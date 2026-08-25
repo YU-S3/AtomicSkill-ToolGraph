@@ -1,0 +1,21 @@
+llm:
+  provider: openrouter
+  base_url: https://openrouter.ai/api/v1
+  model: openai/gpt-4o-mini
+  # Replace with your OpenRouter API key, or leave blank and point
+  # local_override_path to a configs/local.yaml that sets it.
+  api_key: "YOUR_OPENROUTER_API_KEY"
+  app_name: flowevo
+  local_override_path: configs/local.yaml
+  skill_top_k: 3
+  skill_context_budgets:
+    draft_total_tokens: 4096
+    repair_total_tokens: 4096
+    draft_per_skill_tokens: 1500
+    repair_per_skill_tokens: 1500
+  draft:
+    temperature: 0.2
+    max_output_tokens: 900
+  repair:
+    temperature: 0.15
+    max_output_tokens: 900

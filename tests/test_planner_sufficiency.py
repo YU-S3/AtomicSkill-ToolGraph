@@ -1,0 +1,169 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+from atomic_skillgraph.adapters.benchmark import Task
+from atomic_skillgraph.core.config import SystemConfig
+from atomic_skillgraph.core.refs import SkillRef
+from atomic_skillgraph.core.skill_ir import AbstractAtomicSkill, CompositeSkill
+from atomic_skillgraph.core.status import SkillStatus
+from atomic_skillgraph.graph.registry import SkillGraphRegistry
+from atomic_skillgraph.evolution.success_processor import SuccessProcessor
+from atomic_skillgraph.runtime.atomic_planner import AtomicPlanner
+from atomic_skillgraph.core.trace_ir import TraceRecord
+
+
+TASK_TYPE = "pick_heat_then_place_in_recep"
+
+
+def _atomic(logical_id: str, predicate: str, inputs: list[str]):
+    return AbstractAtomicSkill(
+        ref=SkillRef(logical_id, "1.0.0"),
+        summary=logical_id,
+        inputs=[{"name": name} for name in inputs],
+        effects=[{
+            "predicate": predicate,
+            "args": {name: f"$inputs.{name}" for name in inputs
+                     if name in {"object", "target_location"}},
+        }],
+        metadata={"task_type_labels": [TASK_TYPE],
+                  "statistics": {"utility": 0.5}},
+        status=SkillStatus.ACTIVE,
+    )
+
+
+def _composite(logical_id: str, refs: list[str], summary: str, utility: float):
+    return CompositeSkill(
+        ref=SkillRef(logical_id, "1.0.0"), summary=summary,
+        task_type_labels=[TASK_TYPE],
+        graph={"nodes": refs},
+        metadata={"statistics": {"utility": utility}},
+        status=SkillStatus.ACTIVE,
+    )
+
+
+def _registry(root, *, include_complete: bool = True):
+    registry = SkillGraphRegistry(root / "skill_graph")
+    acquire = _atomic("alfworld.acquire_object", "agent.holds", ["object"])
+    heat = _atomic("alfworld.heat_object", "object.heated", ["object"])
+    place = _atomic("alfworld.place_object", "object.at_location",
+                    ["object", "target_location"])
+    for atomic in (acquire, heat, place):
+        registry.register(atomic)
+    partial = _composite(
+        "composite.alfworld.acquire-heat",
+        [str(acquire.ref), str(heat.ref)],
+        "heat mug and put it in cabinet", 1.0,
+    )
+    registry.register(partial)
+    if include_complete:
+        registry.register(_composite(
+            "composite.alfworld.acquire-heat-place",
+            [str(acquire.ref), str(heat.ref), str(place.ref)],
+            "unrelated complete chain", 0.1,
+        ))
+    return registry
+
+
+def _task(*, goal: str = "heat some mug and put it in cabinet.",
+          params: dict | None = None):
+    return Task(
+        task_id="alfworld_test", benchmark="alfworld", task_type=TASK_TYPE,
+        goal=goal,
+        context={"params": params or {}}, state={"facts": []},
+        target_effects=[
+            {"predicate": "object.heated", "args": {"object": "$object"}},
+            {"predicate": "object.at_location",
+             "args": {"object": "$object", "location": "$target_location"}},
+        ],
+    )
+
+
+def test_complete_composite_beats_higher_scoring_partial(workspace_tmp):
+    registry = _registry(workspace_tmp, include_complete=True)
+    planner = AtomicPlanner(registry, SystemConfig())
+    plan = planner.compile_runtime_graph(_task(params={
+        "object": "mug", "target_location": "cabinet 1"}))
+    assert plan.composite_ref.endswith(
+        "composite.alfworld.acquire-heat-place@1.0.0")
+    assert not any(node.dynamic for node in plan.nodes)
+    assert "composite_effect_complete" in plan.notes
+
+
+def test_partial_composite_dynamic_gap_binds_task_params(workspace_tmp):
+    registry = _registry(workspace_tmp, include_complete=False)
+    planner = AtomicPlanner(registry, SystemConfig())
+    plan = planner.compile_runtime_graph(_task(params={
+        "object": "mug", "target_location": "cabinet 1",
+        "heating_station": "microwave 1"}))
+    gaps = [node for node in plan.nodes if node.dynamic]
+    assert len(gaps) == 1
+    assert gaps[0].params["object"] == "mug"
+    assert gaps[0].params["target_location"] == "cabinet 1"
+    assert gaps[0].params["heating_station"] == "microwave 1"
+    assert "composite_partial_with_bound_gap" in plan.notes
+
+
+def test_unbound_partial_composite_falls_back_to_atomic_plan(workspace_tmp):
+    registry = _registry(workspace_tmp, include_complete=False)
+    planner = AtomicPlanner(registry, SystemConfig())
+    plan = planner.compile_runtime_graph(_task(
+        goal="heat an object", params={"object": "mug"}))
+    assert plan.composite_ref == ""
+    assert "atomic_only_plan" in plan.notes
+    assert all(node.source != "dynamic_gap" for node in plan.nodes)
+
+
+def test_atomic_plan_closes_dependencies_and_orders_acquire_heat_place(workspace_tmp):
+    registry = SkillGraphRegistry(workspace_tmp / "ordered_graph")
+    acquire = _atomic("alfworld.acquire_object", "agent.holds", ["object"])
+    heat = _atomic("alfworld.heat_object", "object.heated", ["object"])
+    place = _atomic("alfworld.place_object", "object.at_location",
+                    ["object", "target_location"])
+    heat.preconditions = [{"predicate": "agent.holds",
+                           "args": {"object": "$inputs.object"}}]
+    place.preconditions = [{"predicate": "agent.holds",
+                            "args": {"object": "$inputs.object"}}]
+    # Place 的分数故意最高，确认排序来自依赖/目标数据流而不是 retrieval score。
+    acquire.metadata["statistics"]["utility"] = 0.7
+    heat.metadata["statistics"]["utility"] = 0.8
+    place.metadata["statistics"]["utility"] = 0.99
+    for atomic in (acquire, heat, place):
+        registry.register(atomic)
+    config = SystemConfig()
+    config.features.enable_composite = False
+    planner = AtomicPlanner(registry, config)
+    plan = planner.compile_runtime_graph(_task(params={
+        "object": "mug", "target_location": "cabinet 1"}))
+    assert [node.ref.logical_id for node in plan.nodes] == [
+        "alfworld.acquire_object", "alfworld.heat_object", "alfworld.place_object"]
+
+
+def test_legacy_composite_cannot_bind_destination_as_acquire_source():
+    resolved = AtomicPlanner._resolve_composite_params(
+        {"object": "$task.object",
+         "object_location": "$task.target_location"},
+        _task(params={"object": "mug", "target_location": "cabinet 1"}),
+    )
+    assert resolved == {"object": "mug"}
+
+
+def test_lifecycle_review_runs_even_when_heavy_maintenance_is_deferred():
+    processor = object.__new__(SuccessProcessor)
+    processor.config = SystemConfig(maintenance_interval=100)
+    processor.base_compiler = None
+    processor.atomicizer = SimpleNamespace(apply=lambda trace: SimpleNamespace(
+        candidates=[], segments=[]))
+    processor.registry = SimpleNamespace()
+    calls: list[object] = []
+    processor.lifecycle = SimpleNamespace(
+        review=lambda **kwargs: calls.append(kwargs) or [])
+    processor.generalizer = SimpleNamespace(
+        run_maintenance=lambda: (_ for _ in ()).throw(
+            AssertionError("heavy maintenance must stay deferred")))
+    result = processor.process_success(
+        TraceRecord(trace_id="trace_lifecycle", success=True),
+        run_maintenance=False,
+    )
+    assert len(calls) == 1
+    assert result.maintenance == []

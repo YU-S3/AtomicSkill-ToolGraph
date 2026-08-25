@@ -1,0 +1,6 @@
+# 本地覆盖（git 忽略）：复制为 configs/local.yaml 后填写，避免 key 入库。
+# 本文件中的值覆盖 configs/default.yaml 的同名字段。
+llm:
+  api_key: "YOUR_OPENROUTER_API_KEY"
+  # base_url: "https://api.deepseek.com/v1"   # 示例：切换为 DeepSeek 等 OpenAI 兼容端点
+  # model: "deepseek-chat"

@@ -1,0 +1,6 @@
+llm:
+  # Copy this file to configs/local.yaml (git-ignored) to keep credentials
+  # out of version control. Values here override the base config selected
+  # via --config-path.
+  # api_key: "YOUR_OPENROUTER_API_KEY"
+  # model: openai/gpt-4o-mini

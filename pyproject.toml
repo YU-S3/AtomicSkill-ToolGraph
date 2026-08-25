@@ -1,0 +1,29 @@
+[project]
+name = "atomic-skillgraph"
+version = "2.0.0"
+description = "AtomicSkillGraph: centralized self-evolving agents through atomic skill graphs and executable tool co-evolution (built on FlowEvo)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2.0",
+    "datasets>=2.19.0",
+    "PyYAML>=6.0",
+    "requests>=2.31.0",
+    "pytest>=7.0",
+]
+
+[project.optional-dependencies]
+alfworld = [
+    "alfworld>=0.3.0",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["experiments"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"

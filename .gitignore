@@ -1,0 +1,21 @@
+# 运行时产物
+data/
+runs/
+.pytest_cache/
+pytest-cache-files-*/
+runs/.pytest_tmp/
+
+# 本地配置（含 API key，禁止入库）
+configs/local.yaml
+configs/flowevo_local.yaml
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# 数据缓存
+*.xlsx
+*.csv.tmp

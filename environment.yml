@@ -1,0 +1,19 @@
+# AtomicSkillGraph v2.0 conda 环境
+# 创建：conda env create -f environment.yml -n asg
+# 或手动：conda create -n asg python=3.11 && conda activate asg && pip install -r requirements.txt
+name: asg
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - pydantic>=2.0
+      - datasets>=2.19.0
+      - pyyaml>=6.0
+      - requests>=2.31.0
+      - pytest>=7.0
+      # ALFWorld 实验可选（体积大，含 textworld 依赖链）：
+      # - alfworld>=0.3.0
+      # - opencv-python
+      # - torch>=1.7.0  # alfworld 的依赖（CPU 版即可）

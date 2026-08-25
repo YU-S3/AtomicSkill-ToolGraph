@@ -1,0 +1,64 @@
+# AtomicSkillGraph v2.0 系统配置
+# 复制本文件为 configs/local.yaml（不提交）覆盖 API key；或设置环境变量
+# OPENROUTER_API_KEY（或 llm.api_key_env 指定的其他变量名）。
+
+data_dir: data
+
+llm:
+  provider: openrouter                # OpenAI 兼容 chat completions
+  base_url: https://openrouter.ai/api/v1
+  model: openai/gpt-4o-mini           # 论文 backbone；可换成其他 OpenAI 兼容模型
+  api_key: "YOUR_OPENROUTER_API_KEY"  # ← 在此填写，或写入 configs/local.yaml
+  api_key_env: OPENROUTER_API_KEY
+  temperature: 0.2
+  max_output_tokens: 900
+  mock: false                         # true = 使用 MockLLM（无 API smoke）
+  # Extractor/Graph Agent 与 Runtime 使用同一模型配置，但创建独立客户端/会话。
+  extractor_temperature: 0.1
+  # DeepSeek V4 Flash 官方最大输出 384K；这是宽松上限，不是生成目标。
+  extractor_max_output_tokens: 384000
+  extractor_thinking: enabled
+  extractor_reasoning_effort: low
+  # 仅独立 Extractor/Graph Agent 使用；不改变任务执行 LLM 的超时。
+  extractor_read_timeout_seconds: 600
+
+thresholds:
+  split_score_force: 0.70
+  split_score_consider: 0.45
+  insight_min_samples: 3              # Layer-3 insight 最少轨迹数
+  direct_min_utility: 0.5
+  direct_min_success: 3
+  direct_max_consecutive_failures: 2
+  candidate_min_support: 3
+  preferred_margin: 0.1
+  suppress_failure_threshold: 2
+  retirement_utility: 0.2
+  admission_timeout_seconds: 10.0
+  # Acquire Direct 在对象位置未知时最多检查多少个唯一 receptacle。
+  acquire_discovery_max_locations: 30
+  # Provider 层已经有限重试；决策层立即交给 task-level reset，避免乘法放大。
+  llm_max_consecutive_errors: 1
+  # 连续 LLM 基础设施错误后，从同一任务初始状态重跑的次数。
+  infrastructure_episode_retries: 2
+  # 单条成功轨迹只产生 draft Composite；至少两条独立轨迹支持后才 active。
+  composite_min_support: 2
+
+features:                             # 消融开关（实验入口可覆盖）
+  enable_composite: true
+  enable_tool_evolution: true
+  enable_node_validator: true
+  enable_layer3_insight: true
+  enable_generalization: true
+  enable_specialization: true
+  enable_cross_task_type_reuse: true
+  enable_nm_binding: true
+  enable_governance: true
+  enable_primitive_reuse: true
+  task_type_hard_restricted: false
+
+seed: 42
+max_repairs: 2
+retrieval_top_k: 5
+task_type_soft_bonus: 0.3
+max_steps: 50
+maintenance_interval: 5

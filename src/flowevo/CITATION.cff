@@ -1,0 +1,66 @@
+cff-version: 1.2.0
+message: "If you use FlowEvo in your research, please cite the following paper."
+type: software
+title: FlowEvo
+repository-code: "https://github.com/DEFENSE-SEU/FlowEvo"
+url: "https://github.com/DEFENSE-SEU/FlowEvo"
+authors:
+  - family-names: Ren
+    given-names: Zeyu
+    affiliation: Southeast University
+  - family-names: Yue
+    given-names: Ling
+    affiliation: Rensselaer Polytechnic Institute
+  - family-names: Li
+    given-names: Ran
+    affiliation: The Hong Kong University of Science and Technology
+  - family-names: Wang
+    given-names: Yishu
+    affiliation: Southeast University
+  - family-names: Xu
+    given-names: Shengxiang
+    affiliation: Southeast University
+  - family-names: Liu
+    given-names: Hanmo
+    affiliation: The Hong Kong University of Science and Technology
+  - family-names: Pan
+    given-names: Shaowu
+    affiliation: Rensselaer Polytechnic Institute
+    email: pans2@rpi.edu
+  - family-names: Di
+    given-names: Shimin
+    affiliation: Southeast University
+    email: shimin.di@seu.edu.cn
+preferred-citation:
+  type: conference-paper
+  title: "FlowEvo: Self-Evolving Agents through the Co-Evolution of Workflows and Executable Skills"
+  year: 2026
+  collection-title: "Conference on Language Modeling (COLM)"
+  notes: "Accepted at COLM 2026"
+  authors:
+    - family-names: Ren
+      given-names: Zeyu
+      affiliation: Southeast University
+    - family-names: Yue
+      given-names: Ling
+      affiliation: Rensselaer Polytechnic Institute
+    - family-names: Li
+      given-names: Ran
+      affiliation: The Hong Kong University of Science and Technology
+    - family-names: Wang
+      given-names: Yishu
+      affiliation: Southeast University
+    - family-names: Xu
+      given-names: Shengxiang
+      affiliation: Southeast University
+    - family-names: Liu
+      given-names: Hanmo
+      affiliation: The Hong Kong University of Science and Technology
+    - family-names: Pan
+      given-names: Shaowu
+      affiliation: Rensselaer Polytechnic Institute
+      email: pans2@rpi.edu
+    - family-names: Di
+      given-names: Shimin
+      affiliation: Southeast University
+      email: shimin.di@seu.edu.cn
