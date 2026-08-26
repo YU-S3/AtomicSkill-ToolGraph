@@ -1,5 +1,6 @@
 import copy
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -136,6 +137,49 @@ def test_same_effect_name_cannot_merge_incompatible_role_contracts(workspace_tmp
     decision = align_atomic(producer, registry)
     assert decision.matched is False
     assert decision.evidence["contract_compatible"] is False
+    stored_variant = copy.deepcopy(producer)
+    stored_variant.ref = SkillRef("generic.object_at_location__deadbeef", "1.0.0")
+    registry.register(stored_variant)
+    reused = align_atomic(producer, registry)
+    assert reused.matched is True
+    assert reused.matched_ref == str(stored_variant.ref)
+
+
+def test_repeated_incompatible_name_variant_reuses_staged_registration(workspace_tmp):
+    registry = SkillGraphRegistry(workspace_tmp / "staged_variant_reuse")
+    base = _atomic(
+        "generic.container_open", [],
+        [{"predicate": "container.open",
+          "args": {"container": "$inputs.target_location"}}],
+        [{"name": "target_location"}], [{"name": "container"}])
+    registry.register(base)
+    variant_candidate = _atomic(
+        "generic.container_open", [],
+        [{"predicate": "container.open",
+          "args": {"container": "$inputs.container"}}],
+        [{"name": "container"}], [{"name": "container"}])
+    variant_candidate.status = SkillStatus.DRAFT
+    variant_candidate.metadata = {
+        "source_trace_ids": ["same_trace"],
+        "statistics": {"support_count": 1, "success_count": 1},
+    }
+    candidates = [SimpleNamespace(
+        skill=copy.deepcopy(variant_candidate),
+        alignment=SimpleNamespace(matched=False, evidence={}, matched_ref=""),
+    ) for _ in range(2)]
+    staged = SimpleNamespace(candidates=candidates, decisions=["add", "add"])
+    atomicizer = TraceAtomicizer(registry)
+    atomicizer.atomicize_success = lambda _trace: staged
+
+    result = atomicizer.apply(TraceRecord(trace_id="same_trace", success=True))
+
+    atomics = [item for item in registry.list_all()
+               if isinstance(item, AbstractAtomicSkill)]
+    assert len(atomics) == 2
+    assert result.decisions == ["add_contract_variant", "reuse_contract_variant"]
+    variant = next(item for item in atomics if "__" in item.ref.logical_id)
+    assert variant.metadata["statistics"]["support_count"] == 1
+    assert variant.metadata["source_trace_ids"] == ["same_trace"]
 
 
 def test_composite_terminal_checks_follow_observed_negative_effects(workspace_tmp):

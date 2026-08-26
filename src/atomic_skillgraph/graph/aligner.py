@@ -90,7 +90,12 @@ def align_atomic(candidate: AbstractAtomicSkill, registry: SkillGraphRegistry) -
     best: tuple[float, Any] | None = None
     for existing in candidates:
         compatible = _atomic_contract_compatible(candidate, existing)
-        if existing.ref.logical_id == candidate.ref.logical_id and compatible:
+        same_identity_family = (
+            existing.ref.logical_id == candidate.ref.logical_id
+            or existing.ref.logical_id.startswith(
+                f"{candidate.ref.logical_id}__")
+        )
+        if same_identity_family and compatible:
             best = (1.0, existing)
             break
         semantic = _overlap(_tokens(candidate.summary, *(candidate.guideline_rules())),

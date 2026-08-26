@@ -16,7 +16,11 @@ from ..core.refs import SkillRef
 from ..core.skill_ir import AbstractAtomicSkill
 from ..core.status import EdgeType, SkillStatus
 from ..core.trace_ir import TraceRecord
-from ..graph.aligner import AlignDecision, align_atomic
+from ..graph.aligner import (
+    AlignDecision,
+    _atomic_contract_compatible,
+    align_atomic,
+)
 from ..graph.registry import SkillGraphRegistry
 from .boundary_detector import detect_boundaries
 from .effect_extractor import (
@@ -234,6 +238,13 @@ class TraceAtomicizer:
                 # ``$inputs.object`` contract in Full runs.
                 collision = self.registry.get(candidate.skill.ref)
                 if collision is not None:
+                    if _atomic_contract_compatible(collision, candidate.skill):
+                        self._merge_evidence(collision, candidate.skill, trace)
+                        self.registry.update_runtime_state(collision)
+                        candidate.skill = collision
+                        result.decisions[candidate_index] = (
+                            "reuse_contract_collision")
+                        continue
                     # Same generated name with an incompatible I/O/Effect
                     # contract must remain a separate capability instead of
                     # corrupting the first immutable node.
@@ -246,6 +257,19 @@ class TraceAtomicizer:
                     candidate.skill.ref = SkillRef(
                         f"{candidate.skill.ref.logical_id}__{suffix}",
                         candidate.skill.ref.version)
+                    variant = self.registry.get(candidate.skill.ref)
+                    if variant is not None:
+                        if not _atomic_contract_compatible(
+                                variant, candidate.skill):
+                            raise ValueError(
+                                "atomic_contract_hash_collision:"
+                                f"{candidate.skill.ref}")
+                        self._merge_evidence(variant, candidate.skill, trace)
+                        self.registry.update_runtime_state(variant)
+                        candidate.skill = variant
+                        result.decisions[candidate_index] = (
+                            "reuse_contract_variant")
+                        continue
                     result.decisions[candidate_index] = "add_contract_variant"
                 self.registry.register(candidate.skill)
                 score = float(candidate.alignment.evidence.get("align_score", 0.0))
