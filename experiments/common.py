@@ -114,6 +114,26 @@ def load_tasks_for(benchmark: str, adapter, limit: int, task_type: str | None) -
     return tasks
 
 
+def balanced_task_subset(tasks: list, task_types: list[str],
+                         per_type_limit: int) -> list:
+    """Deterministically interleave an equal number of tasks from each label."""
+    labels = [str(label) for label in task_types if str(label).strip()]
+    if not labels or per_type_limit <= 0:
+        return []
+    buckets = {
+        label: [task for task in tasks
+                if str(getattr(task, "task_type", "")) == label][:per_type_limit]
+        for label in labels
+    }
+    missing = {label: len(bucket) for label, bucket in buckets.items()
+               if len(bucket) < per_type_limit}
+    if missing:
+        raise ValueError(
+            f"均衡任务不足：要求每类 {per_type_limit} 个，实际不足 {missing}")
+    return [buckets[label][index]
+            for index in range(per_type_limit) for label in labels]
+
+
 # ---------------------------------------------------------------------------
 # 运行
 # ---------------------------------------------------------------------------

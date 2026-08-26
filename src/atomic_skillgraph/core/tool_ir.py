@@ -159,7 +159,7 @@ class ToolAsset:
         errors: list[str] = []
         if not self.summary.strip():
             errors.append("summary 不能为空")
-        if not self.param_names():
+        if "parameters" not in self.signature:
             errors.append("signature.parameters 至少需要一个参数（或无参函数需显式声明空参数表）")
         if not self.artifact_body():
             errors.append("artifact 缺少可执行内容（code/template/steps）")

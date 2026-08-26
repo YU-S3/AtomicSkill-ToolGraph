@@ -159,6 +159,8 @@ class TraceAtomicizer:
             parameterize_predicates(effect.positive, bound_params), bound_params)
         parameterized_preconditions = parameterize_predicates(effect.preconditions,
                                                               bound_params)
+        parameterized_negative_effects = _parameterize_negative_effects(
+            effect.negative, bound_params)
 
         proposed_alias = str(segment.get("proposed_intent") or segment.get("name") or "")
         observed_families = {
@@ -188,6 +190,10 @@ class TraceAtomicizer:
                 "benchmark": trace.benchmark,
                 "semantic_alias_counts": ({proposed_alias: 1} if proposed_alias else {}),
                 "observed_parameter_families": observed_families,
+                # Negative deltas are occurrence evidence used for causal and
+                # terminal-effect closure. They are not inferred from the
+                # capability name and remain auditable after registration.
+                "observed_negative_effects": parameterized_negative_effects,
                 "generalization": {
                     "canonical_name": segment_name,
                     "identity_source": "code_validated_core_effect",
@@ -269,6 +275,12 @@ class TraceAtomicizer:
                 if value not in bucket:
                     bucket.append(value)
         existing.metadata["observed_parameter_families"] = observed
+        negative_evidence = list(
+            existing.metadata.get("observed_negative_effects") or [])
+        for effect in incoming.metadata.get("observed_negative_effects") or []:
+            if effect not in negative_evidence:
+                negative_evidence.append(effect)
+        existing.metadata["observed_negative_effects"] = negative_evidence
         trace_count = len(sources)
         existing.metadata["generalization"] = {
             "canonical_name": existing.ref.logical_id.rsplit(".", 1)[-1],
@@ -302,16 +314,15 @@ class TraceAtomicizer:
 def _materialize_segment_effect(segment: dict[str, Any]) -> ExtractedEffect:
     """Preserve the Effect contract already validated against event evidence.
 
-    The semantic validator may remove helper transitions (for example opening a
-    microwave inside Heat).  Re-diffing the whole phase here used to reintroduce
-    those transitions and could create a false ``open_container`` Atomic node.
+    The semantic validator may remove helper transitions from a proposed
+    occurrence. Re-diffing the whole phase here used to reintroduce those
+    transitions and could create a false extra Atomic node.
     """
     params = dict(segment.get("params") or {})
     effect = extract_effect(segment.get("before") or {},
                             segment.get("after") or {}, bound_params=params)
     validated = segment.get("effect")
-    if (segment.get("extraction_method") != "llm_proposal_code_validated"
-            or not isinstance(validated, list) or not validated):
+    if not isinstance(validated, list) or not validated:
         return effect
 
     effect.positive = [dict(item) for item in validated if isinstance(item, dict)]
@@ -406,7 +417,7 @@ def _safe_prefix(benchmark: str) -> str:
 
 
 def _entity_family(value: Any) -> str:
-    """Collapse ALFWorld instance suffixes for cross-trace generalization audit."""
+    """Collapse a conventional numeric instance suffix for generalization audit."""
     import re
     normalized = str(value).strip().lower().replace(" ", "_")
     return re.sub(r"_\d+$", "", normalized)
@@ -414,20 +425,14 @@ def _entity_family(value: Any) -> str:
 
 def _safe_parameterized_effects(effects: list[dict[str, Any]],
                                 bound_params: dict[str, Any]) -> list[dict[str, Any]]:
-    """Reject a same-family literal that escaped occurrence grounding."""
+    """Reject a concrete occurrence literal that escaped generic grounding."""
     import re
     safe: list[dict[str, Any]] = []
-    object_bound = "object" in bound_params
-    target_bound = "target_location" in bound_params
     for effect in effects:
         args = effect.get("args") or {}
-        if object_bound and "object" in args and args.get("object") != "$inputs.object":
-            continue
-        if (target_bound and str(effect.get("predicate") or "") == "object.at_location"
-                and args.get("location") != "$inputs.target_location"):
-            continue
-        # Other concrete ALFWorld instance literals may not enter an Abstract
-        # Effect when the same semantic family is already an input role.
+        # A concrete occurrence literal may not enter an Abstract Effect when
+        # the same semantic family is already represented by an input role.
+        # Placeholder names themselves are intentionally unconstrained.
         input_families = {_entity_family(value) for value in bound_params.values()}
         leaked = any(isinstance(value, str) and re.search(r"_\d+$", value)
                      and _entity_family(value) in input_families
@@ -435,3 +440,22 @@ def _safe_parameterized_effects(effects: list[dict[str, Any]],
         if not leaked:
             safe.append(effect)
     return safe
+
+
+def _parameterize_negative_effects(
+        effects: list[dict[str, Any]],
+        bound_params: dict[str, Any]) -> list[dict[str, Any]]:
+    """Parameterize the predicate nested in a negative Effect wrapper."""
+    result: list[dict[str, Any]] = []
+    for effect in effects:
+        if not isinstance(effect, dict):
+            continue
+        inner = effect.get("not")
+        if isinstance(inner, dict):
+            parameterized = parameterize_predicates([inner], bound_params)
+            if parameterized:
+                result.append({"not": parameterized[0]})
+        else:
+            parameterized = parameterize_predicates([effect], bound_params)
+            result.extend(parameterized)
+    return result

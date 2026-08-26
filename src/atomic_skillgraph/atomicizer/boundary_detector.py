@@ -16,10 +16,6 @@ from ..core.predicates import StateSnapshot, compute_effects
 from ..core.trace_ir import TraceRecord
 from .effect_extractor import _family_of
 
-# 交互环境：移动到无状态变化的动作（机械步骤）附着到下一个状态转移段
-_MOVEMENT_VERBS = {"go", "goto", "look", "inventory", "examine", "open"}
-
-
 def detect_env_boundaries(trace: TraceRecord) -> list[dict[str, Any]]:
     """按状态转移切分交互轨迹（快照在动作之后记录：snapshot[i+1] 对应 action[i] 之后）。
 
@@ -53,7 +49,7 @@ def detect_env_boundaries(trace: TraceRecord) -> list[dict[str, Any]]:
     merged: list[dict[str, Any]] = []
     pending: list[dict[str, Any]] = []
     for group in groups:
-        if _is_mechanical(group["actions"]):
+        if not _meaningful_effects(group["before"], group["after"]):
             pending.extend(group["actions"])
             group["actions"] = []
         if group["actions"]:
@@ -68,13 +64,11 @@ def detect_env_boundaries(trace: TraceRecord) -> list[dict[str, Any]]:
     for index, group in enumerate(merged):
         before, after = group["before"], group["after"]
         before_snap, after_snap = StateSnapshot(before), StateSnapshot(after)
-        positive, _negative = compute_effects(before_snap, after_snap)
-        # 过滤机械性噪声事实（location_checked / agent_at）
-        positive = [e for e in positive
-                    if _family_of(e) not in {"location_checked", "agent_at"}]
+        positive, negative = compute_effects(before_snap, after_snap)
+        positive = _meaningful_effects(before, after)
         params = _extract_action_params(group["actions"])
         effect_names = sorted({_family_of(e) for e in positive if _family_of(e)})
-        # 语义命名：单一效果族 → 建议名（heat_object / place_object）
+        # Deterministic predicate-derived identity; no benchmark capability list.
         if len(effect_names) == 1:
             from .effect_extractor import _FACT_FAMILY_NAMES
             name = _FACT_FAMILY_NAMES.get(effect_names[0], (effect_names[0], ""))[0]
@@ -88,6 +82,7 @@ def detect_env_boundaries(trace: TraceRecord) -> list[dict[str, Any]]:
             "after": after,
             "params": params,
             "effect": positive,
+            "negative_effect": negative,
             "summary": _summary_from_effects(positive),
         }
         segments.append(segment)
@@ -146,21 +141,44 @@ def _state_changed(before: dict[str, Any], after: dict[str, Any]) -> bool:
     return (before.get("inventory") or []) != (after.get("inventory") or [])
 
 
-def _is_mechanical(actions: list[dict[str, Any]]) -> bool:
-    for action in actions:
-        name = str(action.get("name", "")).split()[0].lower()
-        if name not in _MOVEMENT_VERBS:
-            return False
-    return bool(actions)
+def _meaningful_effects(before: dict[str, Any], after: dict[str, Any]) -> list[dict[str, Any]]:
+    positive, _negative = compute_effects(StateSnapshot(before), StateSnapshot(after))
+    newly_observed = {
+        str((effect.get("args") or {}).get("object") or "")
+        for effect in positive
+        if str(effect.get("predicate") or "") == "object.exists"
+    }
+    meaningful: list[dict[str, Any]] = []
+    for effect in positive:
+        predicate = str(effect.get("predicate") or "")
+        if predicate in {"location.checked", "agent_at", "agent.at", "object.exists"}:
+            continue
+        # Discovering an entity and its location in the same observation is
+        # knowledge acquisition, not an environment-changing capability.
+        if (predicate == "object.at_location"
+                and str((effect.get("args") or {}).get("object") or "")
+                in newly_observed):
+            continue
+        meaningful.append(effect)
+    return meaningful
 
 
 def _extract_action_params(actions: list[dict[str, Any]]) -> dict[str, Any]:
-    """从动作参数中提取实例绑定（object / object_location / ...）。"""
+    """Extract roles with the effect-producing action taking precedence.
+
+    A preceding setup action may use a generic role for the same entity while
+    the core transition gives it a more precise role. Walking backward keeps
+    that trace-grounded core role without an operation or benchmark whitelist.
+    """
     params: dict[str, Any] = {}
-    for action in actions:
+    normalized_values: set[str] = set()
+    for action in reversed(actions):
         for key, value in (action.get("params") or {}).items():
-            if key not in params and value not in (None, ""):
+            normalized = str(value).strip().lower().replace(" ", "_")
+            if (key not in params and value not in (None, "")
+                    and normalized not in normalized_values):
                 params[key] = value
+                normalized_values.add(normalized)
     return params
 
 

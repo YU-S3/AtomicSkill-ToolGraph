@@ -13,8 +13,9 @@ class ProposalReplayer:
     """Evidence gate for the rule: failure proposes; success admits.
 
     Contract/composite proposals are evidence proposals, not executable patches.
-    They are resolved only by a later successful trace covering the same node or
-    task type. Executable Tool updates still have to pass Tool admission separately.
+    They are resolved only by a later successful trace covering the same node,
+    Composite, or executable Tool. Benchmark task labels are never replay keys.
+    Executable Tool updates still have to pass Tool admission separately.
     """
 
     def __init__(self, data_dir) -> None:
@@ -27,15 +28,14 @@ class ProposalReplayer:
         covered = {_logical(str(node.get("ref") or node.get("node_ref") or ""))
                    for node in trace.realized_atomic_nodes}
         covered.update(_logical(ref) for ref in (learned_refs or []))
+        covered.add(_logical(str(trace.selected_composite or "")))
         covered.discard("")
         events: list[dict[str, Any]] = []
         for proposal in self.store.pending():
             payload = dict(proposal.get("payload") or {})
-            same_task_type = payload.get("task_type") == trace.task_type
             target = _logical(str(proposal.get("target_ref") or ""))
             tool_overlap = bool(set(payload.get("tool_refs") or []) & set(trace.tool_refs))
-            matched = target in covered or tool_overlap or (
-                proposal.get("kind") == "composite_revision" and same_task_type)
+            matched = target in covered or tool_overlap
             if not matched:
                 continue
             result = {

@@ -179,7 +179,7 @@ class SuccessProcessor:
                 graph_proposal=graph_proposal)
             result.composite = build.to_dict()
             # 7. Layer-3 insight
-            if build.composite is not None and trace.task_type:
+            if build.composite is not None:
                 support = int((build.composite.metadata.get("statistics") or {}).get(
                     "support_count", 0))
                 insight_due = (
@@ -188,7 +188,7 @@ class SuccessProcessor:
                 )
                 if insight_due:
                     insight = self.insight_updater.update_if_ready(
-                        build.composite.ref, trace.task_type)
+                        build.composite.ref)
                     if insight:
                         result.insight = insight
                 else:

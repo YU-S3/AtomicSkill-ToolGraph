@@ -8,19 +8,10 @@ from typing import Any
 
 from ..core.predicates import StateSnapshot, compute_effects, _fact_to_predicate
 
-# 事实族 → 语义命名（用于 atomic candidate 的 logical_id 命名）
-_FACT_FAMILY_NAMES = {
-    "agent_holds": ("acquire_object", "Agent 持有目标对象"),
-    "object_heated": ("heat_object", "目标对象被加热"),
-    "object_cleaned": ("clean_object", "目标对象被清洁"),
-    "object_cooled": ("cool_object", "目标对象被冷却"),
-    "object_at": ("place_object", "目标对象被放置到目标位置"),
-    "object_lit": ("light_object", "目标对象被点亮"),
-    "container_open": ("open_container", "容器被打开"),
-    "callable_returns_expected": ("solve_function", "函数对给定输入返回期望输出"),
-    "tests_pass": ("pass_tests", "测试用例全部通过"),
-    "answer_correct": ("produce_answer", "产出正确答案"),
-}
+# Kept as a compatibility hook for callers that import the symbol. Capability
+# names are no longer enumerated: any verified predicate family is normalized
+# mechanically below, while the Extractor Agent proposes its semantic alias.
+_FACT_FAMILY_NAMES: dict[str, tuple[str, str]] = {}
 
 
 @dataclass
@@ -51,8 +42,10 @@ class ExtractedEffect:
         }
 
 
-# 机械性事实族：移动/探索产生的位置变化，不构成核心 Effect（§6.2 封装原则）
-_NOISE_FAMILIES = {"location_checked", "agent_at"}
+# Observation-only facts are filtered below. Whether a location transition is
+# noise or a real capability is decided relative to the goal and causal graph,
+# never globally by predicate name.
+_NOISE_FAMILIES = {"location_checked"}
 
 
 def extract_effect(before: dict[str, Any], after: dict[str, Any],
@@ -62,7 +55,8 @@ def extract_effect(before: dict[str, Any], after: dict[str, Any],
     before_snapshot = StateSnapshot(before)
     after_snapshot = StateSnapshot(after)
     positive, negative = compute_effects(before_snapshot, after_snapshot)
-    # 过滤机械性噪声事实（移动/探索），只保留核心状态转移
+    # Keep genuine state transitions. Goal-relative slicing decides whether a
+    # movement is a capability or merely setup/exploration.
     positive = [p for p in positive if _family_of(p) not in _NOISE_FAMILIES]
     positive = _causal_positive_effects(positive, bound_params)
     negative = [n for n in negative if not _is_noise_effect(n)]
@@ -73,7 +67,9 @@ def extract_effect(before: dict[str, Any], after: dict[str, Any],
     result.primary_family = families[0] if families else ""
     if result.primary_family:
         name, summary = _FACT_FAMILY_NAMES.get(result.primary_family,
-                                               (_snake(result.primary_family), result.primary_family))
+                                               (_snake(result.primary_family),
+                                                f"Verified transition: "
+                                                f"{str(positive[0].get('predicate') or '')}"))
         result.suggested_name = name
         result.summary = summary
 
@@ -97,12 +93,11 @@ def extract_effect(before: dict[str, Any], after: dict[str, Any],
         pred = _fact_to_predicate(fact)
         if pred is None:
             continue
-        name = str(pred.get("predicate", ""))
-        if _family_of(pred) in _NOISE_FAMILIES:
-            continue
-        if name in ("object.exists", "object.at_location", "agent.holds", "container.open",
-                    "object.is_accessible", "callable.returns_expected"):
-            raw_preconditions.append(pred)
+        # Start from every structured fact the adapter can represent. The
+        # generic grounding filter below retains only reads tied to this
+        # occurrence's declared inputs; no benchmark predicate catalogue is
+        # used to decide which preconditions are possible.
+        raw_preconditions.append(pred)
     parameterized = parameterize_predicates(raw_preconditions, bound_params)
     relevant = [p for p in parameterized if _relevant_precondition(
         p, result.primary_family, bound_params)]
@@ -134,32 +129,31 @@ def _has_input_reference(predicate: dict[str, Any]) -> bool:
 
 def _relevant_precondition(predicate: dict[str, Any], primary_family: str,
                            bound_params: dict[str, Any]) -> bool:
-    """只保留当前目标实体的必要条件，避免把场景中旁观对象写进 Contract。"""
-    args = predicate.get("args") or {}
-    name = str(predicate.get("predicate") or "")
-    object_arg = args.get("object")
-    if "object" in bound_params and object_arg != "$inputs.object":
+    """Retain only grounded input-dependent reads, independent of operation name."""
+    if not _has_input_reference(predicate):
         return False
-    if primary_family == "agent_holds":
-        if name == "object.exists":
-            return object_arg == "$inputs.object"
-        if name == "object.at_location":
-            return (object_arg == "$inputs.object"
-                    and args.get("location") == "$inputs.object_location")
-        return False
-    if primary_family in {"object_heated", "object_cleaned", "object_cooled",
-                          "object_at"}:
-        return name == "agent.holds" and object_arg == "$inputs.object"
-    return _has_input_reference(predicate)
+    # Replacing one shared argument is not enough to make the whole fact part
+    # of this occurrence. A bystander can share the same location with the
+    # target entity; its fact must not become a precondition
+    # must not become a precondition. Entity-valued literals must therefore be
+    # grounded to a declared input as well. Numeric/boolean literals remain
+    # valid predicate constants.
+    for value in (predicate.get("args") or {}).values():
+        if not isinstance(value, str) or value.startswith("$inputs."):
+            continue
+        lowered = value.strip().lower()
+        if lowered in {"true", "false", "none", "null"}:
+            continue
+        try:
+            float(lowered)
+            continue
+        except ValueError:
+            return False
+    return True
 
 
 def _family_of(effect: dict[str, Any]) -> str:
     name = str(effect.get("predicate", ""))
-    for family in _FACT_FAMILY_NAMES:
-        if name.replace(".", "_").startswith(family):
-            return family
-    if name in _FACT_FAMILY_NAMES:
-        return name
     return name.replace(".", "_") or ""
 
 
@@ -173,10 +167,20 @@ def _is_noise_effect(effect: dict[str, Any]) -> bool:
 
 def _causal_positive_effects(effects: list[dict[str, Any]],
                              bound_params: dict[str, Any]) -> list[dict[str, Any]]:
-    """排除探索时新观察到的旁观对象；只保留动作参数所指实体的状态变化。"""
+    """Exclude observations unrelated to any grounded phase participant."""
     from ..core.predicates import normalize_value
-    target_object = normalize_value(bound_params.get("object", ""))
-    target_location = normalize_value(bound_params.get("target_location", ""))
+    participants = {normalize_value(value) for value in bound_params.values()
+                    if value not in (None, "")}
+    participants.discard("")
+    entity_participants = {
+        normalize_value(value) for role, value in bound_params.items()
+        if value not in (None, "")
+        and not str(role).lower().endswith("_location")
+        and not any(token in str(role).lower()
+                    for token in ("station", "resource", "device", "instrument",
+                                  "destination"))
+    }
+    entity_participants.discard("")
 
     def same_entity(left: Any, right: str) -> bool:
         value = normalize_value(left)
@@ -196,17 +200,18 @@ def _causal_positive_effects(effects: list[dict[str, Any]],
     for effect in effects:
         name = str(effect.get("predicate") or "")
         args = effect.get("args") or {}
-        # exists / at_location 的新增常来自首次观察，不是动作产生的 Effect。
+        # Existence is observational knowledge, not a capability Effect.
         if name == "object.exists":
             continue
-        if name == "object.at_location":
-            if not (same_entity(args.get("object"), target_object)
-                    and target_location
-                    and same_entity(args.get("location"), target_location)):
-                continue
-        elif "object" in args and target_object:
-            if not same_entity(args.get("object"), target_object):
-                continue
+        argument_values = [normalize_value(value) for value in args.values()]
+        if ("object" in args and entity_participants
+                and not any(same_entity(args.get("object"), participant)
+                            for participant in entity_participants)):
+            continue
+        if participants and argument_values and not any(
+                any(same_entity(value, participant) for participant in participants)
+                for value in argument_values):
+            continue
         key = repr(effect)
         if key not in seen:
             seen.add(key)
@@ -269,15 +274,17 @@ def parameterize_predicates(effects: list[dict[str, Any]],
 
 
 def _preferred_slot(argument: str, slots: list[str]) -> str:
-    preferences = {
-        "object": ["object"],
-        "location": ["target_location", "object_location", "location"],
-        "container": ["container", "target_location", "object_location",
-                      "heating_station", "cleaning_station", "cooling_station"],
-    }.get(argument, [argument])
-    for preferred in preferences:
-        if preferred in slots:
-            return preferred
+    if argument in slots:
+        return argument
+    lexical = [slot for slot in slots
+               if argument in slot or slot in argument]
+    if lexical:
+        return sorted(lexical, key=lambda item: (len(item), item))[0]
+    if argument in {"location", "container"}:
+        relational = [slot for slot in slots
+                      if any(token in slot for token in ("location", "place", "station"))]
+        if relational:
+            return sorted(relational, key=lambda item: (len(item), item))[0]
     return sorted(slots)[0]
 
 
@@ -289,12 +296,12 @@ def _snake(text: str) -> str:
 
 def _semantic_type_of(name: str) -> str:
     lowered = str(name).lower()
-    if "location" in lowered or "recep" in lowered:
+    if any(token in lowered for token in (
+            "location", "place", "destination", "source", "origin", "recep")):
         return "location_ref"
-    if "station" in lowered or "heating" in lowered or "cooling" in lowered:
-        return "station_ref"
-    if "object" in lowered or "container" in lowered:
-        return "object_ref"
+    if any(token in lowered for token in (
+            "resource", "device", "instrument", "station")):
+        return "resource_ref"
     if "entry" in lowered:
         return "entry_point"
-    return "value"
+    return "entity_ref"

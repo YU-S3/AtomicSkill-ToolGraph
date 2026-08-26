@@ -93,11 +93,47 @@ def _atomic(logical_id, preconditions, effects, inputs, outputs):
         status=SkillStatus.ACTIVE)
 
 
+def test_composite_terminal_checks_follow_observed_negative_effects(workspace_tmp):
+    registry = SkillGraphRegistry(workspace_tmp / "terminal_closure_graph")
+    prepared = _atomic(
+        "generic.session_ready", [],
+        [{"predicate": "session.ready", "args": {"session": "$inputs.session"}}],
+        [{"name": "session"}], [{"name": "session"}])
+    committed = _atomic(
+        "generic.artifact_committed",
+        [{"predicate": "session.ready", "args": {"session": "$inputs.session"}}],
+        [{"predicate": "artifact.committed",
+          "args": {"artifact": "$inputs.artifact"}}],
+        [{"name": "session"}, {"name": "artifact"}],
+        [{"name": "artifact"}])
+    registry.register(prepared)
+    registry.register(committed)
+    trace = TraceRecord(
+        trace_id="terminal_closure", task_id="generic_task",
+        task_goal="commit an artifact", benchmark="generic", success=True)
+    segments = [
+        {"phase_id": "p0", "params": {"session": "session_1"},
+         "effect": [{"predicate": "session.ready",
+                     "args": {"session": "session_1"}}],
+         "negative_effect": []},
+        {"phase_id": "p1",
+         "params": {"session": "session_1", "artifact": "artifact_1"},
+         "effect": [{"predicate": "artifact.committed",
+                     "args": {"artifact": "artifact_1"}}],
+         "negative_effect": [{"not": {"predicate": "session.ready",
+                                       "args": {"session": "session_1"}}}]},
+    ]
+    built = CompositeBuilder(registry, SystemConfig(data_dir=workspace_tmp)).build_or_align(
+        [prepared.ref, committed.ref], trace, segments=segments)
+    assert built.composite.validator["check_semantics"] == "terminal_effect_closure_v2"
+    assert built.composite.validator["checks"] == ["artifact.committed"]
+
+
 def test_llm_macro_phase_hides_internal_place_acquire():
     result = SemanticExtractorAgent(_ExtractorLLM()).extract(_trace())
     assert result.method == "llm_proposal_code_validated"
     assert [phase["name"] for phase in result.phases] == [
-        "acquire_object", "heat_object", "place_object"]
+        "agent_holds", "object_heated", "object_at_location"]
     assert (result.phases[1]["event_start"], result.phases[1]["event_end"]) == (3, 3)
     assert result.phases[1]["causal_event_indices"] == [3]
     assert result.phases[1]["removed_internal_event_indices"] == [1, 2]
@@ -174,6 +210,44 @@ def test_causal_slice_treats_observed_object_origin_as_exogenous():
     assert {(item["source_phase_id"], item["target_phase_id"])
             for item in diagnostics["dependencies"]} == {
                 ("acquire", "heat"), ("acquire", "place")}
+
+
+def test_causal_slice_preserves_two_distinct_place_occurrences_for_cardinality():
+    phases = []
+    for index, obj in enumerate(("cd_1", "cd_2")):
+        phases.extend([
+            {
+                "phase_id": f"acquire_{index}",
+                "params": {"object": obj, "object_location": f"desk_{index + 1}"},
+                "before": {"facts": [f"object_exists({obj})",
+                                      f"object_at({obj}, desk_{index + 1})"]},
+                "preconditions": [],
+                "effect": [{"predicate": "agent.holds", "args": {"object": obj}}],
+                "validation": {},
+            },
+            {
+                "phase_id": f"place_{index}",
+                "params": {"object": obj, "target_location": "safe_1"},
+                "before": {"facts": [f"agent_holds({obj})"],
+                           "inventory": [obj]},
+                "preconditions": [{"predicate": "agent.holds",
+                                    "args": {"object": "$inputs.object"}}],
+                "effect": [{"predicate": "object.at_location",
+                            "args": {"object": obj, "location": "safe_1"}}],
+                "validation": {},
+            },
+        ])
+    selected, diagnostics = causal_slice(
+        phases,
+        [{"predicate": "object.at_location",
+          "args": {"object": "$object_type", "location": "$target_location"},
+          "cardinality": 2, "distinct_by": "object"}],
+        {"facts": []},
+        task_params={"object_type": "cd", "target_location": "safe_1"},
+    )
+    assert [phase["phase_id"] for phase in selected] == [
+        "acquire_0", "place_0", "acquire_1", "place_1"]
+    assert diagnostics["unresolved_requirements"] == []
 
 
 def test_state_effect_evidence_is_not_erased_by_llm_label_mismatch():
@@ -258,7 +332,7 @@ def test_personalized_names_and_internal_effects_are_canonicalized():
     result = SemanticExtractorAgent(_PersonalizedExtractorLLM()).extract(
         _trace_with_internal_effects())
     assert [phase["name"] for phase in result.phases] == [
-        "acquire_object", "heat_object", "place_object"]
+        "agent_holds", "object_heated", "object_at_location"]
     acquire, _, place = result.phases
     assert acquire["event_end"] == 0
     assert acquire["params"] == {"object": "mug_1", "object_location": "countertop_1"}
@@ -348,8 +422,8 @@ def test_first_trace_cannot_persist_same_family_bystander_literal(workspace_tmp)
     ).apply(_trace_with_internal_effects("first_trace_with_bystander"))
 
     assert [candidate.skill.ref.logical_id for candidate in result.candidates] == [
-        "env.acquire_object", "env.heat_object", "env.place_object"]
-    place = registry.get_recommended("env.place_object")
+        "env.agent_holds", "env.object_heated", "env.object_at_location"]
+    place = registry.get_recommended("env.object_at_location")
     assert place is not None
     assert place.effects == [{
         "predicate": "object.at_location",
@@ -366,22 +440,29 @@ def test_later_extractor_receives_catalog_and_node_accumulates_generalization(wo
     first = atomicizer.apply(_trace_with_internal_effects("independent_one"))
     atomicizer.apply(_trace_with_internal_effects("independent_two"))
     assert [candidate.skill.ref.logical_id for candidate in first.candidates] == [
-        "env.acquire_object", "env.heat_object", "env.place_object"]
-    assert registry.get_recommended("env.open_container") is None
-    node = registry.get_recommended("env.acquire_object")
+        "env.agent_holds", "env.object_heated", "env.object_at_location"]
+    assert registry.get_recommended("env.container_open") is None
+    node = registry.get_recommended("env.agent_holds")
     assert node is not None
     assert node.metadata["statistics"]["support_count"] == 2
     assert node.metadata["generalization"]["status"] == "cross_trace_validated"
     assert "acquire_and_transport_mug_to_microwave" in node.metadata["semantic_alias_counts"]
     assert llm.inputs[0]["known_atomic_contracts"] == []
-    assert any(item["canonical_name"] == "acquire_object"
+    assert llm.inputs[0]["task"] == {"goal": "heat and place mug"}
+    assert "task_type" not in json.dumps(llm.inputs[0])
+    assert "benchmark" not in json.dumps(llm.inputs[0])
+    assert any(item["canonical_name"] == "agent_holds"
                for item in llm.inputs[1]["known_atomic_contracts"])
 
 
 def test_extractor_prompt_requires_entity_independent_capability_names():
-    assert "Generalization is mandatory" in EXTRACTOR_PROMPT
-    assert "take_out_a_banana" in EXTRACTOR_PROMPT
-    assert "acquire_object (拿取物品)" in EXTRACTOR_PROMPT
+    assert "benchmark taxonomy" in EXTRACTOR_PROMPT
+    assert "Infer its boundary" in EXTRACTOR_PROMPT
+    assert "minimal causal action subsequence" in EXTRACTOR_PROMPT
+    for leaked_boundary in (
+            "acquire_object", "heat_object", "clean_object", "cool_object",
+            "place_object", "open_container", "intermediate placement"):
+        assert leaked_boundary not in EXTRACTOR_PROMPT
 
 
 def test_extractor_failure_cannot_fall_back_and_mutate_skillgraph(workspace_tmp):
@@ -650,14 +731,17 @@ def test_unchanged_composite_insight_updates_evidence_without_version_churn(
         segments=[{"phase_id": "a", "params": {"object": "mug_1"}},
                   {"phase_id": "b", "params": {"object": "mug_1"}}])
     traces = [TraceRecord(trace_id=f"insight_{index}", task_type="heat_place",
-                          task_goal="perform reusable operation")
+                          task_goal="perform reusable operation", success=True)
               for index in range(3)]
+    built.composite.metadata["source_trace_ids"] = [trace.trace_id for trace in traces]
+    registry.update_runtime_state(built.composite)
+    by_id = {trace.trace_id: trace for trace in traces}
     store = type("Store", (), {
-        "by_task_type": lambda self, *_args, **_kwargs: traces,
+        "load": lambda self, trace_id: by_id.get(trace_id),
     })()
 
     result = InsightUpdater(registry, store, config).update_if_ready(
-        built.composite.ref, "heat_place")
+        built.composite.ref)
 
     assert result["reason"] == "evidence_only"
     assert registry.list_versions(built.composite.ref.logical_id) == ["1.0.0"]
@@ -679,13 +763,20 @@ def test_insight_version_records_layer3_reason(workspace_tmp):
         segments=[{"phase_id": "a", "params": {"object": "mug_1"}},
                   {"phase_id": "b", "params": {"object": "mug_1"}}])
     traces = [TraceRecord(trace_id=f"reason_{index}", task_type="heat_place",
-                          task_goal="use microwave and cabinet")
+                          task_goal="use reusable resources", success=True)
               for index in range(3)]
+    for trace in traces:
+        trace.actions = [ActionRecord(
+            step=0, name="operate fixture",
+            params={"resource_location": "bay_7"})]
+    built.composite.metadata["source_trace_ids"] = [trace.trace_id for trace in traces]
+    registry.update_runtime_state(built.composite)
+    by_id = {trace.trace_id: trace for trace in traces}
     store = type("Store", (), {
-        "by_task_type": lambda self, *_args, **_kwargs: traces,
+        "load": lambda self, trace_id: by_id.get(trace_id),
     })()
     result = InsightUpdater(registry, store, config).update_if_ready(
-        built.composite.ref, "heat_place")
+        built.composite.ref)
     assert result["updated"]
     latest = registry.get_latest(built.composite.ref.logical_id)
     assert latest.metadata["version_reason"] == "layer3_insight_update"

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..core.predicates import StateSnapshot, bind_args, check_effects
+from ..core.predicates import StateSnapshot, _fact_to_predicate, bind_args, check_effects
 from ..core.skill_ir import CompositeSkill
 from ..core.trace_ir import NodeValidationResult
 
@@ -36,8 +36,8 @@ class CompositeValidator:
         # 1. 所有子节点 occurrence 的最终结果通过。
         #
         # Runtime 会为同一个计划节点的每次 fallback attempt 都保留一条
-        # NodeValidationResult。例如 Seeded Heat 失败后由 Dynamic 原地救回时，
-        # 序列中会连续出现 ``Heat(False), Heat(True)``。前一条仍是 failure
+        # NodeValidationResult。例如 Seeded 执行失败后由 Dynamic 原地救回时，
+        # 序列中会连续出现同一节点的 ``False, True``。前一条仍是 failure
         # branch/Tool 归因所需的真实历史，但不能让已经成功完成的 occurrence
         # 永久污染 Composite 的最终成功语义。
         effective_results = _effective_occurrence_results(node_results)
@@ -56,15 +56,19 @@ class CompositeValidator:
             check_names = validator.get("checks") or validator.get("post_checks") or []
         else:
             check_names = []
+        terminal_closure = (
+            isinstance(validator, dict)
+            and validator.get("check_semantics") == "terminal_effect_closure_v2")
         for check_name in check_names:
-            # 兼容历史 Composite 中曾保存的中间态检查；它们由对应 Atomic
-            # Validator 证明“曾达成”，不要求在任务最终状态继续保持。
-            transient = str(check_name) in {
-                "agent.holds", "container.open", "location.checked",
-                "object.is_accessible", "object.exists",
-            }
-            ok = ((transient and all_nodes_ok)
-                  or _check_name_in_facts(str(check_name), final_snapshot.facts))
+            observed_at_end = _check_name_in_facts(
+                str(check_name), final_snapshot.facts)
+            # New Composites carry code-computed terminal closure and therefore
+            # enforce every check in the final state. Historical banks stored a
+            # union of intermediate Effects; retain read-only compatibility
+            # without a predicate-name whitelist and rely on their Atomic and
+            # bound-target validators.
+            ok = observed_at_end if terminal_closure else (
+                observed_at_end or all_nodes_ok)
             result.checks[f"composite_check:{check_name}"] = ok
             if not ok:
                 result.messages.append(f"高层目标未满足：{check_name}")
@@ -97,18 +101,11 @@ class CompositeValidator:
 
 
 def _check_name_in_facts(check_name: str, facts: set[str]) -> bool:
-    aliases = {
-        "object.at_location": "object_at(",
-        "agent.holds": "agent_holds(",
-        "object.heated": "object_heated(",
-        "object.cleaned": "object_cleaned(",
-        "object.cooled": "object_cooled(",
-        "container.open": "container_open(",
-        "tests.pass": "tests_pass(",
-        "callable.returns_expected": "callable_returns_expected(",
-    }
-    prefix = aliases.get(check_name, check_name.replace(".", "_") + "(")
-    return any(str(fact).startswith(prefix) for fact in facts)
+    return any(
+        isinstance(predicate := _fact_to_predicate(str(fact)), dict)
+        and str(predicate.get("predicate") or "") == check_name
+        for fact in facts
+    )
 
 
 def _effective_occurrence_results(

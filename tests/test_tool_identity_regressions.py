@@ -98,6 +98,49 @@ def test_action_parameterization_accepts_underscore_binding_for_space_action():
     assert set(tool.param_names()) == {"object", "heating_station"}
 
 
+def test_compiler_restores_state_grounded_location_without_capability_catalogue():
+    trace = TraceRecord(
+        trace_id="generic_location_contract", task_id="generic",
+        task_type="unseen_task", benchmark="generic_env", success=True,
+        actions=[
+            ActionRecord(step=0, name="move near bay 7", accepted=True),
+            ActionRecord(step=1, name="engage fixture 3", accepted=True),
+        ],
+        state_snapshots=[
+            {"step": 0, "state": {"facts": [
+                "agent_at(bay_1)", "object_at(fixture_3, bay_7)"]}},
+            {"step": 1, "state": {"facts": [
+                "agent_at(bay_7)", "object_at(fixture_3, bay_7)"]}},
+            {"step": 2, "state": {"facts": [
+                "agent_at(bay_7)", "object_at(fixture_3, bay_7)",
+                "fixture_engaged(fixture_3)"]}},
+        ],
+    )
+    segment = AtomicSegment(
+        name="operate_fixture", kind="env",
+        actions=[{"step": 1, "name": "engage fixture 3", "params": {}}],
+        params={"fixture": "fixture_3"},
+        before={"facts": [
+            "agent_at(bay_7)", "object_at(fixture_3, bay_7)"]},
+        after={"facts": [
+            "agent_at(bay_7)", "object_at(fixture_3, bay_7)",
+            "fixture_engaged(fixture_3)"]},
+        effect=[{"predicate": "fixture.engaged",
+                 "args": {"object": "fixture_3"}}],
+        entry_event_index=1, causal_event_indices=[1],
+        effect_producer_indices=[1], event_slice_validated=True,
+        replay_safe=True,
+    )
+
+    tool = mine_action_template_tools(trace, [segment])[0]
+
+    assert tool.artifact["steps"] == [
+        "move near {fixture_location}", "engage {fixture}"]
+    assert set(tool.param_names()) == {"fixture", "fixture_location"}
+    assert tool.tests[0]["bindings"]["fixture_location"] == "bay_7"
+    assert tool.tests[0]["prefix"] == []
+
+
 def test_action_admission_rejects_concrete_instance_residue_before_replay():
     replay_called = False
 

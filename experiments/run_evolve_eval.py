@@ -54,6 +54,7 @@ from atomic_skillgraph.graph.validator import validate_graph  # noqa: E402
 from experiments.common import (  # noqa: E402
     PROJECT_ROOT,
     apply_condition,
+    balanced_task_subset,
     load_conda_config,
     make_adapter,
     make_llm,
@@ -199,6 +200,10 @@ def main() -> int:
     parser.add_argument("--conditions", nargs="+", default=OUR_CONDITIONS)
     parser.add_argument("--task-type", default=None,
                         help="ALFWorld 任务类型（需与在线运行一致）")
+    parser.add_argument("--task-types", nargs="+", default=None,
+                        help="ALFWorld 多 label 均衡冻结 replay")
+    parser.add_argument("--per-type-limit", type=int, default=None,
+                        help="与 --task-types 同用：每类任务数")
     parser.add_argument("--limit", type=int, default=None,
                         help="评估任务数（默认取在线运行的任务数）")
     parser.add_argument("--max-steps", type=int, default=50,
@@ -217,6 +222,11 @@ def main() -> int:
                              "独立补跑 baseline 时指向新目录）")
     parser.add_argument("--mock", action="store_true", help="toy 基准联调用 MockLLM")
     args = parser.parse_args()
+
+    if args.task_type and args.task_types:
+        parser.error("--task-type 与 --task-types 不能同时使用")
+    if args.task_types and (args.per_type_limit is None or args.per_type_limit <= 0):
+        parser.error("--task-types 需要正整数 --per-type-limit")
 
     run_dir = Path(args.run_dir)
     if not run_dir.exists():
@@ -250,6 +260,9 @@ def main() -> int:
                            alfworld_data=args.alfworld_data, max_steps=args.max_steps,
                            kinds=("code", "math", "env"))
     all_tasks = adapter.load_tasks(limit=0, task_type=args.task_type)
+    if args.task_types:
+        all_tasks = balanced_task_subset(
+            all_tasks, list(args.task_types), int(args.per_type_limit))
     if args.split == "test":
         if args.train_limit is None:
             print("[错误] test 切分需要 --train-limit（在线训练任务数）")

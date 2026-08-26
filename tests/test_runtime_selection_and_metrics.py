@@ -14,64 +14,99 @@ from atomic_skillgraph.tools.resolver import ToolResolver
 from experiments.report import summarize_episodes
 
 
-def _acquire_tool(tool_id: str, steps: list[str]) -> ToolAsset:
+def _action_tool(tool_id: str, steps: list[str]) -> ToolAsset:
     return ToolAsset(
         ref=ToolRef(tool_id, "1.0.0"),
         artifact_kind=ArtifactKind.ACTION_TEMPLATE,
-        summary="generic acquire",
-        signature={"parameters": [{"name": "object"},
-                                   {"name": "object_location"}]},
+        summary="generic verified transition",
+        signature={"parameters": [{"name": "fixture"},
+                                   {"name": "fixture_location"}]},
         artifact={"steps": steps},
         status=ToolLifecycle.CANDIDATE,
     )
 
 
-def test_discovery_context_prefers_take_only_acquire(workspace_tmp):
+def test_prepared_context_prefers_structurally_minimal_tool(workspace_tmp):
     graph = SkillGraphRegistry(workspace_tmp / "selector_graph")
     tools = ToolRegistry(workspace_tmp / "selector_tools")
     atomic = AbstractAtomicSkill(
-        ref=SkillRef("alfworld.acquire_object", "1.0.0"),
-        summary="acquire object",
-        inputs=[{"name": "object"}, {"name": "object_location"}],
-        outputs=[{"name": "object"}],
-        effects=[{"predicate": "agent.holds",
-                  "args": {"object": "$inputs.object"}}],
+        ref=SkillRef("generic.fixture_engaged", "1.0.0"),
+        summary="engage fixture",
+        inputs=[{"name": "fixture"}, {"name": "fixture_location"}],
+        outputs=[{"name": "fixture"}],
+        effects=[{"predicate": "fixture.engaged",
+                  "args": {"object": "$inputs.fixture"}}],
         status=SkillStatus.ACTIVE,
     )
     graph.register(atomic)
-    go_take = _acquire_tool(
-        "alfworld.acquire.go_take",
-        ["go to {object_location}", "take {object} from {object_location}"],
+    prepared_and_core = _action_tool(
+        "generic.fixture.move_engage",
+        ["move near {fixture_location}", "engage {fixture}"],
     )
-    take_only = _acquire_tool(
-        "alfworld.acquire.take_only",
-        ["take {object} from {object_location}"],
+    core_only = _action_tool(
+        "generic.fixture.engage_only",
+        ["engage {fixture}"],
     )
-    tools.register(go_take)
-    tools.register(take_only)
-    go_impl = ImplementationAtom(
-        ref=SkillRef("impl.acquire.go_take", "1.0.0"),
+    tools.register(prepared_and_core)
+    tools.register(core_only)
+    prepared_impl = ImplementationAtom(
+        ref=SkillRef("impl.fixture.move_engage", "1.0.0"),
         abstract_ref=atomic.ref,
-        tool_bindings=[ToolBinding(go_take.ref)],
+        tool_bindings=[ToolBinding(prepared_and_core.ref)],
         quality={"utility": 0.9, "success_count": 10},
     )
-    take_impl = ImplementationAtom(
-        ref=SkillRef("impl.acquire.take_only", "1.0.0"),
+    core_impl = ImplementationAtom(
+        ref=SkillRef("impl.fixture.engage_only", "1.0.0"),
         abstract_ref=atomic.ref,
-        tool_bindings=[ToolBinding(take_only.ref)],
+        tool_bindings=[ToolBinding(core_only.ref)],
         quality={"utility": 0.4, "success_count": 0},
     )
-    graph.register(go_impl)
-    graph.register(take_impl)
+    graph.register(prepared_impl)
+    graph.register(core_impl)
     selector = ImplementationSelector(graph, ToolResolver(tools), SystemConfig())
     context = {"harness": "env", "inputs": {
-        "object": "mug_1", "object_location": "countertop_1"}}
-    assert selector.select(atomic.ref, context).implementation.ref == go_impl.ref
-    context["prefer_take_only_acquire"] = True
-    assert selector.select(atomic.ref, context).implementation.ref == take_impl.ref
+        "fixture": "fixture_1", "fixture_location": "bay_1"}}
+    assert selector.select(atomic.ref, context).implementation.ref == prepared_impl.ref
+    context["prefer_minimal_after_preparation"] = True
+    assert selector.select(atomic.ref, context).implementation.ref == core_impl.ref
     ranked = selector.rank(atomic.ref, context)
     assert [choice.implementation.ref for choice in ranked] == [
-        take_impl.ref, go_impl.ref]
+        core_impl.ref, prepared_impl.ref]
+
+
+def test_selector_discovers_location_slot_from_learned_tool_contract(workspace_tmp):
+    graph = SkillGraphRegistry(workspace_tmp / "generic_location_graph")
+    tools = ToolRegistry(workspace_tmp / "generic_location_tools")
+    atomic = AbstractAtomicSkill(
+        ref=SkillRef("generic.fixture_engaged", "1.0.0"),
+        summary="verified transition", inputs=[{"name": "fixture"}],
+        effects=[{"predicate": "fixture.engaged",
+                  "args": {"object": "$inputs.fixture"}}],
+        status=SkillStatus.ACTIVE)
+    graph.register(atomic)
+    tool = ToolAsset(
+        ref=ToolRef("generic.engage", "1.0.0"),
+        artifact_kind=ArtifactKind.ACTION_TEMPLATE,
+        summary="generic executable",
+        signature={"parameters": [
+            {"name": "fixture"}, {"name": "fixture_location"}]},
+        artifact={"steps": [
+            "move near {fixture_location}", "engage {fixture}"]},
+        status=ToolLifecycle.CANDIDATE)
+    tools.register(tool)
+    impl = ImplementationAtom(
+        ref=SkillRef("impl.generic.fixture_engaged", "1.0.0"),
+        abstract_ref=atomic.ref,
+        tool_bindings=[ToolBinding(tool.ref)],
+        quality={"utility": 0.7, "success_count": 2},
+        status=SkillStatus.ACTIVE)
+    graph.register(impl)
+    selector = ImplementationSelector(graph, ToolResolver(tools), SystemConfig())
+    context = {"harness": "env", "inputs": {"fixture": "fixture_3"}}
+    assert selector.discoverable_location_slots(atomic.ref, context) == {
+        "fixture_location"}
+    assert selector.select_allowing_missing(
+        atomic.ref, context, {"fixture_location"}).implementation.ref == impl.ref
 
 
 def test_report_separates_any_direct_node_rate_and_all_direct_episodes():
@@ -90,5 +125,28 @@ def test_report_separates_any_direct_node_rate_and_all_direct_episodes():
     assert summary["any_direct_episode_rate"] == 1.0
     assert summary["direct_node_rate"] == 0.8333
     assert summary["all_nodes_direct_episode_rate"] == 0.5
+    assert summary["all_executed_nodes_direct_episode_rate"] == 0.5
+    assert summary["full_plan_direct_episode_rate"] == 0.5
+    assert summary["goal_early_terminal_episode_rate"] == 0.0
     assert summary["direct_node_count"] == 5
     assert summary["seeded_node_count"] == 1
+
+
+def test_report_separates_goal_early_terminal_from_direct_failure():
+    episodes = [
+        {"episode": 1, "success": True, "retries": 0,
+         "planned_node_count": 3, "executed_node_count": 2,
+         "goal_terminal_before_plan_complete": True,
+         "goal_terminal_skipped_node_count": 1,
+         "node_mode_counts": {"direct": 2}, "direct_reuse_count": 2,
+         "seeded_generation_count": 0, "dynamic_generation_count": 0},
+    ]
+    summary = summarize_episodes(episodes)
+    assert summary["direct_node_rate"] == 1.0
+    assert summary["all_executed_nodes_direct_episode_rate"] == 1.0
+    assert summary["full_plan_direct_episode_rate"] == 0.0
+    # Backward-compatible strict metric retains its original meaning.
+    assert summary["all_nodes_direct_episode_rate"] == 0.0
+    assert summary["goal_early_terminal_episode_count"] == 1
+    assert summary["goal_early_terminal_episode_rate"] == 1.0
+    assert summary["goal_terminal_skipped_node_count"] == 1

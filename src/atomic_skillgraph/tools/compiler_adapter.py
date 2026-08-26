@@ -28,7 +28,7 @@ _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 class AtomicSegment:
     """原子化后的成功轨迹片段（Trace Atomicizer 输出）。"""
 
-    name: str                       # 段名（如 acquire_object / normalize_values）
+    name: str                       # predicate-derived or learned segment name
     kind: str                       # "code" | "env"
     task_type: str = ""
     trace_id: str = ""
@@ -135,7 +135,7 @@ def mine_code_tools(trace: TraceRecord, segments: list[AtomicSegment],
 
 
 def _build_code_tool(segment: AtomicSegment, entry_point: str, trace: TraceRecord) -> ToolAsset:
-    params = _signature_from_ast(segment.code, entry_point)
+    call_params = _signature_from_ast(segment.code, entry_point)
     replay_case = {
         "kind": "replay",
         "entry_point": entry_point,
@@ -155,8 +155,12 @@ def _build_code_tool(segment: AtomicSegment, entry_point: str, trace: TraceRecor
         ),
         artifact_kind=ArtifactKind.PYTHON_CALLABLE,
         summary=segment.summary or f"Executable tool for atomic effect: {segment.name}",
-        signature={"entry_point": entry_point, "parameters": params},
-        interface={"inputs": params, "outputs": [{"name": "result"}]},
+        # Function arguments describe the callable API exercised by the
+        # benchmark tests. They are not configuration slots required to select
+        # and execute the source artifact itself.
+        signature={"entry_point": entry_point, "parameters": [],
+                   "call_parameters": call_params},
+        interface={"inputs": call_params, "outputs": [{"name": "result"}]},
         artifact={"code": segment.code},
         tests=[replay_case] if segment.tests else [],
         safety={"direct_execution_allowed": True, "checks_passed": []},
@@ -246,7 +250,13 @@ def mine_action_template_tools(trace: TraceRecord, segments: list[AtomicSegment]
     for segment in segments:
         if segment.kind != "env" or not segment.actions:
             continue
-        steps, slots = _parameterize_actions(segment.actions, segment.params)
+        # Semantic slicing may remove exploration, but an execution-location
+        # transition backed by the raw state trace is part of the reusable Tool
+        # contract. Recover it without consulting task types or capability names.
+        executable_actions, executable_params, promoted = (
+            _restore_grounded_location_transition(trace, segment))
+        steps, slots = _parameterize_actions(
+            executable_actions, executable_params)
         if not steps:
             continue
         # 清理：无槽位/无信息步骤是实例特有探索 → 移入 replay 前缀；
@@ -258,10 +268,10 @@ def mine_action_template_tools(trace: TraceRecord, segments: list[AtomicSegment]
             {"name": slot, "semantic_type": _guess_semantic_type(slot), "required": True}
             for slot in sorted(slots)
         ]
-        # One Atomic capability can have multiple valid executable shapes
-        # (Acquire from an open surface vs. go→open→take from a cabinet).  Give
-        # each normalized shape a stable identity so a later occurrence cannot
-        # overwrite or receive support for a different template body.
+        # One Atomic capability can have multiple valid executable shapes with
+        # different grounded setup requirements. Give each normalized shape a
+        # stable identity so later evidence cannot overwrite or receive support
+        # for a different template body.
         shape_key = content_hash({
             "steps": core_steps,
             "parameters": parameters,
@@ -271,9 +281,10 @@ def mine_action_template_tools(trace: TraceRecord, segments: list[AtomicSegment]
         # 源轨迹前缀动作（字面值）：admission replay 从任务初始状态开始，
         # 需先重放前缀以达成段落的前置状态（§28.2 source trace replay）
         prefix = _trace_prefix_actions(trace, segment) + extra_prefix
+        prefix = _drop_promoted_prefix_actions(prefix, promoted)
         replay_case = {
             "kind": "replay",
-            "bindings": segment.params,
+            "bindings": executable_params,
             "steps": core_steps,
             "before": segment.before,
             "after": segment.after,
@@ -294,8 +305,8 @@ def mine_action_template_tools(trace: TraceRecord, segments: list[AtomicSegment]
                 version="0.1.0",
             ),
             artifact_kind=ArtifactKind.ACTION_TEMPLATE,
-            # LLM rationale may mention the source object ("heat this cup").
-            # Tool identity/summary must describe the reusable capability.
+            # LLM rationale may mention a source instance. Tool identity and
+            # summary must still describe the reusable verified capability.
             summary=f"Action template for reusable atomic capability: {segment.name}",
             signature={"parameters": parameters},
             interface={
@@ -327,15 +338,18 @@ def mine_action_template_tools(trace: TraceRecord, segments: list[AtomicSegment]
 def _clean_template_steps(steps: list[str]) -> tuple[list[str], list[str]]:
     """模板步骤清理：返回 (核心符号化步骤, 探索前缀步骤)。
 
-    - 不含 {槽位} 的步骤 / look / inventory：实例特有探索 → 前缀（仅供 replay）
+    - 不含 {槽位} 的步骤：实例特有上下文 → 前缀（仅供 replay）
     - 连续重复去重
+
+    Whether an action is causally relevant has already been decided from its
+    structured event/state evidence. This cleaner must not reclassify it from
+    a benchmark verb such as ``look`` or ``inventory``.
     """
     core: list[str] = []
     prefix: list[str] = []
     for step in steps:
         stripped = str(step).strip()
-        lowered = stripped.lower()
-        if lowered in ("inventory", "look") or not re.search(r"\{[^}]+\}", stripped):
+        if not re.search(r"\{[^}]+\}", stripped):
             prefix.append(stripped)
             continue
         if core and core[-1] == stripped:
@@ -344,14 +358,124 @@ def _clean_template_steps(steps: list[str]) -> tuple[list[str], list[str]]:
     return core, prefix
 
 
+def _restore_grounded_location_transition(
+        trace: TraceRecord,
+        segment: AtomicSegment,
+        ) -> tuple[list[dict[str, Any]], dict[str, Any], list[str]]:
+    """Restore a removed transition that is proven to be executable context.
+
+    The raw trace must show that the transition newly establishes the agent's
+    location immediately before the core action. That location must also be a
+    core location role, or the observed location of an entity role used by the
+    core action. This separates required execution context from unrelated
+    exploration without enumerating verbs, tasks, or Atomic capability names.
+    """
+    actions = [dict(item) for item in segment.actions]
+    params = dict(segment.params or {})
+    if not actions:
+        return actions, params, []
+
+    core_text = "\n".join(str(item.get("name") or "") for item in actions)
+    first_step = min(int(item.get("step", 0)) for item in actions)
+    before_facts = {str(item) for item in (segment.before or {}).get("facts", [])}
+    current_locations = {
+        match.group(1) for fact in before_facts
+        if (match := re.fullmatch(r"agent_at\((.+?)\)", fact))
+    }
+    if not current_locations:
+        return actions, params, []
+
+    # TraceIR stores snapshot N before action N and N+1 after action N.
+    snapshots = {
+        int(item.get("step", 0)): set((item.get("state") or {}).get("facts", []))
+        for item in (trace.state_snapshots or [])
+    }
+    preceding: list[dict[str, Any]] = []
+    for item in trace.actions:
+        value = item.to_dict() if hasattr(item, "to_dict") else dict(item)
+        if (int(value.get("step", 0)) < first_step
+                and bool(value.get("accepted", True))):
+            preceding.append(value)
+
+    for location in sorted(current_locations):
+        role = _location_contract_role(params, core_text, before_facts, location)
+        if not role:
+            continue
+        location_slot = next(
+            (slot for slot, value in params.items()
+             if _is_location_role(slot)
+             and _norm_value(value) == _norm_value(location)),
+            _unique_location_slot(params, role),
+        )
+        for candidate in reversed(preceding):
+            step = int(candidate.get("step", 0))
+            prior = snapshots.get(step, set())
+            after = snapshots.get(step + 1, set())
+            fact = f"agent_at({location})"
+            if fact not in after or fact in prior:
+                continue
+            name = str(candidate.get("name") or "").strip()
+            # A concrete transition that cannot expose the location as a slot
+            # is not safe to turn into a reusable executable template.
+            if _replace_value(name, location, location_slot) == name:
+                continue
+            if any(int(item.get("step", -1)) == step for item in actions):
+                return actions, params, []
+            params[location_slot] = location
+            actions.insert(0, candidate)
+            return actions, params, [name]
+    return actions, params, []
+
+
+def _location_contract_role(params: dict[str, Any], core_text: str,
+                            facts: set[str], location: str) -> str:
+    """Return the core role whose execution is grounded at ``location``."""
+    normalized_location = _norm_value(location)
+    for slot, value in params.items():
+        if _replace_value(core_text, value, slot) == core_text:
+            continue
+        normalized_value = _norm_value(value)
+        if normalized_value == normalized_location:
+            return slot
+        if f"object_at({normalized_value}, {normalized_location})" in facts:
+            return slot
+    return ""
+
+
+def _unique_location_slot(params: dict[str, Any], role: str) -> str:
+    base = f"{role}_location"
+    if base not in params:
+        return base
+    index = 2
+    while f"{base}_{index}" in params:
+        index += 1
+    return f"{base}_{index}"
+
+
+def _is_location_role(role: str) -> bool:
+    lowered = str(role).lower()
+    return any(token in lowered for token in (
+        "location", "place", "destination", "origin"))
+
+
+def _drop_promoted_prefix_actions(prefix: list[str], promoted: list[str]) -> list[str]:
+    """Remove one source occurrence for each transition moved into the Tool."""
+    result = list(prefix)
+    for action in promoted:
+        wanted = str(action).strip().lower()
+        for index in range(len(result) - 1, -1, -1):
+            if str(result[index]).strip().lower() == wanted:
+                result.pop(index)
+                break
+    return result
+
+
 def _trace_prefix_actions(trace: TraceRecord, segment: AtomicSegment) -> list[str]:
     """源轨迹中该段之前的所有动作文本（按执行顺序，字面值）。"""
     if segment.replay_prefix_actions:
         return [str(action.get("action") or action.get("name") or "").strip()
                 for action in segment.replay_prefix_actions
-                if str(action.get("action") or action.get("name") or "").strip()
-                and str(action.get("action") or action.get("name") or "").lower()
-                not in ("inventory", "look")]
+                if str(action.get("action") or action.get("name") or "").strip()]
     segment_steps = {int(a.get("step", 0)) for a in segment.actions}
     if not segment_steps:
         return []
@@ -363,7 +487,7 @@ def _trace_prefix_actions(trace: TraceRecord, segment: AtomicSegment) -> list[st
         step = int(action_dict.get("step", 0))
         if step < first_step:
             name = str(action_dict.get("name", "")).strip()
-            if name and name.lower() not in ("inventory", "look"):
+            if name:
                 prefix.append(name)
     return prefix
 
@@ -372,8 +496,8 @@ def _parameterize_actions(actions: list[dict[str, Any]],
                           params: dict[str, Any]) -> tuple[list[str], set[str]]:
     """把动作序列参数化：动作文本中的实例常量替换为 {slot} 占位符。
 
-    动作文本（如 "take tomato 1 from countertop 1"）中的参数值按词边界替换；
-    值相同的参数（如 go-to 与 take 的同一位置）归一为同一 slot。
+    动作文本中的参数值按词边界替换；不同动作引用的同一个实例值归一为同一
+    slot。
     """
     value_to_slot: dict[str, str] = {}
     slots: set[str] = set()
@@ -429,8 +553,10 @@ def _norm_value(value: Any) -> str:
 
 def _guess_semantic_type(slot: str) -> str:
     lowered = slot.lower()
-    if "location" in lowered or "recep" in lowered or lowered in ("sink", "shelf", "countertop"):
+    if any(token in lowered for token in (
+            "location", "place", "destination", "source", "origin")):
         return "location_ref"
-    if "station" in lowered or "heating" in lowered or "cooling" in lowered:
-        return "station_ref"
+    if any(token in lowered for token in (
+            "resource", "device", "instrument", "station")):
+        return "resource_ref"
     return "object_ref"

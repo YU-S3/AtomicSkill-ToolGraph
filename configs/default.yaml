@@ -59,6 +59,8 @@ features:                             # 消融开关（实验入口可覆盖）
 seed: 42
 max_repairs: 2
 retrieval_top_k: 5
-task_type_soft_bonus: 0.3
+# Official labels are sampling/report metadata in the main method. A non-zero
+# value is used only when an explicit task-type-restricted ablation enables it.
+task_type_soft_bonus: 0.0
 max_steps: 50
 maintenance_interval: 5

@@ -113,7 +113,7 @@ class FailureProcessor:
                  attribution: FailureAttribution) -> dict[str, Any] | None:
         kind = attribution.kind
         common = {"attribution": attribution.to_dict(),
-                  "task_type": trace.task_type, "tool_refs": list(trace.tool_refs)}
+                  "tool_refs": list(trace.tool_refs)}
         if kind == ErrorKind.TOOL_EXECUTION_ERROR:
             return self.proposals.add(
                 "tool_update", trace.trace_id, attribution.node_ref,

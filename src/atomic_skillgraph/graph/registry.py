@@ -443,7 +443,13 @@ def _norm_effect(effect: dict[str, Any]) -> str:
     if not isinstance(effect, dict):
         return str(effect)
     name = str(effect.get("predicate", ""))
-    args = {k: str(v) for k, v in (effect.get("args") or {}).items()}
+    # Placeholder paths belong to different scopes in stored Skills and task
+    # goals (for example $inputs.object versus $object). Retrieval compares the
+    # verified predicate/argument contract, not those serialization paths.
+    args = {
+        str(key): ("$" if str(value).startswith("$") else str(value))
+        for key, value in (effect.get("args") or {}).items()
+    }
     return f"{name}:{json.dumps(args, sort_keys=True)}"
 
 

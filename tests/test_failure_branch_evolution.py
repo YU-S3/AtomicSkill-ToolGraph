@@ -229,9 +229,11 @@ def test_seeded_failure_dynamic_rescue_evolves_atomic_in_isolated_branch(workspa
         "trace_atomic_repair", "trace_atomic_repair_second_evidence"]
 
 
-def test_atomic_repair_parameterizes_entities_and_removes_open_close_cycles(workspace_tmp):
+def test_atomic_repair_parameterizes_entities_and_removes_state_cycles_from_evidence(
+        workspace_tmp):
     root = workspace_tmp / "generalized_repair"
-    registry, tools, atomic, _tool = _bank(root)
+    registry, tools, atomic, _tool = _bank(
+        root, effect_predicate="object.heated")
     actions = [
         "open microwave 1", "close microwave 1", "open microwave 1",
         "repair apple 1 with microwave 1",
@@ -242,6 +244,13 @@ def test_atomic_repair_parameterizes_entities_and_removes_open_close_cycles(work
         actions=[ActionRecord(step=index, name=name, mode=ExecutionMode.DYNAMIC,
                               node_ref=str(atomic.ref))
                  for index, name in enumerate(actions)],
+        state_snapshots=_state_snapshots(
+            [],
+            ["container_open(microwave_1)"],
+            [],
+            ["container_open(microwave_1)"],
+            ["container_open(microwave_1)", "object_heated(apple_1)"],
+        ),
         realized_atomic_nodes=[{
             "ref": str(atomic.ref),
             "params": {"object": "apple 1", "heating_station": "microwave 1"},
@@ -252,7 +261,7 @@ def test_atomic_repair_parameterizes_entities_and_removes_open_close_cycles(work
                  "action_end": 0, "before": {}, "after": {}},
                 {"mode": "dynamic", "passed": True, "failure_type": "",
                  "action_start": 0, "action_end": 4, "before": {},
-                 "after": {"facts": ["object.done(apple_1)"]}},
+                 "after": {"facts": ["object_heated(apple_1)"]}},
             ],
         }],
     )

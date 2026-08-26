@@ -139,6 +139,39 @@ def test_atomic_plan_closes_dependencies_and_orders_acquire_heat_place(workspace
         "alfworld.acquire_object", "alfworld.heat_object", "alfworld.place_object"]
 
 
+def test_pick_two_atomic_plan_repeats_closed_acquire_place_branch(workspace_tmp):
+    registry = SkillGraphRegistry(workspace_tmp / "pick_two_graph")
+    acquire = _atomic("alfworld.acquire_object", "agent.holds", ["object"])
+    place = _atomic("alfworld.place_object", "object.at_location",
+                    ["object", "target_location"])
+    acquire.metadata["task_type_labels"] = ["pick_two_obj_and_place"]
+    place.metadata["task_type_labels"] = ["pick_two_obj_and_place"]
+    place.preconditions = [{"predicate": "agent.holds",
+                            "args": {"object": "$inputs.object"}}]
+    registry.register(acquire)
+    registry.register(place)
+    config = SystemConfig()
+    config.features.enable_composite = False
+    planner = AtomicPlanner(registry, config)
+    task = Task(
+        task_id="pick_two", benchmark="alfworld",
+        task_type="pick_two_obj_and_place",
+        goal="put two cd in safe.", state={"facts": []},
+        context={"params": {"object": "cd", "object_type": "cd",
+                            "target_location": "safe 1"}},
+        target_effects=[{
+            "predicate": "object.at_location",
+            "args": {"object": "$object_type", "location": "$target_location"},
+            "cardinality": 2, "distinct_by": "object",
+        }],
+    )
+    plan = planner.compile_runtime_graph(task)
+    assert [node.ref.logical_id for node in plan.nodes] == [
+        "alfworld.acquire_object", "alfworld.place_object",
+        "alfworld.acquire_object", "alfworld.place_object",
+    ]
+
+
 def test_legacy_composite_cannot_bind_destination_as_acquire_source():
     resolved = AtomicPlanner._resolve_composite_params(
         {"object": "$task.object",
@@ -146,6 +179,31 @@ def test_legacy_composite_cannot_bind_destination_as_acquire_source():
         _task(params={"object": "mug", "target_location": "cabinet 1"}),
     )
     assert resolved == {"object": "mug"}
+
+
+def test_learned_parameter_family_binds_unstated_resource_without_task_type():
+    atomic = _atomic(
+        "generic.state_change", "object.changed",
+        ["object", "transformation_resource"])
+    atomic.metadata["observed_parameter_families"] = {
+        "object": ["apple"],
+        "transformation_resource": ["fixture"],
+    }
+    task = Task(
+        task_id="unseen", benchmark="generic_env", task_type="secret_label",
+        goal="make an apple ready", state={"facts": []},
+        context={
+            "params": {"object": "apple"},
+            "goal_roles": {"theme": "apple"},
+            "exposed_entities": ["fixture_7", "bay_2"],
+        },
+    )
+    planner = AtomicPlanner(SkillGraphRegistry.__new__(SkillGraphRegistry),
+                            SystemConfig())
+    assert planner._bind_params(task, atomic) == {
+        "object": "apple",
+        "transformation_resource": "fixture_7",
+    }
 
 
 def test_lifecycle_review_runs_even_when_heavy_maintenance_is_deferred():

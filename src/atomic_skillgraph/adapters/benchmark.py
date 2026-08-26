@@ -231,32 +231,59 @@ class BenchmarkAdapter(Protocol):
 
 
 # ---------------------------------------------------------------------------
-# 通用 goal 解析工具（弱参数提取；ALFWorld 真实环境可复用 vendored param_extractor）
+# 通用 goal 语义角色弱解析。它只读取用户可见文本，不接收 benchmark label，
+# 也不包含实体白名单、任务流程或中间资源映射。
 # ---------------------------------------------------------------------------
 
 def parse_goal_params(goal: str, input_names: list[str]) -> dict[str, Any]:
-    """从 goal 文本中弱提取对象/位置参数（用于原子节点参数绑定兜底）。"""
+    """Bind role-shaped input names to explicit relations in the goal text.
+
+    This is intentionally conservative. Hidden execution positions and
+    unstated resources stay unbound for learned-contract matching or runtime
+    discovery instead of being guessed from a benchmark task type.
+    """
+    text = re.sub(r"\s+", " ", str(goal or "").strip().lower()).rstrip(". !?")
+    if not text:
+        return {}
+
+    destination = ""
+    associated = ""
+    source = ""
+    trailing = re.search(
+        r"\b(in|on|into|onto|under|with|using|from)\s+(?:the\s+)?"
+        r"([a-z][a-z0-9]*(?:\s+\d+)?)\s*$", text)
+    prefix = text
+    if trailing:
+        relation, value = trailing.group(1), trailing.group(2).strip()
+        prefix = text[:trailing.start()].strip()
+        if relation in {"in", "on", "into", "onto"}:
+            destination = value
+        elif relation == "from":
+            source = value
+        else:
+            associated = value
+
+    first_clause = re.split(r"\b(?:and then|then|and)\b", prefix, maxsplit=1)[0]
+    words = re.findall(r"[a-z][a-z0-9]*", first_clause)
+    ignored = {"a", "an", "the", "some", "one", "two", "three", "four", "five",
+               "it", "them", "this", "that"}
+    content = [word for word in words if word not in ignored]
+    theme = content[-1] if content else ""
+
     params: dict[str, Any] = {}
-    goal_lower = goal.lower()
     for name in input_names:
-        lower = name.lower()
-        if lower in ("object_location", "source_location", "source"):
-            match = re.search(r"\bfrom\s+(?:the\s+)?([a-z]+(?:\s+\d+)?)", goal_lower)
-            if match:
-                params[name] = match.group(1).strip()
-        elif "location" in lower or lower in ("recep", "target", "target_location", "sink"):
-            # 单词边界避免把 ``heat an object`` 末尾的 ``at`` 误当成
-            # 位置介词，从而错误绑定 target_location="an"。
-            match = re.search(r"\b(?:in|on|into|to|at)\b\s+(?:the\s+)?([a-z0-9 ]+?)(?:\.|$|\s)", goal_lower)
-            if match and match.group(1).strip():
-                params[name] = match.group(1).strip()
-            else:
-                recep_match = re.search(r"(countertop|shelf|drawer|cabinet|fridge|microwave|sink|garbagecan|toilet|bathtub|stoveburner|coffeemachine|dresser|desk|sidetable|ottoman|bed|safe|box|basin|cart|laundryhamper|pan|pot|bowl|plate|mug|cup|bottle|knife|fork|spoon|butterknife|plate|lettuce|tomato|potato|apple|bread|egg|laptop|cellphone|book|newspaper|pen|pencil|creditcard|key|remotecontrol|watch|tissue|soap|candle|cloth|spraybottle|teddybear|statue|vase)", goal_lower)
-                if recep_match:
-                    params[name] = recep_match.group(1).strip()
-        elif "object" in lower or lower in ("obj", "target_object", "item"):
-            # 取第一个名词（排除容器/位置词）
-            obj_match = re.search(r"(?:take|get|pick|put|move|clean|heat|cool|examine|use|look at|place|find|grab)\s+(?:up\s+)?(?:(?:the|a|an|some)\s+)?([a-z0-9 ]+?)(?:\s+(?:and|with|from|in|on|to|into|at|then)|\.|$|\s)", goal_lower)
-            if obj_match and obj_match.group(1).strip():
-                params[name] = obj_match.group(1).strip()
-    return {k: v for k, v in params.items() if v}
+        lowered = str(name).lower()
+        tokens = set(filter(None, re.split(r"[^a-z0-9]+", lowered)))
+        value = ""
+        if tokens & {"source", "origin"} and tokens & {"location", "place", "container"}:
+            value = source
+        elif tokens & {"destination", "target", "recep"} and tokens & {
+                "location", "place", "container", "destination", "target", "recep"}:
+            value = destination
+        elif tokens & {"associated", "reference", "instrument", "resource", "device", "light"}:
+            value = associated
+        elif tokens & {"object", "item", "theme", "entity", "obj"} and "location" not in tokens:
+            value = theme
+        if value:
+            params[str(name)] = value
+    return params

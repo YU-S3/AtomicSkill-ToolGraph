@@ -1,7 +1,7 @@
 """Atomic Skill Node Validator（三级验证体系第 2 层，设计文档 v2.0 §35.2）。
 
 回答：该 Tool/Implementation 执行后，Atomic Skill 的核心状态 Effect 是否真的发生？
-例：AcquireObject → inventory contains object。
+验证标准来自节点自己的结构化 Precondition/Effect 合同。
 """
 
 from __future__ import annotations

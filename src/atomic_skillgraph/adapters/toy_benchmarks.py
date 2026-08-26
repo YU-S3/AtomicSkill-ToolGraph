@@ -13,7 +13,7 @@ import re
 from typing import Any
 
 from ..core.llm import LLM
-from ..core.predicates import StateSnapshot, check_effects
+from ..core.predicates import StateSnapshot, _fact_to_predicate, check_effects
 from ..tools.sandbox import Sandbox
 from .benchmark import (
     BenchmarkAdapter,
@@ -157,7 +157,11 @@ def toy_tasks(kinds: tuple[str, ...] = ("code", "math", "env")) -> list[Task]:
                          "objects": spec["objects"],
                          "params": spec.get("params", {})},
                 state=initial_world.state(),
-                target_effects=[],
+                # The fixture already exposes terminal fact checks. Convert
+                # those facts mechanically into the formal target contract;
+                # do not recover it from the task label or an operation list.
+                target_effects=[predicate for fact in spec["checks"]
+                                if (predicate := _fact_to_predicate(fact)) is not None],
                 metadata={},
             ))
     return tasks

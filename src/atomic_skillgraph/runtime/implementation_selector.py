@@ -52,7 +52,8 @@ class ImplementationSelector:
         """返回全部可绑定实现，供 Runtime 逐个通过 Direct Gate。
 
         排序只是偏好，不等于执行许可；可靠性、前置条件和验证仍由 Direct Gate
-        决定。这样首选 take-only 尚未成熟时可以安全回退到 active 实现。
+        决定。框架若已经建立了某些执行前置状态，会优先选择不重复这些准备动作
+        的最小实现，但不会依据动作动词或预定义能力名称识别实现。
         """
         candidates = self._implementations_of(atomic_ref)
         if not candidates:
@@ -79,11 +80,11 @@ class ImplementationSelector:
             score = float(quality.get("utility", 0.5))
             success = int(quality.get("success_count", 0))
             score += 0.02 * min(success, 10)
-            # 位置发现已经把 Agent 放在已验证的 object_location，并打开了必要
-            # 容器。此时 take-only 是与当前状态最匹配的最小实现；不能再按历史
-            # support 选回冗余的 go-to/take 模板。
-            if context.get("prefer_take_only_acquire"):
-                score += 10.0 if _is_take_only_acquire(usable) else 0.0
+            # 外部准备已经建立了可验证的位置/可达性状态时，最短的符号化实现
+            # 与当前状态最匹配。这里只计算 Tool 的步骤数，不检查动作词，也不
+            # 假定当前 Atomic 属于任何预定义操作类别。
+            if context.get("prefer_minimal_after_preparation"):
+                score += _prepared_state_fit_score(usable)
             ranked.append((score, impl))
 
         if not ranked:
@@ -134,6 +135,40 @@ class ImplementationSelector:
         return ImplementationChoice(ranked[0][1],
                                     f"selected_for_parameter_discovery:{ranked[0][0]:.3f}")
 
+    def discoverable_location_slots(self, atomic_ref: SkillRef,
+                                    context: dict[str, Any]) -> set[str]:
+        """Return location-only gaps of the best otherwise-bindable Tool.
+
+        The parameter names are learned Tool contracts. No task label, action
+        verb, entity class, or benchmark operation is consulted.
+        """
+        ranked: list[tuple[float, set[str]]] = []
+        for impl in self._implementations_of(atomic_ref):
+            if impl.status != SkillStatus.ACTIVE:
+                continue
+            harness = (impl.compatibility or {}).get("harness", "")
+            if harness and context.get("harness") and harness != context["harness"]:
+                continue
+            if not self.config.features.enable_nm_binding and len(impl.tool_bindings) != 1:
+                continue
+            resolved = self.tool_resolver.resolve(impl, context)
+            if not resolved or any(item.tool is None or not item.tool.is_usable()
+                                   for item in resolved):
+                continue
+            missing = {str(value) for item in resolved
+                       for value in (item.missing or [])}
+            if not missing or not all(value.endswith("_location")
+                                      for value in missing):
+                continue
+            quality = impl.quality or {}
+            score = float(quality.get("utility", 0.5))
+            score += 0.02 * min(int(quality.get("success_count", 0)), 10)
+            ranked.append((score, missing))
+        if not ranked:
+            return set()
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        return set(ranked[0][1])
+
     def _implementations_of(self, atomic_ref: SkillRef) -> list[ImplementationAtom]:
         result: list[ImplementationAtom] = []
         for impl in self.registry.list_all_versions(SkillNodeKind.IMPLEMENTATION_ATOMIC):
@@ -142,11 +177,20 @@ class ImplementationSelector:
         return result
 
 
-def _is_take_only_acquire(resolved_tools: list[Any]) -> bool:
-    if len(resolved_tools) != 1:
-        return False
-    tool = resolved_tools[0].tool
-    steps = [str(step).strip().lower()
-             for step in (tool.artifact.get("steps") or [])
-             if str(step).strip().lower() not in ("look", "inventory")]
-    return len(steps) == 1 and steps[0].startswith("take ")
+def _prepared_state_fit_score(resolved_tools: list[Any]) -> float:
+    """Prefer the least redundant executable shape after verified preparation.
+
+    The score is deliberately structural. It has no benchmark verb list and
+    therefore works for any learned Tool whose alternative implementations
+    differ only by already-satisfied setup steps.
+    """
+    step_count = sum(
+        1
+        for item in resolved_tools
+        for step in (item.tool.artifact.get("steps") or [])
+        if str(step).strip()
+    )
+    # One redundant step must dominate the bounded historical utility bonus;
+    # otherwise a high-support setup-heavy shape still wins after that setup
+    # has already been executed by controlled discovery.
+    return 10.0 - 2.0 * min(step_count, 50)

@@ -47,6 +47,9 @@ def main() -> int:
                         choices=["alfworld", "humaneval", "gsm8k", "toy"])
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--task-type", default="pick_heat_then_place_in_recep")
+    parser.add_argument("--task-types", nargs="+", default=None,
+                        help="ALFWorld 多 label 均衡交错，共享同一在线 bank")
+    parser.add_argument("--per-type-limit", type=int, default=None)
     parser.add_argument("--conditions", nargs="+", default=DEFAULT_CONDITIONS)
     parser.add_argument("--max-steps", type=int, default=100)
     parser.add_argument("--alfworld-data", default=None)
@@ -61,6 +64,14 @@ def main() -> int:
     parser.add_argument("--rerun-online", action="store_true",
                         help="与 --run-dir 同用：仅将所选 ours 从零重跑，保留 baseline")
     args = parser.parse_args()
+
+    if args.task_types:
+        if args.benchmark != "alfworld":
+            parser.error("--task-types 目前只用于 ALFWorld")
+        if args.per_type_limit is None or args.per_type_limit <= 0:
+            parser.error("--task-types 需要正整数 --per-type-limit")
+        # The total limit is derived from the balanced design.
+        args.limit = len(args.task_types) * int(args.per_type_limit)
 
     invalid = [condition for condition in args.conditions
                if condition not in OUR_CONDITIONS]
@@ -90,7 +101,11 @@ def main() -> int:
                 "--fresh-conditions",
             ]
             if args.benchmark == "alfworld":
-                online_command += ["--task-type", args.task_type]
+                if args.task_types:
+                    online_command += ["--task-types", *args.task_types,
+                                       "--per-type-limit", str(args.per_type_limit)]
+                else:
+                    online_command += ["--task-type", args.task_type]
                 if args.alfworld_data:
                     online_command += ["--alfworld-data", args.alfworld_data]
             if args.mock:
@@ -108,7 +123,11 @@ def main() -> int:
             "--output-dir", str(online_root),
         ]
         if args.benchmark == "alfworld":
-            online_command += ["--task-type", args.task_type]
+            if args.task_types:
+                online_command += ["--task-types", *args.task_types,
+                                   "--per-type-limit", str(args.per_type_limit)]
+            else:
+                online_command += ["--task-type", args.task_type]
             if args.alfworld_data:
                 online_command += ["--alfworld-data", args.alfworld_data]
         if args.mock:
@@ -143,7 +162,11 @@ def main() -> int:
         "--output-dir", str(eval_root),
     ]
     if args.benchmark == "alfworld":
-        eval_command += ["--task-type", args.task_type]
+        if args.task_types:
+            eval_command += ["--task-types", *args.task_types,
+                             "--per-type-limit", str(args.per_type_limit)]
+        else:
+            eval_command += ["--task-type", args.task_type]
         if args.alfworld_data:
             eval_command += ["--alfworld-data", args.alfworld_data]
     if args.mock:
@@ -185,7 +208,9 @@ def main() -> int:
         "benchmark": args.benchmark,
         "conditions": args.conditions,
         "limit": args.limit,
-        "task_type": args.task_type,
+        "task_type": None if args.task_types else args.task_type,
+        "task_types": args.task_types or [],
+        "per_type_limit": args.per_type_limit,
         "max_steps": args.max_steps,
         "online_run_dir": str(run_dir),
         "frozen_eval_dir": str(eval_dir),

@@ -26,6 +26,7 @@ _PREDICATE_FACT_NAMES: dict[str, tuple[str, tuple[str, ...]]] = {
     "object.cleaned": ("object_cleaned", ("object",)),
     "object.cooled": ("object_cooled", ("object",)),
     "object.lit": ("object_lit", ("object",)),
+    "object.toggled": ("object_toggled", ("object",)),
     "object.in_receptacle": ("object_in_receptacle", ("object", "receptacle")),
     "container.open": ("container_open", ("container",)),
     "location.checked": ("location_checked", ("location",)),
@@ -115,6 +116,13 @@ def evaluate_predicate(state: StateSnapshot, predicate: dict[str, Any]) -> bool:
 
     fact = _fact_string(name, args)
 
+    cardinality = max(1, int(predicate.get("cardinality", 1) or 1))
+    if cardinality > 1:
+        # Matching facts are distinct grounded tuples. This supplies the
+        # explicit ``o1 != o2`` semantics required by ALFWorld pick-two while
+        # retaining a reusable class-valued object argument.
+        return _matching_fact_count(state, fact) >= cardinality
+
     # 特定求值器
     if name == "object.exists":
         return _object_known(state, args.get("object"))
@@ -137,13 +145,19 @@ def evaluate_predicate(state: StateSnapshot, predicate: dict[str, Any]) -> bool:
 
 def _has_matching_fact(state: StateSnapshot, expected_fact: str) -> bool:
     """匹配规范事实，并允许 ALFWorld 类名与实例编号等价（apple ↔ apple_1）。"""
+    return _matching_fact_count(state, expected_fact) > 0
+
+
+def _matching_fact_count(state: StateSnapshot, expected_fact: str) -> int:
+    """Count distinct grounded facts matching a possibly class-valued fact."""
     if state.has_fact(expected_fact):
-        return True
+        return 1
     expected = _FACT_RE.match(expected_fact)
     if expected is None:
-        return False
+        return 0
     expected_name = expected.group(1)
     expected_args = [part.strip() for part in expected.group(2).split(",")]
+    matches = 0
     for actual_fact in state.facts:
         actual = _FACT_RE.match(actual_fact)
         if actual is None or actual.group(1) != expected_name:
@@ -153,8 +167,8 @@ def _has_matching_fact(state: StateSnapshot, expected_fact: str) -> bool:
             continue
         if all(_value_matches(want, got)
                for want, got in zip(expected_args, actual_args)):
-            return True
-    return False
+            matches += 1
+    return matches
 
 
 def _value_matches(expected: Any, actual: Any) -> bool:

@@ -188,6 +188,11 @@ class AtomicSkillGraphSystem:
                 (trace.validation_layers.get("composite") or {}).get("passed", True)),
             "benchmark_passed": bool(trace.success),
         }
+        goal_terminal_before_plan_complete = bool(
+            trace.success
+            and len(runtime_graph.nodes) > 0
+            and executed_node_count < len(runtime_graph.nodes)
+        )
         episode = {
             "episode": self.episode_count,
             "task_id": task.task_id,
@@ -216,6 +221,15 @@ class AtomicSkillGraphSystem:
             "node_mode_counts": node_mode_counts,
             "planned_node_count": len(runtime_graph.nodes),
             "executed_node_count": executed_node_count,
+            # The benchmark may legally terminate before every retrieved node is
+            # needed.  Keep this separate from a runtime/tool failure.  This is
+            # observable in ALFWorld games whose initial PDDL state already
+            # satisfies one component of the natural-language goal.
+            "goal_terminal_before_plan_complete": goal_terminal_before_plan_complete,
+            "goal_terminal_skipped_node_count": (
+                len(runtime_graph.nodes) - executed_node_count
+                if goal_terminal_before_plan_complete else 0
+            ),
             "fallback_node_count": sum(bool(node.fallback_reason)
                                        for node in runtime_graph.nodes),
             "validation_summary": validation_summary,
@@ -558,57 +572,100 @@ class AtomicSkillGraphSystem:
         for index, planned in enumerate(plan.nodes):
             node = runtime_graph.nodes[index]
             before = dict((resume or {}).get("state") or task.state or {})
-            # Acquire is intentionally planned with a class-valued slot such as
-            # ``mug`` because the object location is initially hidden.  Once a
-            # concrete instance is held, carry that identity through Heat and
-            # Place.  This is the runtime realization of Composite DATA_FLOW.
+            # A plan may initially contain a class-valued entity slot because a
+            # concrete instance is still hidden. Once execution establishes an
+            # instance identity, carry it through later DATA_FLOW edges.
             planned.params = _refine_env_object_binding(planned.params, before)
+            # RuntimeNodeState is created before execution.  Keep its persisted
+            # view synchronized with parameters refined by prior-node data flow
+            # or by framework discovery; otherwise node_results records the
+            # stale class-valued planning input rather than the executed one.
+            node.params = dict(planned.params)
             atomic = None if planned.dynamic else self._get_recommended(planned.ref.logical_id)
             effects = list(planned.target_effects or getattr(atomic, "effects", []) or [])
             candidates: list[tuple[ExecutionMode, str, list[dict[str, Any]]]] = []
-            acquire_discovered = False
+            location_discovered = False
 
             if atomic is not None:
-                # Acquire Tool 的 object_location 属于可发现参数。只有启用 Tool
-                # evolution 的条件才开放该受控通道，避免把能力错误归给 Graph-only。
-                is_acquire = any(
+                produces_possession = any(
                     str(effect.get("predicate") or "").replace("_", ".") == "agent.holds"
                     for effect in effects if isinstance(effect, dict))
                 discover = getattr(self.adapter, "discover_object_location", None)
-                if (is_acquire and self.config.features.enable_tool_evolution
-                        and callable(discover) and planned.params.get("object")
-                        and not planned.params.get("object_location")):
+                # Location slots come from the learned Atomic/Tool interface,
+                # never from task_type or a fixed operation list. Bind anything
+                # already witnessed in state before opening the bounded search.
+                planned.params = _bind_known_location_slots(
+                    planned.params, atomic, before)
+                node.params = dict(planned.params)
+                location_slots = self.selector.discoverable_location_slots(
+                    atomic.ref, {"inputs": planned.params, "harness": "env"})
+                location_slots |= {
+                    str(item.get("name")) for item in (atomic.inputs or [])
+                    if isinstance(item, dict)
+                    and str(item.get("name") or "").endswith("_location")
+                    and not planned.params.get(str(item.get("name")))
+                }
+                if (self.config.features.enable_tool_evolution
+                        and callable(discover) and location_slots):
                     partial = self.selector.select_allowing_missing(
                         atomic.ref, {"inputs": planned.params, "harness": "env"},
-                        {"object_location"})
+                        set(location_slots))
                     if partial.implementation is not None:
                         partial_resolved = self.resolver.resolve(
                             partial.implementation, {"inputs": planned.params})
                         discovery_tool_refs = [str(item.binding.tool_ref)
                                                for item in partial_resolved]
-                        binding, discovery_result = discover(
-                            task, str(planned.params["object"]), resume=resume,
-                            max_locations=self.config.thresholds.acquire_discovery_max_locations,
-                            node_ref=str(planned.ref),
-                            tool_ref=discovery_tool_refs[0] if discovery_tool_refs else "")
-                        resume = _env_resume_payload(discovery_result)
-                        before = dict(resume.get("state") or before)
-                        trace.metrics.setdefault("acquire_location_discovery", []).append({
-                            "node_ref": str(planned.ref),
-                            "found": bool(binding),
-                            "binding": dict(binding),
-                            "checked_locations": list(
-                                (before.get("meta") or {}).get("checked_locations") or []),
-                            "search_actions": len(discovery_result.actions),
-                        })
-                        if binding:
-                            planned.params.update(binding)
-                            acquire_discovered = True
-                        else:
-                            node.fallback_reason = "object_location_discovery_failed"
+                        for location_slot in sorted(location_slots):
+                            if planned.params.get(location_slot):
+                                continue
+                            entity_role = location_slot[:-len("_location")]
+                            entity_value = planned.params.get(entity_role)
+                            if entity_value in (None, ""):
+                                continue
+                            excluded_objects = (
+                                _completed_distinct_effect_instances(
+                                    task, before, planned.params)
+                                if entity_role == "object" else set())
+                            binding, discovery_result = discover(
+                                task, str(entity_value), resume=resume,
+                                max_locations=self.config.thresholds.acquire_discovery_max_locations,
+                                node_ref=str(planned.ref),
+                                tool_ref=discovery_tool_refs[0]
+                                if discovery_tool_refs else "",
+                                excluded_objects=excluded_objects,
+                                allow_passive_navigable=not produces_possession)
+                            resume = _env_resume_payload(discovery_result)
+                            before = dict(resume.get("state") or before)
+                            remapped = _remap_location_binding(
+                                binding, entity_role, location_slot)
+                            metric = {
+                                "node_ref": str(planned.ref),
+                                "entity_role": entity_role,
+                                "location_role": location_slot,
+                                "found": bool(remapped),
+                                "binding": dict(remapped),
+                                "excluded_objects": sorted(excluded_objects),
+                                "checked_locations": list(
+                                    (before.get("meta") or {}).get(
+                                        "checked_locations") or []),
+                                "search_actions": len(discovery_result.actions),
+                            }
+                            trace.metrics.setdefault(
+                                "controlled_location_discovery", []).append(metric)
+                            if produces_possession and entity_role == "object":
+                                trace.metrics.setdefault(
+                                    "acquire_location_discovery", []).append(metric)
+                            if remapped:
+                                planned.params.update(remapped)
+                                node.params = dict(planned.params)
+                                location_discovered = True
+                            else:
+                                node.fallback_reason = (
+                                    f"location_discovery_failed:{location_slot}")
+                                break
                 selection_context = {
                     "inputs": planned.params, "harness": "env",
-                    "prefer_take_only_acquire": acquire_discovered,
+                    "prefer_minimal_after_preparation": location_discovered,
                 }
                 ranked_choices = self.selector.rank(atomic.ref, selection_context)
                 fallback_payload = None
@@ -697,6 +754,25 @@ class AtomicSkillGraphSystem:
                 last_result = result
                 after_payload = _env_resume_payload(result)
                 after = dict(after_payload.get("state") or attempt_before)
+                # Seeded/Dynamic agents can discover an initially unbound
+                # entity while executing the node (for example the concrete
+                # light used by a generic toggle capability).  Ground only
+                # contract input slots from accepted action parameters and
+                # observed state Effects, then validate with those realized
+                # bindings.  Benchmark success is never used as a substitute
+                # for this evidence.
+                grounded, binding_evidence = _ground_env_runtime_params(
+                    planned.params, atomic, effects, result,
+                    action_start=action_start, before=attempt_before,
+                    after=after, node_ref=str(planned.ref))
+                planned.params = grounded
+                node.params = dict(grounded)
+                if binding_evidence:
+                    trace.metrics.setdefault("runtime_param_bindings", []).append({
+                        "node_ref": str(planned.ref),
+                        "mode": mode.value,
+                        "bindings": binding_evidence,
+                    })
                 passed = bool(getattr(result, "atomic_complete", False))
                 validation = None
                 if atomic is not None:
@@ -718,6 +794,7 @@ class AtomicSkillGraphSystem:
                     trace.node_validators.append(validation)
                 node.attempts.append({"mode": mode.value, "passed": passed,
                                       "failure_type": str(result.failure_type or ""),
+                                      "params": dict(planned.params),
                                       "tool_refs": list(node.tool_refs)
                                       if mode == ExecutionMode.DIRECT else [],
                                       "action_start": action_start,
@@ -765,6 +842,13 @@ class AtomicSkillGraphSystem:
 
     def _finalize_validation(self, trace: TraceRecord, task: Task) -> None:
         """持久化四层验证结果；各层独立记录，不用上层成功掩盖下层失败。"""
+        realized_inputs = _realized_task_bindings(
+            dict(task.context.get("params") or {}),
+            trace.realized_atomic_nodes)
+        # Persist the exact validation bindings separately from the semantic
+        # task parameters.  This makes instance grounding auditable without
+        # leaking concrete instances into learned Skill/Tool identity.
+        trace.provenance["realized_params"] = copy.deepcopy(realized_inputs)
         trace.validation_layers["atomic"] = [item.to_dict()
                                                for item in trace.node_validators
                                                if item.level == "atomic"]
@@ -778,7 +862,7 @@ class AtomicSkillGraphSystem:
                 result = self.composite_validator.validate_composite(
                     composite,
                     [item for item in trace.node_validators if item.level == "atomic"],
-                    trace.final_state(), inputs=dict(task.context.get("params") or {}),
+                    trace.final_state(), inputs=realized_inputs,
                     context={"harness": "env" if _is_env_task(task) else "code_math"},
                 )
                 trace.validation_layers["composite"] = result.to_dict()
@@ -798,14 +882,28 @@ class AtomicSkillGraphSystem:
         action_index = 0
         for spec in direct_steps:
             step_count = len(spec["steps"])
-            before = states[action_index] if action_index < len(states) else {}
-            after_index = min(action_index + step_count, len(states) - 1)
+            action_start = action_index
+            before = states[action_start] if action_start < len(states) else {}
+            after_index = min(action_start + step_count, len(states) - 1)
             after = states[after_index]
             action_index = after_index
             atomic = spec["atomic"]
             node = runtime_graph.nodes[spec["graph_index"]]
+            grounded, binding_evidence = _ground_env_runtime_params(
+                spec["inputs"], atomic, list(atomic.effects or []), result,
+                action_start=action_start, action_end=after_index,
+                before=before, after=after, node_ref=spec["node_ref"])
+            spec["inputs"].clear()
+            spec["inputs"].update(grounded)
+            node.params = dict(grounded)
+            if binding_evidence:
+                trace.metrics.setdefault("runtime_param_bindings", []).append({
+                    "node_ref": spec["node_ref"],
+                    "mode": ExecutionMode.DIRECT.value,
+                    "bindings": binding_evidence,
+                })
             validation = self.node_validator.validate_atomic(
-                atomic, before, after, inputs=spec["inputs"],
+                atomic, before, after, inputs=grounded,
                 context={"harness": "env"})
             validation.node_ref = spec["node_ref"]
             node.validation = validation
@@ -1061,12 +1159,12 @@ def _phase_goal_of(atomic: Any, effects: list[dict[str, Any]],
 
 def _refine_env_object_binding(params: dict[str, Any],
                                state: dict[str, Any]) -> dict[str, Any]:
-    """Carry a discovered ALFWorld object instance into downstream nodes.
+    """Carry a discovered environment entity instance into downstream nodes.
 
     Planning correctly starts from a class-level goal slot (for example
-    ``mug``).  After Acquire, the tracker has exactly which instance is held.
-    Refining only a class-valued slot keeps the choice stable and never replaces
-    an already concrete binding.
+    an entity family). Once execution identifies the exact instance, the tracker
+    carries it through downstream data flow. Refining only a class-valued slot
+    keeps the choice stable and never replaces an already concrete binding.
     """
     import re
     from .core.predicates import normalize_value
@@ -1084,3 +1182,301 @@ def _refine_env_object_binding(params: dict[str, Any],
     if len(matches) == 1:
         refined["object"] = matches[0]
     return refined
+
+
+def _bind_known_location_slots(params: dict[str, Any], atomic: Any,
+                               state: dict[str, Any]) -> dict[str, Any]:
+    """Fill learned ``<entity_role>_location`` slots from state evidence."""
+    import re
+    from .core.predicates import normalize_value
+
+    refined = dict(params or {})
+    slots = {
+        str(item.get("name")) for item in (getattr(atomic, "inputs", []) or [])
+        if isinstance(item, dict)
+        and str(item.get("name") or "").endswith("_location")
+    }
+    facts = list((state or {}).get("facts") or [])
+    for slot in slots:
+        if refined.get(slot) not in (None, ""):
+            continue
+        entity_role = slot[:-len("_location")]
+        wanted = normalize_value(refined.get(entity_role, ""))
+        if not wanted:
+            continue
+        candidates: list[tuple[str, str]] = []
+        for fact in facts:
+            match = re.fullmatch(r"object_at\((.+?),\s*(.+?)\)", str(fact))
+            if not match:
+                continue
+            actual, location = normalize_value(match.group(1)), normalize_value(match.group(2))
+            if _runtime_values_compatible(wanted, actual):
+                candidates.append((actual, location))
+        if len(set(candidates)) != 1:
+            continue
+        actual, location = candidates[0]
+        if _runtime_binding_can_refine(refined.get(entity_role), actual):
+            refined[entity_role] = actual
+        refined[slot] = location
+    return refined
+
+
+def _remap_location_binding(binding: dict[str, Any], entity_role: str,
+                            location_role: str) -> dict[str, Any]:
+    """Map the adapter's neutral entity/location evidence to learned roles."""
+    if not binding:
+        return {}
+    entity = binding.get("object")
+    location = binding.get("object_location")
+    if entity in (None, "") or location in (None, ""):
+        return {}
+    return {str(entity_role): entity, str(location_role): location}
+
+
+def _ground_env_runtime_params(
+        params: dict[str, Any], atomic: Any,
+        effects: list[dict[str, Any]], result: Any, *,
+        action_start: int, action_end: int | None = None,
+        before: dict[str, Any], after: dict[str, Any],
+        node_ref: str = "",
+        ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Ground a node's unresolved inputs from its actual execution evidence.
+
+    Planning parameters are hypotheses.  An environment attempt can resolve a
+    hypothesis to a concrete instance through an accepted action or through a
+    real positive state transition.  This function only fills slots declared
+    by the Atomic contract; it never invents a role from benchmark labels or
+    treats task-level success as node evidence.
+    """
+    from .core.predicates import (
+        StateSnapshot,
+        check_effects,
+        compute_effects,
+    )
+
+    refined = dict(params or {})
+    declared_effects = [dict(item) for item in (effects or [])
+                        if isinstance(item, dict)]
+    contract_items = list(getattr(atomic, "preconditions", []) or [])
+    contract_items += list(getattr(atomic, "effects", []) or [])
+    contract_items += declared_effects
+    slots = {
+        str(item.get("name"))
+        for item in (getattr(atomic, "inputs", []) or [])
+        if isinstance(item, dict) and item.get("name")
+    }
+    for item in contract_items:
+        _collect_input_slots(item, slots)
+    evidence: list[dict[str, Any]] = []
+
+    actions = list(getattr(result, "actions", None) or [])
+    start = max(0, int(action_start))
+    end = len(actions) if action_end is None else max(start, int(action_end))
+    # Prefer the latest accepted grounding for each unresolved role: the action
+    # nearest the observed Effect is causal evidence, while earlier actions in
+    # the same Seeded attempt may merely be exploration or recovery.
+    for action in reversed(actions[start:end]):
+        if not bool(action.get("accepted", True)):
+            continue
+        action_node = str(action.get("node_ref") or "")
+        if node_ref and action_node and action_node != node_ref:
+            continue
+        for slot, observed in dict(action.get("params") or {}).items():
+            if slot not in slots or observed in (None, ""):
+                continue
+            normalized = _normalize_runtime_binding(observed)
+            old = refined.get(slot)
+            if not _runtime_binding_can_refine(old, normalized):
+                continue
+            refined[slot] = normalized
+            evidence.append({
+                "parameter": str(slot),
+                "value": normalized,
+                "source": "accepted_action_param",
+                "action_step": action.get("step"),
+            })
+
+    # Action adapters need not expose every semantic role.  A newly added fact
+    # that matches a declared Effect is independent state evidence for the
+    # placeholder occupying that fact argument.
+    positive, _negative = compute_effects(StateSnapshot(before),
+                                           StateSnapshot(after))
+    for expected in declared_effects:
+        expected_name = _canonical_runtime_predicate(expected.get("predicate"))
+        if not expected_name:
+            continue
+        expected_args = dict(expected.get("args") or {})
+        candidates = [item for item in positive
+                      if _canonical_runtime_predicate(item.get("predicate"))
+                      == expected_name]
+        for actual in candidates:
+            actual_args = dict(actual.get("args") or {})
+            proposed: dict[str, Any] = {}
+            compatible = True
+            for role, expected_value in expected_args.items():
+                actual_value = actual_args.get(role)
+                slot = _input_slot_name(expected_value)
+                if slot:
+                    if slot not in slots or actual_value in (None, ""):
+                        continue
+                    normalized = _normalize_runtime_binding(actual_value)
+                    old = refined.get(slot)
+                    if (_runtime_values_compatible(old, normalized)
+                            or _runtime_binding_can_refine(old, normalized)):
+                        proposed[slot] = normalized
+                    else:
+                        compatible = False
+                        break
+                elif actual_value not in (None, "") and not _runtime_values_compatible(
+                        expected_value, actual_value):
+                    compatible = False
+                    break
+            if not compatible or not proposed:
+                continue
+            trial = dict(refined)
+            for slot, value in proposed.items():
+                if _runtime_binding_can_refine(trial.get(slot), value):
+                    trial[slot] = value
+            effect_ok, _missing = check_effects(
+                StateSnapshot(after), trial, [expected], {"harness": "env"})
+            if not effect_ok:
+                continue
+            for slot, value in proposed.items():
+                old = refined.get(slot)
+                if not _runtime_binding_can_refine(old, value):
+                    continue
+                refined[slot] = value
+                evidence.append({
+                    "parameter": str(slot),
+                    "value": value,
+                    "source": "observed_positive_effect",
+                    "predicate": expected_name,
+                })
+            break
+    return refined, evidence
+
+
+def _collect_input_slots(value: Any, slots: set[str]) -> None:
+    if isinstance(value, dict):
+        for nested in value.values():
+            _collect_input_slots(nested, slots)
+    elif isinstance(value, (list, tuple)):
+        for nested in value:
+            _collect_input_slots(nested, slots)
+    else:
+        slot = _input_slot_name(value)
+        if slot:
+            slots.add(slot)
+
+
+def _input_slot_name(value: Any) -> str:
+    text = str(value or "")
+    if text.startswith("$inputs."):
+        return text[len("$inputs."):]
+    if text.startswith("$") and "." not in text[1:]:
+        return text[1:]
+    return ""
+
+
+def _normalize_runtime_binding(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    from .core.predicates import normalize_value
+    return normalize_value(value)
+
+
+def _runtime_values_compatible(left: Any, right: Any) -> bool:
+    """Match a class-valued binding to an instance without conflating IDs."""
+    import re
+    from .core.predicates import normalize_value
+
+    left_norm, right_norm = normalize_value(left), normalize_value(right)
+    if not left_norm or left_norm.startswith("$"):
+        return False
+    if left_norm == right_norm:
+        return True
+    if re.search(r"_\d+$", left_norm):
+        return False
+    return re.sub(r"_\d+$", "", left_norm) == re.sub(r"_\d+$", "", right_norm)
+
+
+def _runtime_binding_can_refine(current: Any, observed: Any) -> bool:
+    """Whether observed evidence may make an existing slot more concrete."""
+    import re
+    from .core.predicates import normalize_value
+
+    if observed in (None, ""):
+        return False
+    if current in (None, "") or str(current).startswith("$"):
+        return True
+    current_norm = normalize_value(current)
+    observed_norm = normalize_value(observed)
+    if current_norm == observed_norm:
+        return False
+    if re.search(r"_\d+$", current_norm):
+        return False
+    return (re.sub(r"_\d+$", "", current_norm)
+            == re.sub(r"_\d+$", "", observed_norm)
+            and bool(re.search(r"_\d+$", observed_norm)))
+
+
+def _canonical_runtime_predicate(value: Any) -> str:
+    return str(value or "").strip().lower().replace("_", ".")
+
+
+def _realized_task_bindings(task_params: dict[str, Any],
+                            realized_nodes: list[dict[str, Any]]) -> dict[str, Any]:
+    """Fill task roles absent at planning time from validated runtime nodes.
+
+    Existing task-level values retain precedence.  In particular a generic
+    cardinality slot must not be narrowed to one of several occurrences.
+    """
+    realized = dict(task_params or {})
+    for node in realized_nodes or []:
+        if not isinstance(node, dict):
+            continue
+        for slot, value in dict(node.get("params") or {}).items():
+            if value in (None, ""):
+                continue
+            current = realized.get(slot)
+            if current in (None, "") or str(current).startswith("$"):
+                realized[slot] = value
+    return realized
+
+
+def _completed_distinct_effect_instances(task: Task, state: dict[str, Any],
+                                         params: dict[str, Any]) -> set[str]:
+    """Exclude instances already satisfying a cardinality placement goal.
+
+    This is execution state, not a persisted instance-specific Skill/Tool
+    identity. The trigger is the goal contract itself, never a benchmark task
+    label. It prevents a repeated generic producer branch from selecting a
+    completed distinct instance back out of the destination.
+    """
+    import re
+    from .core.predicates import bind_args, normalize_value
+
+    contract = next((effect for effect in (task.target_effects or [])
+                     if isinstance(effect, dict)
+                     and str(effect.get("predicate") or "") == "object.at_location"
+                     and int(effect.get("cardinality", 1) or 1) > 1
+                     and str(effect.get("distinct_by") or "") == "object"), None)
+    if contract is None:
+        return set()
+    context = dict(task.context.get("params") or {})
+    bindings = {**context, **dict(params or {})}
+    args = bind_args(dict(contract.get("args") or {}), bindings, bindings)
+    wanted = normalize_value(args.get("object") or "")
+    target = normalize_value(args.get("location") or "")
+    if not wanted or not target:
+        return set()
+    family = re.sub(r"_\d+$", "", wanted)
+    completed: set[str] = set()
+    for fact in state.get("facts", []) or []:
+        match = re.fullmatch(r"object_at\((.+?),\s*(.+?)\)", str(fact))
+        if not match:
+            continue
+        obj, location = normalize_value(match.group(1)), normalize_value(match.group(2))
+        if re.sub(r"_\d+$", "", obj) == family and location == target:
+            completed.add(obj)
+    return completed

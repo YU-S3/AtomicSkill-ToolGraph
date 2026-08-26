@@ -456,9 +456,14 @@ def check_atomicizer_env(tmp_path: Path) -> None:
     trace = _env_trace()
     result = atomicizer.atomicize_success(trace)
     expect(bool(result.candidates), "应产生原子候选")
-    names = {c.skill.ref.logical_id for c in result.candidates}
-    expect(any("acquire" in n or "hold" in n for n in names), f"应发现 acquire 类原子：{names}")
-    expect(any("place" in n or "object_at" in n for n in names), f"应发现 place 类原子：{names}")
+    predicates = {
+        str(effect.get("predicate") or "")
+        for candidate in result.candidates
+        for effect in candidate.skill.effects
+    }
+    expect("agent.holds" in predicates, f"应保留第一个真实状态转移：{predicates}")
+    expect("object.at_location" in predicates,
+           f"应保留第二个真实状态转移：{predicates}")
     for candidate in result.candidates:
         expect(bool(candidate.skill.effects), f"候选 {candidate.skill.ref} 缺少 Effect")
         expect(candidate.skill.validator.get("post_checks"),

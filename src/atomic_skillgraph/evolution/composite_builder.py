@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -93,7 +94,7 @@ class CompositeBuilder:
         candidate = CompositeSkill(
             ref=SkillRef(logical_id=logical_id, version="1.0.0"),
             # Composite 的公开语义由已验证 Atomic 角色链确定。LLM 的原始
-            # summary 只作审计证据，不能把 mug/microwave 等执行实例写入
+            # summary 只作审计证据，不能把任何具体执行实例写入
             # 可复用能力身份。
             summary=_summary_from_refs(atomic_refs),
             task_type_labels=[trace.task_type] if trace.task_type else [],
@@ -113,7 +114,9 @@ class CompositeBuilder:
                      "common_locations": [], "common_pitfalls": [],
                      "environment_facts": [], "search_priority": [],
                      "failure_distribution": {}},
-            validator={"checks": _composite_checks(atomic_refs, self.registry),
+            validator={"checks": _composite_checks(
+                           atomic_refs, self.registry, segments),
+                       "check_semantics": "terminal_effect_closure_v2",
                        "target_effects": list(trace.provenance.get("target_effects") or [])},
             metadata={
                 "source_trace_ids": [trace.trace_id],
@@ -222,21 +225,49 @@ def _summary_from_refs(atomic_refs: list[SkillRef]) -> str:
 
 
 def _composite_checks(atomic_refs: list[SkillRef],
-                      registry: SkillGraphRegistry) -> list[str]:
-    # 中间态效果不应被误写成 Composite 最终态不变量。例如 place 完成后
-    # agent.holds 必然为假，但 acquire 节点仍然是正确完成的。
-    transient = {"agent.holds", "container.open", "location.checked",
-                 "object.is_accessible", "object.exists"}
+                      registry: SkillGraphRegistry,
+                      segments: list[dict[str, Any]] | None = None) -> list[str]:
+    """Compute terminal predicates by replaying actual positive/negative deltas.
+
+    No predicate is declared transient by name. An earlier Effect disappears
+    from the Composite contract only when a later occurrence contains the
+    matching negative state delta.
+    """
+    active: dict[tuple[str, tuple[tuple[str, str], ...]], dict[str, Any]] = {}
+    segments = list(segments or [])
+    for index, ref in enumerate(atomic_refs):
+        segment = segments[index] if index < len(segments) else {}
+        positives = [dict(item) for item in (segment.get("effect") or [])
+                     if isinstance(item, dict)]
+        negatives = [dict(item) for item in (segment.get("negative_effect") or [])
+                     if isinstance(item, dict)]
+        if not positives:
+            atomic = registry.get(ref) or registry.get_recommended(ref.logical_id)
+            if atomic is not None:
+                positives = [dict(item) for item in atomic.effects
+                             if isinstance(item, dict)]
+                negatives = [dict(item) for item in
+                             (atomic.metadata.get("observed_negative_effects") or [])
+                             if isinstance(item, dict)]
+        for negative in negatives:
+            inner = negative.get("not") if isinstance(negative.get("not"), dict) else negative
+            active.pop(_effect_key(inner), None)
+        for positive in positives:
+            active[_effect_key(positive)] = positive
+
     checks: list[str] = []
-    for ref in atomic_refs:
-        atomic = registry.get(ref) or registry.get_recommended(ref.logical_id)
-        if atomic is None:
-            continue
-        for effect in atomic.effects:
-            name = str(effect.get("predicate", ""))
-            if name and name not in transient and name not in checks:
-                checks.append(name)
+    for effect in active.values():
+        name = str(effect.get("predicate") or "")
+        if name and name not in checks:
+            checks.append(name)
     return checks
+
+
+def _effect_key(effect: dict[str, Any]) -> tuple[str, tuple[tuple[str, str], ...]]:
+    args = tuple(sorted(
+        (str(key), str(value).strip().lower().replace(" ", "_"))
+        for key, value in (effect.get("args") or {}).items()))
+    return str(effect.get("predicate") or ""), args
 
 
 def _infer_data_edges(steps: list[dict[str, Any]], registry: SkillGraphRegistry,
@@ -266,9 +297,21 @@ def _infer_data_edges(steps: list[dict[str, Any]], registry: SkillGraphRegistry,
                 matched = False
                 for output in list(getattr(source, "outputs", None) or []):
                     same_name = output.get("name") == input_spec.get("name")
-                    same_type = (output.get("semantic_type")
-                                 and output.get("semantic_type") == input_spec.get("semantic_type"))
-                    if not (same_name or same_type):
+                    same_type = bool(
+                        output.get("semantic_type")
+                        and output.get("semantic_type")
+                        == input_spec.get("semantic_type"))
+                    source_value = dict(source_step.get("params") or {}).get(
+                        str(output.get("name") or ""))
+                    target_value = dict(target_step.get("params") or {}).get(
+                        str(input_spec.get("name") or ""))
+                    grounded_same_value = bool(
+                        source_value not in (None, "")
+                        and target_value not in (None, "")
+                        and _same_grounded_value(source_value, target_value))
+                    # Broad semantic types such as entity_ref are not enough
+                    # on their own: two unrelated roles can share that type.
+                    if not (same_name or (same_type and grounded_same_value)):
                         continue
                     edges.append(GraphEdge(
                         source=source_step["node_ref"], target=target_step["node_ref"],
@@ -288,6 +331,12 @@ def _infer_data_edges(steps: list[dict[str, Any]], registry: SkillGraphRegistry,
                 if matched:
                     break
     return edges
+
+
+def _same_grounded_value(left: Any, right: Any) -> bool:
+    normalize = lambda value: re.sub(
+        r"\s+", "_", str(value or "").strip().lower())
+    return bool(normalize(left) and normalize(left) == normalize(right))
 
 
 def _infer_dependency_edges(steps: list[dict[str, Any]], registry: SkillGraphRegistry,
@@ -345,55 +394,23 @@ def _role_params(params: dict[str, Any], trace: TraceRecord) -> dict[str, Any]:
     known = dict(trace.provenance.get("params") or {})
     semantic = dict(trace.provenance.get("semantic_params") or {})
     result: dict[str, Any] = {}
-    compatible_roles = {
-        "object": {"object", "object1", "object2"},
-        "object_location": {"object_location", "source_location",
-                            "source_receptacle"},
-        "target_location": {"target_location", "target_receptacle",
-                            "destination", "destination_location"},
-        "heating_station": {"heating_station"},
-        "cleaning_station": {"cleaning_station"},
-        "cooling_station": {"cooling_station"},
-    }
     for key, value in params.items():
         value_norm = normalize_value(value)
         matched_role = ""
-        allowed = compatible_roles.get(str(key), {str(key)})
-        # Exact identity always wins.  In particular cabinet_2 must not bind to
-        # target_location=cabinet_1 merely because both share the cabinet class.
-        for role, role_value in known.items():
-            if str(role) not in allowed:
+        # Role identity comes from the validated occurrence/goal data flow.
+        # Never translate through a benchmark-specific compatibility table.
+        for source in (known, semantic):
+            if str(key) not in source:
                 continue
-            role_norm = normalize_value(role_value)
-            if value_norm == role_norm:
-                matched_role = str(role)
+            role_norm = normalize_value(source[str(key)])
+            same = value_norm == role_norm
+            generic_family = (value_norm and role_norm
+                              and not __import__("re").search(r"_\d+$", role_norm)
+                              and __import__("re").sub(r"_\d+$", "", value_norm)
+                              == role_norm)
+            if same or generic_family:
+                matched_role = str(key)
                 break
-        # semantic_params 保存目标语义类型（cabinet），params 保存本题可执行
-        # 实例（cabinet_1）。Occurrence 可以是 cabinet_5；角色映射应按前者的
-        # family 对齐，但仍严格限制 source/target 等兼容角色，不能串位。
-        if not matched_role:
-            for role, role_value in semantic.items():
-                if str(role) not in allowed:
-                    continue
-                role_norm = normalize_value(role_value)
-                if (value_norm and role_norm
-                        and __import__("re").sub(r"_\d+$", "", value_norm)
-                        == __import__("re").sub(r"_\d+$", "", role_norm)):
-                    matched_role = str(role)
-                    break
-        # 兼容没有 semantic_params 的旧 trace：只允许泛化的 executable role
-        # 吸收其具体 occurrence，两个具体位置之间绝不按 family 强行绑定。
-        if not matched_role:
-            for role, role_value in known.items():
-                if str(role) not in allowed:
-                    continue
-                role_norm = normalize_value(role_value)
-                role_is_generic = not __import__("re").search(r"_\d+$", role_norm)
-                if (value_norm and role_norm and role_is_generic
-                        and __import__("re").sub(r"_\d+$", "", value_norm)
-                        == role_norm):
-                    matched_role = str(role)
-                    break
         if matched_role:
             result[str(key)] = f"$task.{matched_role}"
     return result

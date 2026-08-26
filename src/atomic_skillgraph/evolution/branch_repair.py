@@ -590,7 +590,7 @@ class FailureBranchManager:
                    for action in trace.actions]
         prefix_end = int(incident.get("action_start") or 0)
         prefix = [str(action.get("name") or "") for action in actions[:prefix_end]
-                  if str(action.get("name") or "").lower() not in ("look", "inventory")]
+                  if str(action.get("name") or "").strip()]
         latest = branch_tools.get_latest(original.tool_id) or original
         data = original.to_dict()
         data["version"] = bump_version(latest.ref.version, "patch")
@@ -820,7 +820,7 @@ def _parameterize_rescue_actions(actions: list[str], params: dict[str, Any]) -> 
     values = _safe_replacement_values(actions, params)
     for raw in actions:
         text = str(raw).strip()
-        if not text or _is_observation_action(text):
+        if not text:
             continue
         for value, name in values:
             pattern = rf"(?<![a-z0-9]){re.escape(value)}(?![a-z0-9])"
@@ -830,7 +830,11 @@ def _parameterize_rescue_actions(actions: list[str], params: dict[str, Any]) -> 
         # the action is episode-specific and cannot enter a reusable repair.
         if _contains_concrete_instance(text):
             continue
-        _append_without_state_cycle(result, text)
+        # The shared event-level causal slicer has already removed exploration,
+        # recovery loops and irrelevant state toggles. Do not rewrite the
+        # verified path by recognizing domain verbs here.
+        if not result or result[-1] != text:
+            result.append(text)
     return result
 
 
@@ -1193,9 +1197,6 @@ def _repair_guard(before: dict[str, Any],
         predicate = _fact_to_predicate(str(fact))
         if not isinstance(predicate, dict):
             continue
-        if str(predicate.get("predicate") or "") not in {
-                "agent.holds", "object.at_location", "container.open"}:
-            continue
         parameterized = parameterize_predicates([predicate], bindings)
         if parameterized and any(
                 isinstance(value, str) and value.startswith("$inputs.")
@@ -1207,38 +1208,9 @@ def _repair_guard(before: dict[str, Any],
     }
 
 
-def _is_observation_action(text: str) -> bool:
-    verb = str(text).strip().lower().split(maxsplit=1)[0] if str(text).strip() else ""
-    return verb in {"look", "inventory", "examine", "check", "wait"}
-
-
 def _contains_concrete_instance(text: str) -> bool:
     return bool(re.search(r"(?<![{$a-z0-9])(?:[a-z][a-z0-9]*[ _])+\d+(?![a-z0-9}])",
                           str(text), flags=re.IGNORECASE))
-
-
-def _state_transition(step: str) -> tuple[str, str] | None:
-    match = re.match(r"^\s*(open|close)\s+(.+?)\s*$", str(step), flags=re.IGNORECASE)
-    return (match.group(1).lower(), match.group(2).strip().lower()) if match else None
-
-
-def _append_without_state_cycle(result: list[str], step: str) -> None:
-    """Collapse repeated/inverse open-close loops to their final required state."""
-    transition = _state_transition(step)
-    if transition:
-        for index in range(len(result) - 1, -1, -1):
-            previous = _state_transition(result[index])
-            if previous and previous[1] == transition[1]:
-                # No productive action on this target occurred between both
-                # transitions: retain only the final state request.
-                if all((_state_transition(item) is not None
-                        and _state_transition(item)[1] == transition[1])
-                       for item in result[index + 1:]):
-                    result[index:] = [step]
-                    return
-                break
-    if not result or result[-1] != step:
-        result.append(step)
 
 
 def _guideline_placeholders(step: str) -> str:

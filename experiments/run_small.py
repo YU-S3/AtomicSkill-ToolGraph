@@ -34,6 +34,7 @@ from experiments.common import (  # noqa: E402
     load_conda_config,
     make_adapter,
     run_conditions,
+    balanced_task_subset,
 )
 from experiments.report import (  # noqa: E402
     aggregate_results,
@@ -56,6 +57,10 @@ def main() -> int:
                         help="任务数（默认：alfworld=10, humaneval=10, gsm8k=50）")
     parser.add_argument("--task-type", default=None,
                         help="ALFWorld：同一类任务过滤（默认 pick_heat_then_place_in_recep）")
+    parser.add_argument("--task-types", nargs="+", default=None,
+                        help="ALFWorld：多个官方 label，按 --per-type-limit 均衡交错")
+    parser.add_argument("--per-type-limit", type=int, default=None,
+                        help="与 --task-types 同用：每类任务数")
     parser.add_argument("--conditions", nargs="+", default=CORE_CONDITIONS)
     parser.add_argument("--config-path", default=str(PROJECT_ROOT / "configs" / "default.yaml"))
     parser.add_argument("--output-dir", default=str(PROJECT_ROOT / "runs" / "small"))
@@ -73,9 +78,15 @@ def main() -> int:
                         help="重跑所选条件前将旧 condition data 移入可恢复备份")
     args = parser.parse_args()
 
+    if args.task_type and args.task_types:
+        parser.error("--task-type 与 --task-types 不能同时使用")
+    if args.task_types and args.benchmark != "alfworld":
+        parser.error("--task-types 目前只用于 ALFWorld label 均衡取样")
+    if args.task_types and (args.per_type_limit is None or args.per_type_limit <= 0):
+        parser.error("--task-types 需要正整数 --per-type-limit")
     limit = args.limit if args.limit is not None else DEFAULT_LIMITS[args.benchmark]
-    task_type = args.task_type or (
-        "pick_heat_then_place_in_recep" if args.benchmark == "alfworld" else None)
+    task_type = (None if args.task_types else args.task_type or (
+        "pick_heat_then_place_in_recep" if args.benchmark == "alfworld" else None))
     config = load_conda_config(args.config_path)
     if args.mock:
         config.llm.mock = True
@@ -117,6 +128,8 @@ def main() -> int:
     print("=" * 78)
     print(f"Stage 3 小规模测试：{args.benchmark}（limit={limit}"
           + (f", task_type={task_type}" if task_type else "")
+          + (f", balanced_types={args.task_types}, per_type={args.per_type_limit}"
+             if args.task_types else "")
           + (f", max_steps={config.max_steps}" if args.benchmark == "alfworld" else "")
           + "）")
     print(f"条件：{args.conditions}   mock={args.mock}")
@@ -126,7 +139,12 @@ def main() -> int:
                            task_type=task_type, alfworld_data=args.alfworld_data,
                            max_steps=config.max_steps,
                            kinds=("code", "math", "env"))
-    tasks = adapter.load_tasks(limit=limit, task_type=task_type)
+    tasks = adapter.load_tasks(
+        limit=0 if args.task_types else limit, task_type=task_type)
+    if args.task_types:
+        tasks = balanced_task_subset(
+            tasks, list(args.task_types), int(args.per_type_limit))
+        limit = len(tasks)
     if not tasks:
         print(f"[错误] 未加载到任务。请检查数据可用性（HF 网络 / ALFWorld 数据目录）。")
         return 1

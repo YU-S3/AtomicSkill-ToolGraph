@@ -25,32 +25,34 @@ from .effect_extractor import _FACT_FAMILY_NAMES, _family_of, extract_effect
 
 
 EXTRACTOR_PROMPT = """You are the Trace Extractor Agent in a reusable capability-learning system.
-Your input is a successful task trace already normalized into structured events. Each event has an
-action, parameters, before/after state, positive/negative effects, execution mode, and acceptance.
+You have not been given a benchmark taxonomy, a task type, a catalogue of operations, or a predefined
+workflow. Your input is one successful trace normalized into structured events. Every event contains
+the executed action, grounded arguments, the state immediately before and after it, positive and
+negative state deltas, acceptance, and execution provenance.
 
-Infer a minimal set of discrete high-level Atomic capability occurrences that explains task success.
-Do not copy every state change into the workflow. Group low-level actions and intermediate state
-changes into the capability whose stable effect they implement. Remove exploration, repeated checks,
-failed attempts, loops, recovery detours, and duplicate occurrences unless they are causally required.
-An Atomic occurrence must have one coherent intent, a contiguous event range, explicit parameter
-roles, and one or more stable effects observed at the end of its range. Preserve evidence: never invent
-an action, entity, parameter, state, effect, tool, or skill.
+Discover the smallest sufficient set of reusable Atomic capability occurrences from this evidence.
+An Atomic occurrence is an independently meaningful and independently verifiable state transition
+with a coherent intent, explicit external inputs/outputs, and a minimal causal action subsequence.
+Infer its boundary; do not map the trace onto an assumed list of operations. Repeated checks, failed
+attempts, loops, exploration branches, and recovery detours are not capabilities unless an accepted
+event from them is causally necessary for the verified transition.
 
-Name intent by reusable capability semantics, never by the concrete object, receptacle, task wording,
-or incidental navigation (use acquire_object, heat_object, clean_object, cool_object, place_object,
-open_container, etc.). If known_atomic_contracts contains an equivalent validated Effect contract,
-reuse its canonical_name. A phase may contain internal navigation or container operations, but expose
-only the phase's externally meaningful core Effect. In effect_predicates return predicate names only,
-without arguments (for example "agent.holds", not "agent.holds(mug_1)").
+Use state evidence rather than action wording as authority. Setup actions and temporary helper state
+belong inside an occurrence only when they are necessary to replay its core transition. A durable
+transition should be a separate occurrence when it is independently useful, independently consumed,
+or required by the task goal. This rule must be applied from the observed data; no domain-specific
+boundary rule is supplied.
 
-Generalization is mandatory. Describe the operation shared by different entities and environments,
-not the concrete episode. The intent must still be correct after every observed object and location is
-replaced by another value of the same semantic role. Good: acquire_object (拿取物品), heat_object
-(加热物品), place_object (放置物品). Bad: take_out_a_banana, acquire_mug_from_cabinet,
-transport_mug_to_microwave, place_apple_in_fridge. Do not include object classes, instance numbers,
-source/destination names, appliance names, or a sequence of multiple capabilities in intent. Keep such
-details only in parameter_roles. Generalize at the stable Effect level rather than using a vague label
-such as handle_object: different core Effects remain different Atomic capabilities.
+Invent a concise snake_case intent that describes the reusable transition. The name must remain valid
+when every concrete entity is replaced by another entity with the same semantic role. Do not include
+instance identifiers, concrete object/location/device classes, task wording, or several sequential
+intents in one name. If a learned contract in known_atomic_contracts has equivalent validated Effects,
+compatible I/O, and the same atomic boundary, reuse its canonical_name; otherwise propose a new name.
+Put every episode-specific value in parameter_roles. Include all external values needed to replay the
+minimal occurrence, including a required execution position or resource when the state evidence shows
+that the core action depends on it. In effect_predicates, copy only predicate names that are actually
+present in the structured state deltas, without arguments. Never invent an action, entity, parameter,
+state, Effect, Tool, Skill, or dependency.
 
 Return ONLY JSON:
 {
@@ -60,8 +62,8 @@ Return ONLY JSON:
       "intent": "snake_case_capability_name",
       "event_start": 0,
       "event_end": 3,
-      "parameter_roles": {"object": "observed value"},
-      "effect_predicates": ["object.heated"],
+      "parameter_roles": {"semantic_role": "observed value"},
+      "effect_predicates": ["predicate.name.copied.from.event"],
       "rationale": "why this range is one capability"
     }
   ],
@@ -70,9 +72,9 @@ Return ONLY JSON:
   "workflow_summary": "short semantic summary"
 }
 
-Requirements: ranges must be valid, non-overlapping and ordered; prefer the fewest sufficient phases;
-intermediate placement inside heating/cleaning/cooling belongs inside that transformation phase; the
-final delivery placement is a separate phase; do not infer correctness merely from action wording.
+Requirements: ranges must be valid, non-overlapping and ordered; effect_predicates must be non-empty;
+prefer the fewest independently verifiable occurrences sufficient for the goal; do not infer success or
+atomicity merely from action wording.
 """
 
 
@@ -145,15 +147,7 @@ class SemanticExtractorAgent:
             return result
         payload = {
             "task": {
-                "task_id": trace.task_id,
-                "benchmark": trace.benchmark,
-                "task_type": trace.task_type,
                 "goal": trace.task_goal,
-                "target_effects": list(trace.provenance.get("target_effects") or []),
-                "known_params": dict(trace.provenance.get("params") or {}),
-                "semantic_goal_params": dict(
-                    trace.provenance.get("semantic_params")
-                    or trace.provenance.get("params") or {}),
             },
             "events": [_compact_event(event) for event in events],
             # Later traces see the already validated catalog.  This is evidence
@@ -204,8 +198,7 @@ class SemanticExtractorAgent:
         if self.llm is None or len(occurrences) < 2:
             return {}
         payload = {
-            "task": {"goal": trace.task_goal, "task_type": trace.task_type,
-                     "target_effects": list(trace.provenance.get("target_effects") or [])},
+            "task": {"goal": trace.task_goal},
             "validated_occurrences": occurrences,
         }
         try:
@@ -255,9 +248,6 @@ def validate_phase_proposal(trace: TraceRecord, events: list[dict[str, Any]],
     phases: list[dict[str, Any]] = []
     occupied: set[int] = set()
     previous_core_end = -1
-    task_target_names = {str(item.get("predicate") or "")
-                         for item in (trace.provenance.get("target_effects") or [])
-                         if isinstance(item, dict)}
     known_values = _known_values(trace, events)
     for ordinal, raw in enumerate(proposal.get("phases") or []):
         if not isinstance(raw, dict):
@@ -276,9 +266,10 @@ def validate_phase_proposal(trace: TraceRecord, events: list[dict[str, Any]],
         declared = {_declared_predicate_name(item)
                     for item in (raw.get("effect_predicates") or [])}
         declared.discard("")
-        semantic_core_names = declared - {"agent_at", "agent.at"}
+        semantic_core_names = set(declared)
         if not semantic_core_names:
-            semantic_core_names = _intent_predicates(str(raw.get("intent") or ""))
+            errors.append(f"phase_{ordinal}:missing_effect_predicates")
+            continue
         evidence_end = (_last_core_effect_event(events, start, end,
                                                 semantic_core_names)
                         if semantic_core_names else None)
@@ -287,19 +278,19 @@ def validate_phase_proposal(trace: TraceRecord, events: list[dict[str, Any]],
         observed_params = _event_params(events[start:parameter_end + 1])
         roles = _refine_roles_with_phase_evidence(roles, observed_params)
         # LLM supplies semantic role names, but values must be trace-grounded.
-        # When a raw action calls a station a target_location, prefer the
-        # validated semantic role (heating_station/cleaning_station/...) so the
-        # implementation detail cannot later bind to the task's final location.
+        # Core-event roles take precedence over a broader task-level synonym so
+        # two semantically different locations cannot collapse into one slot.
         params = dict(roles)
         # Preserve the executed action's semantic role even when the LLM used
         # the same entity value under a different task-level role.  For
-        # example, a final target_location=cabinet_1 must not suppress the
-        # observed Acquire object_location=cabinet_2 merely because both are
-        # cabinets.  The family-specific canonical filter below removes roles
-        # that do not belong to this Atomic contract.
+        # For example, a final destination must not suppress an observed source
+        # location merely because both values share an entity family.
         for key, value in observed_params.items():
             if value not in (None, ""):
-                params[str(key)] = value
+                params[_canonical_role_name(str(key))] = value
+        params.update(_infer_execution_location_roles(
+            events, start, evidence_end if evidence_end is not None else end,
+            params, semantic_core_names))
         effect = extract_effect(events[start]["before"], events[end]["after"], params)
         declared_aligned = True
         if declared:
@@ -309,8 +300,7 @@ def validate_phase_proposal(trace: TraceRecord, events: list[dict[str, Any]],
                 effect.positive = matched
             else:
                 # LLM 的 effect_predicates 只是语义提案，不能覆盖真实
-                # before/after 差分。旧逻辑在命名不一致时把已观察到的
-                # take/heat/place Effect 全部过滤掉，造成假阴性。
+                # before/after 差分；命名不一致也不能删除已观察到的 Effect。
                 declared_aligned = False
         # A non-canonical declaration cannot be trusted, but the intent can
         # still select one *observed* core predicate.  It never creates Effect.
@@ -335,12 +325,13 @@ def validate_phase_proposal(trace: TraceRecord, events: list[dict[str, Any]],
             effect.positive = [item for item in effect.positive
                                if str(item.get("predicate")) in core_names]
             # ``extract_effect`` assigns its family before the semantic filter.
-            # A widened phase can also observe helper Effects such as
-            # container.open, so recomputing after trimming must refresh the
-            # identity again or the canonical role filter may erase the real
-            # Heat/Clean/Cool parameters.
+            # A widened phase can also observe helper Effects, so recomputing
+            # after trimming must refresh the identity before role pruning.
             _refresh_effect_identity(effect)
-        params = _canonical_phase_params(params, effect.primary_family)
+        params = _prune_phase_params(
+            _canonical_phase_params(params, effect.primary_family),
+            effect.positive, events[start:end + 1],
+            core_event=events[trimmed_end if trimmed_end is not None else end])
         causal_window_start = max(0, previous_core_end + 1)
         causal_event_indices, slice_diagnostics = _minimal_causal_event_indices(
             events, causal_window_start, end, core_names, params,
@@ -361,13 +352,11 @@ def validate_phase_proposal(trace: TraceRecord, events: list[dict[str, Any]],
             _refresh_effect_identity(canonical_effect)
             effect = canonical_effect
         occupied |= indices
-        internal_helper = (effect.primary_family == "container_open"
-                           and "container.open" not in task_target_names)
-        if not internal_helper:
-            previous_core_end = end
+        previous_core_end = end
         proposed_intent = _safe_name(str(raw.get("intent") or "atomic"))
-        # Logical identity is derived from the verified core Effect rather than
-        # a task-specific LLM phrase.  The phrase is retained as an alias.
+        # Logical identity is derived mechanically from the verified core
+        # Effect.  The independently proposed phrase is retained as an alias;
+        # no benchmark operation catalogue is used to name the node.
         intent = _safe_name(str(effect.suggested_name or proposed_intent))
         phases.append({
             "phase_id": str(raw.get("phase_id") or f"phase_{ordinal:03d}"),
@@ -400,7 +389,7 @@ def validate_phase_proposal(trace: TraceRecord, events: list[dict[str, Any]],
             "validation": {"observed_effect": True, "roles_grounded": True,
                            "declared_effect_aligned": declared_aligned,
                            "state_evidence_precedence": True,
-                           "canonical_name_from_effect": True,
+                           "identity_from_verified_effect": True,
                            "trailing_internal_events_removed": trimmed_end is not None
                            and trimmed_end < raw_end,
                            "internal_causal_slice_applied": len(causal_event_indices)
@@ -423,8 +412,15 @@ def causal_slice(phases: list[dict[str, Any]], target_effects: list[dict[str, An
     reject the workflow.  This keeps exploration out of the capability graph.
     """
     task_params = dict(task_params or {})
-    goals = [dict(item) for item in target_effects
-             if isinstance(item, dict) and item.get("predicate")]
+    goals: list[dict[str, Any]] = []
+    for item in target_effects:
+        if not isinstance(item, dict) or not item.get("predicate"):
+            continue
+        # Requirements are a multiset, not a set. A cardinality-two placement
+        # goal must retain two independently produced occurrences during the
+        # backward slice.
+        count = max(1, int(item.get("cardinality", 1) or 1))
+        goals.extend(dict(item) for _ in range(count))
     diagnostics: dict[str, Any] = {
         "goal_effects": goals,
         "selected_phase_ids": [],
@@ -449,14 +445,23 @@ def causal_slice(phases: list[dict[str, Any]], target_effects: list[dict[str, An
         phase = phases[index]
         params = dict(phase.get("params") or {})
         produced = list(phase.get("effect") or [])
-        matched = [requirement for requirement in needed
-                   if any(_predicates_compatible(effect, params,
-                                                 requirement[0], requirement[1])
-                          for effect in produced)]
-        if not matched:
+        matched_indices: list[int] = []
+        used_effects: set[int] = set()
+        for requirement_index, requirement in enumerate(needed):
+            for effect_index, effect in enumerate(produced):
+                if effect_index in used_effects:
+                    continue
+                if _predicates_compatible(
+                        effect, params, requirement[0], requirement[1]):
+                    matched_indices.append(requirement_index)
+                    used_effects.add(effect_index)
+                    break
+        if not matched_indices:
             continue
         selected_indices.add(index)
-        needed = [requirement for requirement in needed if requirement not in matched]
+        matched_set = set(matched_indices)
+        needed = [requirement for requirement_index, requirement in enumerate(needed)
+                  if requirement_index not in matched_set]
 
         for precondition in (phase.get("preconditions") or []):
             producer_index = _latest_earlier_producer(
@@ -661,6 +666,8 @@ def _compact_event(event: dict[str, Any]) -> dict[str, Any]:
         "params": event["params"], "accepted": event["accepted"],
         "mode": event["mode"], "positive_effects": event["positive_effects"],
         "negative_effects": event["negative_effects"],
+        "before_facts": list(event["before"].get("facts") or []),
+        "after_facts": list(event["after"].get("facts") or []),
         "before_inventory": list(event["before"].get("inventory") or []),
         "after_inventory": list(event["after"].get("inventory") or []),
     }
@@ -683,7 +690,72 @@ def _known_values(trace: TraceRecord, events: list[dict[str, Any]]) -> set[str]:
         values |= {normalize_value(value) for value in (event.get("params") or {}).values()}
         for state_key in ("before", "after"):
             values |= {normalize_value(value) for value in (event[state_key].get("inventory") or [])}
+            for fact in event[state_key].get("facts") or []:
+                predicate = _fact_to_predicate(str(fact))
+                if isinstance(predicate, dict):
+                    values |= {normalize_value(value)
+                               for value in (predicate.get("args") or {}).values()}
     return {value for value in values if value}
+
+
+def _infer_execution_location_roles(
+        events: list[dict[str, Any]], start: int, end: int,
+        params: dict[str, Any], core_names: set[str]) -> dict[str, Any]:
+    """Infer an external co-location input from the real core-event state.
+
+    This is predicate-driven rather than verb- or benchmark-driven.  If the
+    entity changed by the core event is known to be at a location and the
+    agent is at that same location immediately before the event, replaying the
+    occurrence requires that location.  The value becomes ``<role>_location``
+    unless an existing input already binds it.
+    """
+    core_index = _last_core_effect_event(events, start, end, core_names)
+    if core_index is None:
+        return {}
+    event = events[core_index]
+    before_predicates = _state_predicates(event.get("before") or {})
+    agent_locations = {
+        normalize_value((predicate.get("args") or {}).get("arg0")
+                        or (predicate.get("args") or {}).get("location"))
+        for predicate in before_predicates
+        if str(predicate.get("predicate") or "") in {"agent_at", "agent.at"}
+    }
+    agent_locations.discard("")
+    if not agent_locations:
+        return {}
+
+    effect_entities = {
+        normalize_value(value)
+        for effect in (event.get("positive_effects") or [])
+        if str(effect.get("predicate") or "") in core_names
+        for value in (effect.get("args") or {}).values()
+    }
+    inferred: dict[str, Any] = {}
+    normalized_params = {str(role): normalize_value(value)
+                         for role, value in params.items() if value not in (None, "")}
+    occupied_locations = set(normalized_params.values()) & agent_locations
+    if occupied_locations:
+        return inferred
+
+    for predicate in before_predicates:
+        if str(predicate.get("predicate") or "") != "object.at_location":
+            continue
+        args = predicate.get("args") or {}
+        entity = normalize_value(args.get("object"))
+        location = normalize_value(args.get("location"))
+        if not entity or entity not in effect_entities or location not in agent_locations:
+            continue
+        matching_roles = [role for role, value in normalized_params.items()
+                          if value == entity or (
+                              value and not re.search(r"_\d+$", value)
+                              and re.sub(r"_\d+$", "", entity) == value)]
+        if not matching_roles:
+            continue
+        role = sorted(matching_roles)[0]
+        location_role = f"{role}_location"
+        if location_role not in params:
+            inferred[location_role] = location
+    return inferred
 
 
 def _validated_roles(roles: dict[str, Any], known_values: set[str]) -> dict[str, Any]:
@@ -708,6 +780,24 @@ def _refine_roles_with_phase_evidence(roles: dict[str, Any],
     action parameters are authoritative; a generic semantic value may be
     specialized to a unique concrete phase value across role names.
     """
+    observed_by_role: dict[str, Any] = {}
+    for key, value in observed_params.items():
+        observed_by_role.setdefault(_canonical_role_name(str(key)), value)
+    refined: dict[str, Any] = {}
+    for raw_role, proposed in roles.items():
+        role = _canonical_role_name(str(raw_role))
+        same_role = observed_by_role.get(role)
+        if same_role not in (None, ""):
+            refined[role] = same_role
+            continue
+        # Never specialize one semantic role using a same-family value from a
+        # different role (for example a final destination from an acquisition
+        # source merely because both are cabinets).
+        refined[role] = proposed
+    return refined
+
+
+def _canonical_role_name(role: str) -> str:
     aliases = {
         "source_location": "object_location",
         "source_receptacle": "object_location",
@@ -715,29 +805,7 @@ def _refine_roles_with_phase_evidence(roles: dict[str, Any],
         "destination_location": "target_location",
         "target_receptacle": "target_location",
     }
-    observed_by_role: dict[str, Any] = {}
-    for key, value in observed_params.items():
-        observed_by_role.setdefault(aliases.get(str(key), str(key)), value)
-    refined: dict[str, Any] = {}
-    all_observed = list(observed_params.values())
-    for raw_role, proposed in roles.items():
-        role = aliases.get(str(raw_role), str(raw_role))
-        same_role = observed_by_role.get(role)
-        if same_role not in (None, ""):
-            refined[role] = same_role
-            continue
-        proposed_norm = normalize_value(proposed)
-        if proposed_norm:
-            proposed_family = re.sub(r"_\d+$", "", proposed_norm)
-            family_matches = [value for value in all_observed
-                              if re.sub(r"_\d+$", "", normalize_value(value))
-                              == proposed_family]
-            unique = {normalize_value(value): value for value in family_matches}
-            if len(unique) == 1:
-                refined[role] = next(iter(unique.values()))
-                continue
-        refined[role] = proposed
-    return refined
+    return aliases.get(str(role), str(role))
 
 
 def _declared_predicate_name(value: Any) -> str:
@@ -747,15 +815,12 @@ def _declared_predicate_name(value: Any) -> str:
 
 
 def _intent_predicates(intent: str) -> set[str]:
-    normalized = _safe_name(intent)
-    mapping = {
-        "acquire": "agent.holds", "take": "agent.holds", "pick": "agent.holds",
-        "heat": "object.heated", "clean": "object.cleaned",
-        "cool": "object.cooled", "place": "object.at_location",
-        "deliver": "object.at_location", "open": "container.open",
-        "light": "object.lit",
-    }
-    return {predicate for token, predicate in mapping.items() if token in normalized}
+    """No operation-name lexicon is used to infer state semantics.
+
+    Kept as an internal compatibility hook for callers, but Extractor proposals
+    must explicitly cite predicates observed in the event deltas.
+    """
+    return set()
 
 
 def _last_core_effect_event(events: list[dict[str, Any]], start: int, end: int,
@@ -924,35 +989,67 @@ def _state_predicates(state: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _event_operational_requirements(event: dict[str, Any],
                                     params: dict[str, Any]) -> list[dict[str, Any]]:
-    action = str(event.get("action") or event.get("name") or "").strip().lower()
-    verb = action.split(maxsplit=1)[0] if action else ""
-    by_verb = {
-        # Navigation establishes agent_at; it does not consume the object's or
-        # destination container's capability state.  Treating it through the
-        # generic fallback pulls old open/close/exploration loops back into an
-        # otherwise minimal reaching-definition slice.
-        "go": set(),
-        "goto": set(),
-        "walk": set(),
-        "navigate": set(),
-        "take": {"agent_at", "agent.at", "object.at_location", "container.open"},
-        "pick": {"agent_at", "agent.at", "object.at_location", "container.open"},
-        "move": {"agent_at", "agent.at", "agent.holds", "container.open"},
-        "put": {"agent_at", "agent.at", "agent.holds", "container.open"},
-        "place": {"agent_at", "agent.at", "agent.holds", "container.open"},
-        "heat": {"agent_at", "agent.at", "agent.holds", "container.open"},
-        "clean": {"agent_at", "agent.at", "agent.holds", "container.open"},
-        "cool": {"agent_at", "agent.at", "agent.holds", "container.open"},
-        "open": {"agent_at", "agent.at"},
-        "close": {"agent_at", "agent.at"},
-        "toggle": {"agent_at", "agent.at", "object.at_location"},
-    }
-    allowed = by_verb.get(verb, {
-        "agent_at", "agent.at", "agent.holds", "object.at_location",
-        "container.open"})
-    return [predicate for predicate in _state_predicates(event.get("before") or {})
-            if str(predicate.get("predicate") or "") in allowed
-            and _predicate_mentions_phase_entity(predicate, params)]
+    """Infer event reads from grounded state relations, without a verb table."""
+    positives = [item for item in (event.get("positive_effects") or [])
+                 if isinstance(item, dict)]
+    event_params = {**dict(params or {}), **dict(event.get("params") or {})}
+
+    # A parameter-free transition whose only active change is agent location
+    # is a producer/setup event. First observations may add object facts, but
+    # those observations are not reads required to perform the movement.
+    active = [str(item.get("predicate") or "") for item in positives
+              if str(item.get("predicate") or "") != "object.exists"]
+    if (not event.get("params")
+            and any(name in {"agent_at", "agent.at"} for name in active)
+            and all(name in {"agent_at", "agent.at", "object.at_location"}
+                    for name in active)):
+        return []
+
+    before = _state_predicates(event.get("before") or {})
+    participants = {normalize_value(value) for value in event_params.values()
+                    if value not in (None, "")}
+    participants.discard("")
+    related_locations: set[str] = set()
+    for predicate in before:
+        if str(predicate.get("predicate") or "") != "object.at_location":
+            continue
+        args = predicate.get("args") or {}
+        if _matches_any(args.get("object"), participants):
+            related_locations.add(normalize_value(args.get("location")))
+    related_locations.discard("")
+
+    requirements: list[dict[str, Any]] = []
+    seen: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
+    for predicate in before:
+        args = predicate.get("args") or {}
+        values = {normalize_value(value) for value in args.values()}
+        if "object" in args:
+            # An object-bearing relation is selected through its object, never
+            # merely because an unrelated object shares a location participant.
+            mentions_participant = _matches_any(args.get("object"), participants)
+        else:
+            mentions_participant = bool(values & participants)
+        name = str(predicate.get("predicate") or "")
+        if name in {"agent_at", "agent.at", "container.open"}:
+            mentions_participant = mentions_participant or bool(
+                values & related_locations)
+        if not mentions_participant:
+            continue
+        key = _predicate_key(predicate)
+        if key not in seen:
+            seen.add(key)
+            requirements.append(predicate)
+    return requirements
+
+
+def _matches_any(value: Any, candidates: set[str]) -> bool:
+    normalized = normalize_value(value)
+    if normalized in candidates:
+        return True
+    family = re.sub(r"_\d+$", "", normalized)
+    return any(candidate and not re.search(r"_\d+$", candidate)
+               and family == re.sub(r"_\d+$", "", candidate)
+               for candidate in candidates)
 
 
 def _predicate_mentions_phase_entity(predicate: dict[str, Any],
@@ -1003,34 +1100,51 @@ def _predicate_key(predicate: dict[str, Any]) -> tuple[str, tuple[tuple[str, str
 
 
 def _canonical_phase_params(params: dict[str, Any], family: str) -> dict[str, Any]:
-    """Expose only semantic arguments of the verified Atomic contract.
+    """Preserve trace-grounded semantic roles without a capability whitelist."""
+    return {_safe_name(str(key)): value for key, value in params.items()
+            if value not in (None, "")}
 
-    Navigation destinations and implementation-internal receptacles remain in
-    occurrence evidence but cannot leak into the Abstract node interface.
+
+def _prune_phase_params(params: dict[str, Any], effects: list[dict[str, Any]],
+                        events: list[dict[str, Any]], *,
+                        core_event: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Keep only roles evidenced by this proposed occurrence.
+
+    This prevents whole-task bindings from leaking into an Atomic interface
+    without relying on a family-specific role whitelist.
     """
-    aliases = {
-        "source_location": "object_location",
-        "source_receptacle": "object_location",
-        "destination": "target_location",
-        "destination_location": "target_location",
-        "target_receptacle": "target_location",
+    evidence_values = {
+        normalize_value(value)
+        for effect in effects for value in (effect.get("args") or {}).values()
     }
-    normalized: dict[str, Any] = {}
-    for key, value in params.items():
-        canonical = aliases.get(str(key), str(key))
-        normalized.setdefault(canonical, value)
-    allowed = {
-        "agent_holds": {"object", "object_location"},
-        "object_heated": {"object", "heating_station"},
-        "object_cleaned": {"object", "cleaning_station"},
-        "object_cooled": {"object", "cooling_station"},
-        "object_at": {"object", "target_location"},
-        "object_lit": {"object", "light_source"},
-        "container_open": {"container"},
-    }.get(family)
-    if not allowed:
-        return normalized
-    return {key: value for key, value in normalized.items() if key in allowed}
+    action_text = "\n".join(str(event.get("action") or event.get("name") or "")
+                            for event in events).lower().replace("_", " ")
+    for event in events:
+        evidence_values |= {normalize_value(value)
+                            for value in (event.get("params") or {}).values()}
+    core_roles = {
+        _canonical_role_name(str(role))
+        for role in dict((core_event or {}).get("params") or {})
+    }
+    kept: dict[str, Any] = {}
+    for role, value in params.items():
+        normalized = normalize_value(value)
+        surface = normalized.replace("_", " ")
+        if (normalized in evidence_values
+                or (surface and re.search(
+                    rf"(?<![a-z0-9]){re.escape(surface)}(?![a-z0-9])", action_text))):
+            kept[role] = value
+    by_value: dict[str, list[str]] = {}
+    for role, value in kept.items():
+        by_value.setdefault(normalize_value(value), []).append(role)
+    for roles in by_value.values():
+        core_matches = [role for role in roles if role in core_roles]
+        if not core_matches:
+            continue
+        for role in roles:
+            if role not in core_matches:
+                kept.pop(role, None)
+    return kept
 
 
 def _refresh_effect_identity(effect: Any) -> None:
@@ -1038,8 +1152,10 @@ def _refresh_effect_identity(effect: Any) -> None:
     families = sorted({_family_of(item) for item in effect.positive if _family_of(item)})
     effect.primary_family = families[0] if families else ""
     if effect.primary_family:
+        predicate = str((effect.positive[0] or {}).get("predicate") or "")
         name, summary = _FACT_FAMILY_NAMES.get(
-            effect.primary_family, (effect.primary_family, effect.primary_family))
+            effect.primary_family,
+            (effect.primary_family, f"Verified transition: {predicate}"))
         effect.suggested_name = name
         effect.summary = summary
 
@@ -1051,6 +1167,7 @@ def _predicate_name_from_fact(fact: Any) -> str:
         "object_exists": "object.exists", "object_heated": "object.heated",
         "object_cleaned": "object.cleaned", "object_cooled": "object.cooled",
         "container_open": "container.open", "object_lit": "object.lit",
+        "object_toggled": "object.toggled",
     }
     return aliases.get(raw, raw if "." in raw else raw.replace("_", "."))
 

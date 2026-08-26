@@ -60,6 +60,33 @@ def summarize_episodes(episodes: list[dict[str, Any]]) -> dict[str, Any]:
         and int(e.get("executed_node_count", 0)) == int(e.get("planned_node_count", 0))
         and int((e.get("node_mode_counts") or {}).get("direct", 0))
         == int(e.get("planned_node_count", 0)))
+    all_executed_direct_episodes = sum(
+        1 for e in episodes
+        if int(e.get("executed_node_count", 0)) > 0
+        and int((e.get("node_mode_counts") or {}).get("direct", 0))
+        == int(e.get("executed_node_count", 0)))
+    goal_early_terminal_episodes = sum(
+        1 for e in episodes
+        if bool(e.get("goal_terminal_before_plan_complete"))
+        or (
+            bool(e.get("success"))
+            and int(e.get("planned_node_count", 0)) > 0
+            and int(e.get("executed_node_count", 0))
+            < int(e.get("planned_node_count", 0))
+        )
+    )
+    goal_terminal_skipped_nodes = sum(
+        max(0, int(e.get("planned_node_count", 0))
+            - int(e.get("executed_node_count", 0)))
+        for e in episodes
+        if bool(e.get("goal_terminal_before_plan_complete"))
+        or (
+            bool(e.get("success"))
+            and int(e.get("planned_node_count", 0)) > 0
+            and int(e.get("executed_node_count", 0))
+            < int(e.get("planned_node_count", 0))
+        )
+    )
     return {
         "num_tasks": n,
         "num_passed": successes,
@@ -72,6 +99,15 @@ def summarize_episodes(episodes: list[dict[str, Any]]) -> dict[str, Any]:
         "direct_episode_rate": round(direct_episodes / n, 4),
         "any_direct_episode_rate": round(direct_episodes / n, 4),
         "all_nodes_direct_episode_rate": round(all_direct_episodes / n, 4),
+        # Two deliberately different Direct denominators:
+        # - executed: every node the benchmark allowed us to execute was Direct;
+        # - full plan: every planned node was executed and Direct (strictest).
+        "all_executed_nodes_direct_episode_rate": round(
+            all_executed_direct_episodes / n, 4),
+        "full_plan_direct_episode_rate": round(all_direct_episodes / n, 4),
+        "goal_early_terminal_episode_count": goal_early_terminal_episodes,
+        "goal_early_terminal_episode_rate": round(goal_early_terminal_episodes / n, 4),
+        "goal_terminal_skipped_node_count": goal_terminal_skipped_nodes,
         "direct_node_rate": round(direct_nodes / max(total_executed_nodes, 1), 4),
         "seeded_node_rate": round(seeded_nodes / max(total_executed_nodes, 1), 4),
         "dynamic_node_rate": round(dynamic_nodes / max(total_executed_nodes, 1), 4),
@@ -128,20 +164,24 @@ def write_markdown_report(aggregated: dict[str, Any], output_path: str | Path,
     lines = [f"# {title}", ""]
     our_conditions = [c for c, v in aggregated.items() if v.get("kind") == "ours"]
     baseline_conditions = [c for c, v in aggregated.items() if v.get("kind") == "flowevo_baseline"]
-    table = ["| 条件 | 成功率 | Late-run | 首试成功 | Avg Tokens | Direct节点 | 全Direct任务 | "
-             "含Seeded任务 | 含Dynamic任务 | 原子复用率 | 跨类型复用率 |",
-             "|---|---|---|---|---|---|---|---|---|---|---|"]
+    table = ["| 条件 | 成功率 | Late-run | 首试成功 | Avg Tokens | Direct节点 | "
+             "执行节点全Direct | 完整计划全Direct | 目标提前终止 | 含Seeded任务 | "
+             "含Dynamic任务 | 原子复用率 | 跨类型复用率 |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for name in baseline_conditions + our_conditions:
         v = aggregated[name]
         if v.get("kind") == "flowevo_baseline":
             table.append(
                 f"| {name} (FlowEvo 原版) | {_pct(v.get('success_rate'))} | — | — | "
-                f"{v.get('avg_tokens_per_task', 0):.0f} | — | — | — | — | — | — |")
+                f"{v.get('avg_tokens_per_task', 0):.0f} | — | — | — | — | — | — | — | — |")
         else:
             table.append(
                 f"| {name} | {_pct(v.get('success_rate'))} | {_pct(v.get('late_run_success_rate'))} | "
                 f"{_pct(v.get('first_attempt_success_rate'))} | {v.get('avg_tokens_per_task', 0):.0f} | "
-                f"{_pct(v.get('direct_node_rate'))} | {_pct(v.get('all_nodes_direct_episode_rate'))} | "
+                f"{_pct(v.get('direct_node_rate'))} | "
+                f"{_pct(v.get('all_executed_nodes_direct_episode_rate'))} | "
+                f"{_pct(v.get('full_plan_direct_episode_rate'))} | "
+                f"{_pct(v.get('goal_early_terminal_episode_rate'))} | "
                 f"{_pct(v.get('seeded_episode_rate'))} | "
                 f"{_pct(v.get('dynamic_episode_rate'))} | {_pct(v.get('atomic_reuse_rate'))} | "
                 f"{_pct(v.get('cross_task_type_reuse_rate'))} |")
@@ -155,7 +195,13 @@ def write_markdown_report(aggregated: dict[str, Any], output_path: str | Path,
                   f"- 平均重试：{v.get('avg_retries', 0)}，平均 tokens/task：{v.get('avg_tokens_per_task', 0)}",
                   f"- Direct 严格口径：节点 {v.get('direct_node_count', 0)} / "
                   f"{v.get('executed_node_count', 0)}（{_pct(v.get('direct_node_rate'))}）；"
-                  f"全节点 Direct 任务 {_pct(v.get('all_nodes_direct_episode_rate'))}",
+                  f"实际执行节点全 Direct 任务 "
+                  f"{_pct(v.get('all_executed_nodes_direct_episode_rate'))}；"
+                  f"完整计划全 Direct 任务 {_pct(v.get('full_plan_direct_episode_rate'))}",
+                  f"- Benchmark 目标提前终止："
+                  f"{v.get('goal_early_terminal_episode_count', 0)} 个 episode "
+                  f"（{_pct(v.get('goal_early_terminal_episode_rate'))}），"
+                  f"因此跳过 {v.get('goal_terminal_skipped_node_count', 0)} 个规划节点",
                   f"- Admission：通过 {v.get('admission_pass', 0)} / shadow {v.get('admission_shadow', 0)}"
                   f"（通过率 {_pct(v.get('admission_pass_rate'))}）",
                   f"- 维护动作数：{v.get('maintenance_actions', 0)}",

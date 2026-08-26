@@ -20,29 +20,6 @@ from .benchmark import (
 )
 from .code_math import ensure_flowevo_path
 
-_SUPPORTED_TASK_TYPES = {
-    "pick_and_place_simple",
-    "pick_clean_then_place_in_recep",
-    "pick_heat_then_place_in_recep",
-    "pick_cool_then_place_in_recep",
-    "look_at_obj_in_light",
-    "pick_two_obj_and_place",
-}
-
-_RECEPTACLE_TYPES = {
-    "armchair", "bathtub", "bathtubbasin", "bed", "box", "cabinet", "cart",
-    "chair", "coffeemachine", "countertop", "desk", "diningtable", "drawer",
-    "dresser", "fridge", "garbagecan", "laundryhamper", "microwave", "ottoman",
-    "safe", "shelf", "sidetable", "sink", "sinkbasin", "sofa", "stoveburner",
-    "toaster", "toilet",
-}
-_DISCOVERY_SOURCE_PRIORITY = {
-    "countertop": 0, "diningtable": 1, "sidetable": 2, "shelf": 3,
-    "coffeemachine": 4, "garbagecan": 5, "cabinet": 6, "drawer": 7,
-    "fridge": 8, "microwave": 9,
-}
-
-
 class AlfWorldAdapter:
     """真实 ALFWorld（textworld 后端）适配。"""
 
@@ -84,21 +61,18 @@ class AlfWorldAdapter:
         if limit and limit > 0:
             raw_tasks = raw_tasks[:limit]
         tasks: list[Task] = []
-        param_extractor = _get_param_extractor()
         for index, raw in enumerate(raw_tasks):
             task_id = f"alfworld_{index}_{raw.task_type}"
             self._task_indices[task_id] = index
             state = _parse_alfworld_state(raw.initial_observation)
-            # 复用 vendored FlowEvo ParamExtractor（§23：goal/task 参数解析）
-            params: dict[str, Any] = {}
-            if param_extractor is not None and raw.task_type != "pick_two_obj_and_place":
-                try:
-                    params = param_extractor.extract(
-                        str(raw.task_type), str(raw.goal),
-                        str(raw.initial_observation), list(raw.initial_admissible))
-                    params = {str(k): v for k, v in (params or {}).items()}
-                except Exception:  # noqa: BLE001
-                    params = {}
+            # Goal roles come only from the task sentence and entities exposed
+            # by the environment.  In particular, the official task-type label
+            # is never used to inject a station, workflow, or operation boundary.
+            goal_roles = _goal_roles_from_text(str(raw.goal))
+            exposed_entities = _entities_from_admissible(raw.initial_admissible)
+            params = _executable_goal_params(goal_roles, exposed_entities)
+            if params.get("object_type"):
+                params.setdefault("object", params["object_type"])
             semantic_params = _semantic_goal_params(str(raw.goal), params)
             tasks.append(Task(
                 task_id=task_id,
@@ -110,6 +84,9 @@ class AlfWorldAdapter:
                     "env_index": index,
                     "initial_observation": str(raw.initial_observation),
                     "initial_admissible": list(raw.initial_admissible),
+                    "goal_roles": goal_roles,
+                    "goal_entities": sorted(set(goal_roles.values())),
+                    "exposed_entities": exposed_entities,
                     "game_file": str(getattr(raw, "game_file", "")),
                     "params": params,
                     # Goal contract keeps a receptacle family (cabinet), while
@@ -117,7 +94,8 @@ class AlfWorldAdapter:
                     "semantic_params": semantic_params,
                 },
                 state=state,
-                target_effects=_target_effects_of(raw.task_type),
+                target_effects=_target_effects_of(
+                    "", str(raw.goal), params),
                 metadata={},
             ))
         return tasks
@@ -237,16 +215,22 @@ class AlfWorldAdapter:
     def discover_object_location(self, task: Task, object_name: str, *,
                                  resume: dict[str, Any] | None = None,
                                  max_locations: int = 30,
-                                 node_ref: str = "", tool_ref: str = ""
+                                 node_ref: str = "", tool_ref: str = "",
+                                 excluded_objects: set[str] | None = None,
+                                 allow_passive_navigable: bool = False,
                                  ) -> tuple[dict[str, str], EnvRunResult]:
-        """为 Acquire Tool 做确定性、有界且不重复的位置发现。
+        """Bounded location discovery for a learned entity/location contract.
 
-        只执行 admissible 中的 ``go to``/``open`` 探索动作；每个 receptacle
-        最多检查一次。找到具体对象实例后返回 object/object_location 绑定，但不
-        代替 Acquire 本身，随后仍由标准 Direct Tool 执行 take。
+        Only environment-exposed navigation/open actions are used. A location
+        becomes checked only after an accepted arrival and valid observation;
+        a rejected visit gets one retry. For a non-acquisition Tool whose target
+        is itself an exposed navigable entity, the command is sufficient to bind
+        its navigation parameter passively; the Tool retains and executes the
+        actual navigation step.
         """
         # 位置发现是代码框架的有界前置步骤，不是 Direct Tool 调用。
         result = EnvRunResult()
+        excluded = {_norm(item) for item in (excluded_objects or set()) if item}
         if resume:
             obs = str(resume.get("observation") or "")
             admissible = list(resume.get("admissible") or [])
@@ -277,6 +261,8 @@ class AlfWorldAdapter:
                 match = re.fullmatch(r"object_at\((.+?),\s*(.+?)\)", fact)
                 if not match or not _same_object_family(match.group(1), object_name):
                     continue
+                if _norm(match.group(1)) in excluded:
+                    continue
                 location = _norm(match.group(2))
                 priority = (0 if preferred_location and location == preferred_location
                             else 1 if location in current_locations else 2)
@@ -294,38 +280,50 @@ class AlfWorldAdapter:
                 return observed
             for command in admissible:
                 match = re.match(r"take (.+?) from (.+)$", command, re.IGNORECASE)
-                if match and _same_object_family(match.group(1), object_name):
+                if (match and _same_object_family(match.group(1), object_name)
+                        and _norm(match.group(1)) not in excluded):
                     return {"object": _norm(match.group(1)),
                             "object_location": _norm(match.group(2))}
             return {}
 
-        checked = set(tracker.meta.get("checked_locations") or [])
+        if allow_passive_navigable:
+            navigable = []
+            for command in admissible:
+                match = re.fullmatch(r"go to\s+(.+)", command,
+                                     flags=re.IGNORECASE)
+                if (match and _same_object_family(match.group(1), object_name)
+                        and _norm(match.group(1)) not in excluded):
+                    navigable.append(_norm(match.group(1)))
+            if len(set(navigable)) == 1:
+                target = navigable[0]
+                return finish({"object": target, "object_location": target})
+
+        # A repeated same-family Acquire may need to revisit the first source:
+        # both objects can start in one receptacle. The local set still keeps
+        # each location bounded to one visit in this discovery call.
+        checked = (set() if excluded else
+                   set(tracker.meta.get("checked_locations") or []))
+        exhausted: set[str] = set()
         queue: list[tuple[str, str]] = []
 
         def enqueue(commands: list[str], observation: str = "") -> None:
             candidates: dict[str, str] = {}
-            for command in commands:
+            # Candidate locations come only from actions exposed by the
+            # environment. The initial admissible set is retained because some
+            # wrappers expose only a local subset after the first movement.
+            exposed = [*commands,
+                       *list(task.context.get("initial_admissible") or [])]
+            for command in exposed:
                 match = re.match(r"go to (.+)$", command, re.IGNORECASE)
                 if not match:
                     continue
                 location = _norm(match.group(1))
                 candidates.setdefault(location, command)
-            # 有些 wrapper 在中途 observation 中不再完整暴露所有 ``go to``；
-            # 初始房间描述仍是可信候选来源。只解析已知 receptacle，绝不把物体
-            # 实例拼成探索命令。
-            text = " ".join((observation,
-                             str(task.context.get("initial_observation") or "")))
-            for match in re.finditer(r"\b([a-z]+)\s+(\d+)\b", text,
-                                     flags=re.IGNORECASE):
-                family = match.group(1).lower()
-                if family in _RECEPTACLE_TYPES:
-                    location = _norm(match.group(0))
-                    candidates.setdefault(location,
-                                          f"go to {match.group(0).lower()}")
             existing = {item[0] for item in queue}
             additions = [(location, command) for location, command in candidates.items()
-                         if location not in checked and location not in existing]
-            additions.sort(key=lambda item: _discovery_location_priority(item[0]))
+                         if (location not in checked and location not in exhausted
+                             and location not in existing)]
+            additions.sort(key=lambda item: item[0])
             queue.extend(additions)
 
         def execute(action: str) -> Any:
@@ -333,10 +331,11 @@ class AlfWorldAdapter:
             env_result = self._current_env.step(action)
             obs = env_result.observation
             admissible = list(env_result.admissible_commands)
+            accepted = _env_step_accepted(env_result)
             result.actions.append({
                 "step": len(result.actions), "name": action,
                 "params": _parse_action_params(action),
-                "observation": obs, "accepted": "nothing happens" not in obs.lower(),
+                "observation": obs, "accepted": accepted,
                 "mode": "dynamic", "node_ref": node_ref, "tool_ref": "",
                 "origin": "framework_discovery",
             })
@@ -357,16 +356,33 @@ class AlfWorldAdapter:
                                       rf"go to\s+{re.escape(source.replace('_', ' '))}",
                                       command, flags=re.IGNORECASE)),
                                  f"go to {source.replace('_', ' ')}")
-                env_result = execute(go_action)
-                if env_result.done and not env_result.won:
+                arrived = False
+                for _attempt in range(2):
+                    env_result = execute(go_action)
+                    if env_result.done and not env_result.won:
+                        return {}
+                    arrived = (_env_step_accepted(env_result)
+                               and f"agent_at({source})" in tracker.facts)
+                    if arrived:
+                        break
+                if not arrived:
+                    exhausted.add(source)
                     return {}
                 open_action = next((command for command in admissible
                                     if re.fullmatch(
                                         rf"open\s+{re.escape(source.replace('_', ' '))}",
                                         command, flags=re.IGNORECASE)), None)
                 if open_action:
-                    env_result = execute(open_action)
-                    if env_result.done and not env_result.won:
+                    opened = False
+                    for _attempt in range(2):
+                        env_result = execute(open_action)
+                        if env_result.done and not env_result.won:
+                            return {}
+                        if _env_step_accepted(env_result):
+                            opened = True
+                            break
+                    if not opened:
+                        exhausted.add(source)
                         return {}
                 checked.add(source)
                 tracker.meta["checked_locations"] = sorted(checked)
@@ -384,24 +400,47 @@ class AlfWorldAdapter:
                 return finish(found)
 
         enqueue(admissible, obs)
-        inspected = 0
-        while queue and inspected < max(0, int(max_locations)):
+        inspected: set[str] = set()
+        location_limit = max(0, int(max_locations))
+        while queue:
             location, go_action = queue.pop(0)
-            if location in checked:
+            if location in checked or location in exhausted:
                 continue
-            env_result = execute(go_action)
-            if env_result.done:
-                return finish({})
+            if location not in inspected:
+                if len(inspected) >= location_limit:
+                    break
+                inspected.add(location)
+            arrived = False
+            for _attempt in range(2):
+                env_result = execute(go_action)
+                if env_result.done:
+                    return finish({})
+                arrived = (_env_step_accepted(env_result)
+                           and f"agent_at({location})" in tracker.facts)
+                if arrived:
+                    break
+            if not arrived:
+                exhausted.add(location)
+                enqueue(admissible, obs)
+                continue
             # 封闭容器必须打开后才算检查完成。
             open_action = next((cmd for cmd in admissible
                                 if re.fullmatch(rf"open\s+{re.escape(location.replace('_', ' '))}",
                                                 cmd, re.IGNORECASE)), None)
             if open_action:
-                env_result = execute(open_action)
-                if env_result.done:
-                    return finish({})
+                opened = False
+                for _attempt in range(2):
+                    env_result = execute(open_action)
+                    if env_result.done:
+                        return finish({})
+                    if _env_step_accepted(env_result):
+                        opened = True
+                        break
+                if not opened:
+                    exhausted.add(location)
+                    enqueue(admissible, obs)
+                    continue
             checked.add(location)
-            inspected += 1
             tracker.meta["checked_locations"] = sorted(checked)
             # 保存加入 checked 后的结构化状态，而不是只保存在 Python 局部变量。
             result.states[-1]["state"] = tracker.state()
@@ -450,6 +489,12 @@ class AlfWorldAdapter:
                 for step in step_spec.get("steps") or []:
                     template, params = _split_step(step, step_spec.get("params") or {})
                     filled = _fill_template(template, params)
+                    # Location discovery may already have established a Tool's
+                    # navigation precondition. Treating an idempotent movement
+                    # as satisfied avoids sending an invalid same-location
+                    # command while keeping that step in the reusable artifact.
+                    if _navigation_already_satisfied(filled, tracker):
+                        continue
                     env_result = self._current_env.step(filled)
                     obs = env_result.observation
                     admissible = env_result.admissible_commands
@@ -460,7 +505,7 @@ class AlfWorldAdapter:
                         "name": filled,
                         "params": params,
                         "observation": env_result.observation,
-                        "accepted": True,
+                        "accepted": _env_step_accepted(env_result),
                         "mode": "direct",
                         "node_ref": step_spec.get("node_ref", ""),
                         "tool_ref": step_spec.get("tool_ref", ""),
@@ -544,7 +589,7 @@ class AlfWorldAdapter:
                 continue
             env_result = self._current_env.step(action)
             local_env_steps += 1
-            accepted = "Nothing happens" not in env_result.observation
+            accepted = _env_step_accepted(env_result)
             result.actions.append({
                 "step": len(result.actions),
                 "name": action,
@@ -556,7 +601,8 @@ class AlfWorldAdapter:
                 "tool_ref": "",
             })
             tracker.update(env_result.observation)
-            _record_location_inspection(tracker, action, env_result.observation)
+            _record_location_inspection(
+                tracker, action, env_result.observation, accepted=accepted)
             result.states.append({"step": len(result.actions),
                                   "state": tracker.state()})
             action_history.append(action)
@@ -675,6 +721,9 @@ def _parse_alfworld_state(observation: str) -> dict[str, Any]:
     cool = re.search(r"you cool the (.+?) using the (.+?)\.", text)
     if cool:
         facts.append(f"object_cooled({_norm(cool.group(1))})")
+    toggled_on = re.search(r"you turn on the (.+?)\.", text)
+    if toggled_on:
+        facts.append(f"object_toggled({_norm(toggled_on.group(1))})")
 
     for open_obj in re.findall(r"the ([a-z0-9 ]+?) is open", text):
         facts.append(f"container_open({_norm(open_obj)})")
@@ -778,6 +827,12 @@ class _AlfStateTracker:
         cool = re.search(r"you cool the (.+?) using the (.+?)\.", text)
         if cool:
             self.facts.add(f"object_cooled({_norm(cool.group(1))})")
+        toggled_on = re.search(r"you turn on the (.+?)\.", text)
+        if toggled_on:
+            self.facts.add(f"object_toggled({_norm(toggled_on.group(1))})")
+        toggled_off = re.search(r"you turn off the (.+?)\.", text)
+        if toggled_off:
+            self.facts.discard(f"object_toggled({_norm(toggled_off.group(1))})")
 
         carrying = re.search(r"you are carrying (.+)\.?", text)
         if carrying:
@@ -797,6 +852,19 @@ def _norm(text: str) -> str:
     return re.sub(r"\s+", "_", str(text).strip().lower())
 
 
+def _env_step_accepted(result: Any) -> bool:
+    """Use an explicit adapter verdict when present, with text fallback."""
+    observation = str(getattr(result, "observation", "") or "")
+    explicit = bool(getattr(result, "accepted", True))
+    return explicit and "nothing happens" not in observation.lower()
+
+
+def _navigation_already_satisfied(action: str, tracker: _AlfStateTracker) -> bool:
+    match = re.fullmatch(r"go to\s+(.+)", str(action).strip(),
+                         flags=re.IGNORECASE)
+    return bool(match and f"agent_at({_norm(match.group(1))})" in tracker.facts)
+
+
 def _same_object_family(candidate: str, requested: str) -> bool:
     """``apple`` 与具体实例 ``apple 2``/``apple_2`` 属于同一对象族。"""
     left = re.sub(r"_\d+$", "", _norm(candidate))
@@ -804,27 +872,110 @@ def _same_object_family(candidate: str, requested: str) -> bool:
     return bool(left and left == right)
 
 
-def _discovery_location_priority(location: str) -> tuple[int, str]:
-    """稳定且实例无关的位置搜索顺序；常见开放表面优先。"""
-    normalized = _norm(location)
-    family = re.sub(r"_\d+$", "", normalized)
-    return (_DISCOVERY_SOURCE_PRIORITY.get(family, 50), normalized)
+def _goal_roles_from_text(goal: str) -> dict[str, str]:
+    """Parse semantic participants from the goal sentence, without a task label.
+
+    This is an environment-language adapter, not a solution template: it names
+    the theme, final relation target, and an explicitly mentioned associated
+    entity.  It never supplies an intermediate resource or an action sequence.
+    """
+    text = re.sub(r"\s+", " ", str(goal or "").strip().lower()).rstrip(". !?")
+    if not text:
+        return {}
+
+    roles: dict[str, str] = {}
+    relation = re.search(
+        r"\b(in|on|into|onto|under|with|using)\s+(?:the\s+)?"
+        r"([a-z][a-z0-9]*(?:\s+\d+)?)\s*$", text)
+    prefix = text
+    if relation:
+        relation_name, value = relation.group(1), _norm(relation.group(2))
+        if relation_name in {"in", "on", "into", "onto"}:
+            roles["destination"] = value
+        else:
+            roles["associated_entity"] = value
+        prefix = text[:relation.start()].strip()
+
+    # A coordinated goal may contain both a final destination and an earlier
+    # clause ("... and put it in ...").  The theme is the noun phrase of the
+    # first clause, or the phrase immediately before the final relation.
+    first_clause = re.split(r"\b(?:and then|then|and)\b", prefix, maxsplit=1)[0]
+    tokens = re.findall(r"[a-z][a-z0-9]*", first_clause)
+    determiners = {"a", "an", "the", "some", "one", "two", "three", "four", "five"}
+    pronouns = {"it", "them", "this", "that"}
+    # ALFWorld goal language places the theme at the end of the first clause.
+    # Choosing the final content token avoids a benchmark object whitelist and
+    # does not reveal how that entity should be manipulated.
+    content = [token for token in tokens if token not in determiners and token not in pronouns]
+    if content:
+        roles["theme"] = _norm(content[-1])
+
+    count = _goal_cardinality(text)
+    if count > 1:
+        roles["cardinality"] = str(count)
+    return roles
+
+
+def _entities_from_admissible(commands: list[str]) -> list[str]:
+    """Collect grounded entities exposed by the environment action protocol."""
+    entities: list[str] = []
+    for command in commands or []:
+        values = list(_parse_action_params(str(command)).values())
+        unary = re.fullmatch(
+            r"(?:go to|open|close|use|examine)\s+(.+)",
+            str(command).strip(), flags=re.IGNORECASE)
+        if unary:
+            values.append(unary.group(1))
+        for value in values:
+            normalized = _norm(value)
+            if normalized and normalized not in entities:
+                entities.append(normalized)
+    return entities
+
+
+def _resolve_exposed_entity(value: str, exposed: list[str]) -> str:
+    matches = [item for item in exposed if _same_object_family(item, value)]
+    # A unique exposed instance is executable evidence.  Ambiguous families
+    # remain abstract until runtime observation resolves the exact instance.
+    return matches[0] if len(matches) == 1 else _norm(value)
+
+
+def _executable_goal_params(goal_roles: dict[str, str],
+                            exposed_entities: list[str]) -> dict[str, Any]:
+    params: dict[str, Any] = {}
+    theme = str(goal_roles.get("theme") or "")
+    destination = str(goal_roles.get("destination") or "")
+    associated = str(goal_roles.get("associated_entity") or "")
+    if theme:
+        params["object"] = _resolve_exposed_entity(theme, exposed_entities)
+    if destination:
+        params["target_location"] = _resolve_exposed_entity(
+            destination, exposed_entities)
+    if associated:
+        params["associated_entity"] = _resolve_exposed_entity(
+            associated, exposed_entities)
+    cardinality = int(goal_roles.get("cardinality") or 1)
+    if cardinality > 1 and theme:
+        params["object_type"] = _norm(theme)
+        params["object"] = _norm(theme)
+    return params
 
 
 def _semantic_goal_params(goal: str, executable_params: dict[str, Any]) -> dict[str, Any]:
-    """Separate goal-level types from concrete executable ALFWorld bindings."""
+    """Separate goal-level entity families from executable instances."""
     semantic = dict(executable_params or {})
     text = str(goal or "").strip().lower()
-    target = str(semantic.get("target_location") or "").strip()
-    if target:
-        normalized = _norm(target)
+    for role, raw_value in list(semantic.items()):
+        if not isinstance(raw_value, str):
+            continue
+        normalized = _norm(raw_value)
         family = re.sub(r"_\d+$", "", normalized)
         family_text = family.replace("_", " ")
         explicit_instance = re.search(
             rf"\b{re.escape(family_text)}\s+\d+\b", text)
         if (not explicit_instance
                 and re.search(rf"\b{re.escape(family_text)}\b", text)):
-            semantic["target_location"] = family_text
+            semantic[str(role)] = family_text
     return semantic
 
 
@@ -858,6 +1009,8 @@ def _controlled_acquire_replay_setup(
         return resolved, commands, True
 
     checked: set[str] = set()
+    exhausted: set[str] = set()
+    inspected: set[str] = set()
     queue: list[tuple[str, str]] = []
 
     def enqueue(items: list[str]) -> None:
@@ -866,31 +1019,52 @@ def _controlled_acquire_replay_setup(
             match = re.fullmatch(r"go to (.+)", command, flags=re.IGNORECASE)
             if match:
                 location = _norm(match.group(1))
-                if location not in checked and all(location != item[0] for item in queue):
+                if (location not in checked and location not in exhausted
+                        and all(location != item[0] for item in queue)):
                     candidates.append((location, command))
         candidates.sort(key=lambda item: (item[0] != preferred, item[0]))
         queue.extend(candidates)
 
     enqueue(commands)
-    while queue and len(checked) < max(0, int(max_locations)):
+    while queue and len(inspected) < max(0, int(max_locations)):
         location, go_action = queue.pop(0)
-        if location in checked:
+        if location in checked or location in exhausted:
             continue
-        step_result = env.step(go_action)
-        tracker.update(step_result.observation)
-        commands = list(step_result.admissible_commands)
-        if step_result.done and not step_result.won:
-            return resolved, commands, False
+        inspected.add(location)
+        arrived = False
+        for _attempt in range(2):
+            step_result = env.step(go_action)
+            tracker.update(step_result.observation)
+            commands = list(step_result.admissible_commands)
+            if step_result.done and not step_result.won:
+                return resolved, commands, False
+            arrived = (_env_step_accepted(step_result)
+                       and f"agent_at({location})" in tracker.facts)
+            if arrived:
+                break
+        if not arrived:
+            exhausted.add(location)
+            enqueue(commands)
+            continue
         open_action = next((command for command in commands
                             if re.fullmatch(
                                 rf"open\s+{re.escape(location.replace('_', ' '))}",
                                 command, flags=re.IGNORECASE)), None)
         if open_action:
-            step_result = env.step(open_action)
-            tracker.update(step_result.observation)
-            commands = list(step_result.admissible_commands)
-            if step_result.done and not step_result.won:
-                return resolved, commands, False
+            opened = False
+            for _attempt in range(2):
+                step_result = env.step(open_action)
+                tracker.update(step_result.observation)
+                commands = list(step_result.admissible_commands)
+                if step_result.done and not step_result.won:
+                    return resolved, commands, False
+                if _env_step_accepted(step_result):
+                    opened = True
+                    break
+            if not opened:
+                exhausted.add(location)
+                enqueue(commands)
+                continue
         checked.add(location)
         found = take_binding(commands)
         if found:
@@ -900,25 +1074,69 @@ def _controlled_acquire_replay_setup(
     return resolved, commands, False
 
 
-def _target_effects_of(task_type: str) -> list[dict[str, Any]]:
-    mapping = {
-        "pick_heat_then_place_in_recep": [
-            {"predicate": "object.heated", "args": {"object": "$object"}},
-            {"predicate": "object.at_location", "args": {"object": "$object", "location": "$target_location"}},
-        ],
-        "pick_clean_then_place_in_recep": [
-            {"predicate": "object.cleaned", "args": {"object": "$object"}},
-            {"predicate": "object.at_location", "args": {"object": "$object", "location": "$target_location"}},
-        ],
-        "pick_cool_then_place_in_recep": [
-            {"predicate": "object.cooled", "args": {"object": "$object"}},
-            {"predicate": "object.at_location", "args": {"object": "$object", "location": "$target_location"}},
-        ],
-        "look_at_obj_in_light": [
-            {"predicate": "object.lit", "args": {"object": "$object"}},
-        ],
-    }
-    return mapping.get(task_type, [])
+def _target_effects_of(task_type: str, goal: str = "",
+                       params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Compose a goal-state contract from the user-visible sentence only.
+
+    This parser declares *what* must hold, never an action sequence. It does
+    not enumerate benchmark task types, objects, receptacles, or solutions.
+    The learned SkillGraph/Tool Repository remains responsible for discovering
+    *how* to achieve the contract.
+
+    ``task_type`` remains in the signature for compatibility with stored-run
+    tooling, but is intentionally ignored.  Labels are sampling/report fields.
+    """
+    params = dict(params or {})
+    text = str(goal or "").lower()
+    effects: list[dict[str, Any]] = []
+
+    # These words formalize an explicitly stated desired state. They do not
+    # prescribe an action, resource, boundary, or workflow to the agent.
+    if re.search(r"\b(?:heat|heated|hot)\b", text):
+        effects.append({"predicate": "object.heated",
+                        "args": {"object": "$object"}})
+    if re.search(r"\b(?:clean|cleaned)\b", text):
+        effects.append({"predicate": "object.cleaned",
+                        "args": {"object": "$object"}})
+    if re.search(r"\b(?:cool|cooled|cold)\b", text):
+        effects.append({"predicate": "object.cooled",
+                        "args": {"object": "$object"}})
+
+    associated = params.get("associated_entity")
+    is_observation_goal = bool(
+        associated and re.search(r"\b(?:examine|look at)\b", text))
+    if is_observation_goal:
+        return [
+            {"predicate": "object.toggled",
+             "args": {"object": "$associated_entity"}},
+            {"predicate": "agent.holds", "args": {"object": "$object"}},
+        ]
+
+    has_destination = bool(
+        params.get("target_location")
+        or re.search(r"\b(?:put|place)\b", text))
+    if has_destination:
+        count = _goal_cardinality(text)
+        object_slot = "$object_type" if count > 1 else "$object"
+        placement: dict[str, Any] = {
+            "predicate": "object.at_location",
+            "args": {"object": object_slot, "location": "$target_location"},
+        }
+        if count > 1:
+            placement.update({"cardinality": count, "distinct_by": "object"})
+        effects.append(placement)
+    return effects
+
+
+def _goal_cardinality(text: str) -> int:
+    """Parse an explicit count from the visible goal sentence; default one."""
+    words = {"two": 2, "three": 3, "four": 4, "five": 5}
+    match = re.search(
+        r"\b(?:put|place|pick|find)\s+(two|three|four|five|[2-9])\b", text)
+    if match:
+        token = match.group(1)
+        return words.get(token, int(token) if token.isdigit() else 1)
+    return 1
 
 
 def _fill_template(step: str, params: dict[str, Any]) -> str:
@@ -935,24 +1153,17 @@ def _split_step(step: Any, default_params: dict[str, Any]) -> tuple[str, dict[st
 
 
 # ---------------------------------------------------------------------------
-# ReAct prompt（与 vendored FlowEvo alfworld_/generator.py 对齐，§57.1 公平对照）
+# Runtime action-selection prompt.  It deliberately contains no benchmark
+# taxonomy, solution pattern, operation catalogue, or hand-written workflow.
 # ---------------------------------------------------------------------------
 
 _ALFWORLD_SYSTEM_PROMPT = (
-    "You are an expert household robot completing tasks in a virtual home. "
-    "You will be given a task goal, the current observation, and a list of valid actions.\n\n"
-    "At each step:\n"
-    "1. Think about what you need to do next and why.\n"
-    "2. Choose exactly ONE action from the valid actions list.\n\n"
-    "Common task patterns:\n"
-    "- pick_and_place: go to object location -> take it -> go to destination -> put it\n"
-    "- pick_clean_then_place: go to object -> take -> go to sinkbasin -> clean -> go to dest -> put\n"
-    "- pick_heat_then_place: go to object -> take -> go to microwave -> heat -> go to dest -> put\n"
-    "- pick_cool_then_place: go to object -> take -> go to fridge -> cool -> go to dest -> put\n"
-    "- examine_in_light: go to object -> take -> go to lamp -> use lamp\n"
-    "- pick_two: find first object -> take -> go to dest -> put -> find second -> take -> go to dest -> put\n\n"
+    "You control an agent in an interactive environment. You receive only the "
+    "task goal, current observation, prior interaction, optional learned capability "
+    "evidence, and actions currently declared valid by the environment. Infer the next "
+    "step from that evidence. Do not assume a benchmark task taxonomy or a predefined "
+    "workflow. Choose exactly one action from the current valid-actions list.\n\n"
     "Format your response as:\n"
-    "Think: <your step-by-step reasoning>\n"
     "Act: <the exact action from the valid actions list>\n"
 )
 
@@ -993,13 +1204,18 @@ def _checked_locations(tracker: _AlfStateTracker) -> list[str]:
 
 
 def _record_location_inspection(tracker: _AlfStateTracker, action: str,
-                                observation: str) -> None:
+                                observation: str, *, accepted: bool = True) -> None:
     """把完成观察的位置写入可续跑的结构化状态。"""
+    if not accepted or "nothing happens" in str(observation).lower():
+        return
     go = re.match(r"go to (.+)$", action, re.IGNORECASE)
     opened = re.match(r"open (.+)$", action, re.IGNORECASE)
     checked = set(_checked_locations(tracker))
-    if go and " is closed" not in str(observation).lower():
-        checked.add(_norm(go.group(1)))
+    if go:
+        location = _norm(go.group(1))
+        if (" is closed" not in str(observation).lower()
+                and f"agent_at({location})" in tracker.facts):
+            checked.add(location)
     if opened:
         checked.add(_norm(opened.group(1)))
     tracker.meta["checked_locations"] = sorted(checked)
@@ -1116,6 +1332,9 @@ def _parse_action_params(action: str) -> dict[str, Any]:
     if cool_match:
         params["object"] = cool_match.group(1).strip()
         params["cooling_station"] = cool_match.group(2).strip()
+    use_match = re.match(r"use (.+)", action)
+    if use_match:
+        params["light_source"] = use_match.group(1).strip()
     return params
 
 
@@ -1129,14 +1348,4 @@ def _replay_env_index(replay_case: dict[str, Any]) -> int | None:
     try:
         return int(index)
     except (TypeError, ValueError):
-        return None
-
-
-def _get_param_extractor():
-    """复用 vendored FlowEvo ParamExtractor（§23：goal/task 参数解析）。"""
-    try:
-        ensure_flowevo_path()
-        from alfworld_.param_extractor import ParamExtractor
-        return ParamExtractor()
-    except Exception:  # noqa: BLE001
         return None

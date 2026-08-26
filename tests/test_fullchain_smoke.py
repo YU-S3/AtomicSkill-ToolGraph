@@ -47,8 +47,25 @@ def test_fullchain_smoke(workspace_tmp):
         [e["task_id"] for e in episodes if not e["success"]]
     # 路由覆盖：cold dynamic / warm seeded / warm direct
     modes = {e["direct_reuse_count"] for e in episodes}
-    assert any(e["direct_reuse_count"] > 0 for e in episodes), "应出现 direct 复用"
-    assert any(e["seeded_generation_count"] > 0 for e in episodes), "应出现 seeded 复用"
+    route_audit = [
+        (e["task_id"], e["start_mode"], e["planning_mode"],
+         e["direct_reuse_count"], e["seeded_generation_count"],
+         e["dynamic_generation_count"], e["planned_node_count"],
+         e["reused_skill_refs"], e["used_tool_refs"],
+         [
+             {
+                 "ref": node.get("ref"),
+                 "params": node.get("params"),
+                 "attempts": node.get("attempts"),
+                 "fallback_reason": node.get("fallback_reason"),
+             }
+             for node in (system.trace_store.load(e["trace_id"]).realized_atomic_nodes or [])
+         ])
+        for e in episodes
+    ]
+    route_report = "\n".join(map(str, route_audit))
+    assert any(e["direct_reuse_count"] > 0 for e in episodes), route_report
+    assert any(e["seeded_generation_count"] > 0 for e in episodes), route_report
     # 知识增长
     final = system.stats()
     assert final["skill_graph"]["nodes"] >= 10

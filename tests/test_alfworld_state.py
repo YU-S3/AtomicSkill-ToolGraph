@@ -10,16 +10,22 @@ from atomic_skillgraph.adapters.alfworld import (  # noqa: E402
     _AlfStateTracker,
     _compact_seed_context,
     _controlled_acquire_replay_setup,
+    _executable_goal_params,
+    _goal_roles_from_text,
     _parse_action_params,
     _parse_alfworld_state,
+    _record_location_inspection,
     _semantic_goal_params,
+    _target_effects_of,
 )
 from atomic_skillgraph.atomicizer.trace_atomicizer import TraceAtomicizer  # noqa: E402
 from atomic_skillgraph.atomicizer.semantic_extractor import build_structured_events  # noqa: E402
 from atomic_skillgraph.adapters.benchmark import Task  # noqa: E402
 from atomic_skillgraph.core.trace_ir import ActionRecord, TraceRecord  # noqa: E402
+from atomic_skillgraph.core.predicates import StateSnapshot, check_effects  # noqa: E402
 from atomic_skillgraph.graph.registry import SkillGraphRegistry  # noqa: E402
 from atomic_skillgraph.tools.compiler_adapter import mine_action_template_tools  # noqa: E402
+from atomic_skillgraph.system import _completed_distinct_effect_instances  # noqa: E402
 
 # 真实 ALFWorld PDDL 环境（0.4.2）观察语料（来自一次成功 heat 任务）
 ACTIONS = [
@@ -74,6 +80,92 @@ def test_pddl_state_parser():
     assert "object_heated(mug_2)" in heat["facts"]
     move = _parse_alfworld_state("You move the mug 2 to the coffeemachine 1.")
     assert "object_at(mug_2, coffeemachine_1)" in move["facts"]
+    light = _parse_alfworld_state("You turn on the desklamp 1.")
+    assert "object_toggled(desklamp_1)" in light["facts"]
+
+
+def test_official_task_type_is_ignored_by_goal_contract():
+    assert _target_effects_of("pick_heat_then_place_in_recep") == []
+    simple = _target_effects_of(
+        "pick_and_place_simple", "put a mug in cabinet.",
+        {"object": "mug", "target_location": "cabinet"})
+    assert [item["predicate"] for item in simple] == ["object.at_location"]
+    look = _target_effects_of(
+        "look_at_obj_in_light", "examine the book with the lamp.",
+        {"object": "book", "associated_entity": "lamp"})
+    assert [item["predicate"] for item in look] == [
+        "object.toggled", "agent.holds"]
+    pick_two = _target_effects_of(
+        "pick_two_obj_and_place", "put two cd in safe.",
+        {"object_type": "cd", "target_location": "safe"})
+    assert pick_two[0]["cardinality"] == 2
+    assert pick_two[0]["distinct_by"] == "object"
+
+
+def test_goal_contract_is_compositional_not_task_type_enumerated():
+    effects = _target_effects_of(
+        "unseen_household_task",
+        "heat and place three apple in a cabinet.",
+        {"object": "apple", "object_type": "apple",
+         "target_location": "cabinet 1"},
+    )
+    assert [item["predicate"] for item in effects] == [
+        "object.heated", "object.at_location"]
+    assert effects[-1]["cardinality"] == 3
+    assert effects[-1]["distinct_by"] == "object"
+
+    light = _target_effects_of(
+        "unseen_inspection_task", "examine the book with the lamp",
+        {"object": "book", "associated_entity": "lamp 1"})
+    assert [item["predicate"] for item in light] == [
+        "object.toggled", "agent.holds"]
+
+
+def test_goal_roles_do_not_inject_unstated_station_or_workflow():
+    roles = _goal_roles_from_text(
+        "heat some apple and put it in fridge.")
+    params = _executable_goal_params(
+        roles, ["fridge_1", "microwave_1", "sinkbasin_1"])
+    assert roles == {"theme": "apple", "destination": "fridge"}
+    assert params == {"object": "apple", "target_location": "fridge_1"}
+    assert not any("station" in key for key in params)
+
+    inspection = _goal_roles_from_text(
+        "look at pencil under the desklamp.")
+    assert inspection == {
+        "theme": "pencil", "associated_entity": "desklamp"}
+
+
+def test_pick_two_cardinality_requires_distinct_grounded_objects():
+    effect = _target_effects_of(
+        "pick_two_obj_and_place", "put two cd in safe.",
+        {"object_type": "cd", "target_location": "safe 1"})
+    inputs = {"object_type": "cd", "target_location": "safe 1"}
+    one = StateSnapshot({"facts": ["object_at(cd_1, safe_1)"]})
+    two = StateSnapshot({"facts": [
+        "object_at(cd_1, safe_1)", "object_at(cd_2, safe_1)"]})
+    assert check_effects(one, inputs, effect)[0] is False
+    assert check_effects(two, inputs, effect)[0] is True
+
+
+def test_pick_two_excludes_instances_already_placed_at_target():
+    task = Task(
+        task_id="two", benchmark="generic_env", task_type="arbitrary_batch_delivery",
+        goal="put two cd in safe.",
+        context={"params": {"object": "cd", "object_type": "cd",
+                            "target_location": "safe 1"}},
+        target_effects=[{
+            "predicate": "object.at_location",
+            "args": {"object": "$object_type", "location": "$target_location"},
+            "cardinality": 2, "distinct_by": "object"}],
+    )
+    excluded = _completed_distinct_effect_instances(
+        task,
+        {"facts": ["object_at(cd_1, safe_1)",
+                   "object_at(cd_2, desk_1)", "object_at(book_1, safe_1)"]},
+        {"object": "cd"},
+    )
+    assert excluded == {"cd_1"}
 
 
 def test_goal_semantic_location_is_separate_from_executable_instance():
@@ -104,6 +196,10 @@ def test_tracker_accumulates():
     assert not any(f.startswith("object_at(mug_2,") and "coffeemachine_1" not in f
                    for f in facts), "旧位置应被移除"
     assert not any(f.startswith("agent_holds(mug_2)") for f in facts), "持有应被移除"
+    tracker.update("You turn on the desklamp 1.")
+    assert "object_toggled(desklamp_1)" in tracker.state()["facts"]
+    tracker.update("You turn off the desklamp 1.")
+    assert "object_toggled(desklamp_1)" not in tracker.state()["facts"]
 
 
 def test_structured_events_expose_take_heat_place_effects():
@@ -121,6 +217,28 @@ def test_structured_events_expose_take_heat_place_effects():
         "object.at_location"}
     assert any(item.get("not", {}).get("predicate") == "agent.holds"
                for item in place["negative_effects"])
+
+
+def test_structured_event_exposes_light_toggle_effect_and_parameter():
+    trace = TraceRecord(
+        task_id="look", task_type="look_at_obj_in_light",
+        task_goal="examine the cd with the desklamp.", benchmark="alfworld",
+        success=True, provenance={"params": {
+            "object": "cd", "light_source": "desklamp 1"}},
+    )
+    tracker = _AlfStateTracker()
+    trace.state_snapshots.append({"step": 0, "state": tracker.state()})
+    observation = "You turn on the desklamp 1."
+    tracker.update(observation)
+    trace.actions.append(ActionRecord(
+        step=0, name="use desklamp 1",
+        params=_parse_action_params("use desklamp 1"),
+        observation=observation, accepted=True))
+    trace.state_snapshots.append({"step": 1, "state": tracker.state()})
+    event = build_structured_events(trace)[0]
+    assert event["params"] == {"light_source": "desklamp 1"}
+    assert event["positive_effects"] == [{
+        "predicate": "object.toggled", "args": {"object": "desklamp_1"}}]
 
 
 def test_atomicizer_on_pddl_trace(workspace_tmp):
@@ -141,7 +259,7 @@ def test_atomicizer_on_pddl_trace(workspace_tmp):
     assert "{object}" in bodies and ("{object_location}" in bodies
                                      or "{heating_station}" in bodies
                                      or "{target_location}" in bodies), bodies
-    acquire = next(t for t in tools if "acquire_object" in t.tool_id)
+    acquire = next(t for t in tools if "agent_holds" in t.tool_id)
     assert acquire.artifact.get("steps") == [
         "go to {object_location}",
         "take {object} from {object_location}",
@@ -204,6 +322,20 @@ def test_tracker_from_state():
     assert tracker.state()["meta"]["checked_locations"] == ["cabinet_1"]
 
 
+def test_rejected_dynamic_visit_does_not_pollute_checked_locations():
+    tracker = _AlfStateTracker(from_state={
+        "facts": ["agent_at(table_1)"], "inventory": [], "meta": {}})
+    _record_location_inspection(
+        tracker, "go to countertop 1", "Nothing happens.", accepted=False)
+    assert tracker.state()["meta"].get("checked_locations") in (None, [])
+
+    tracker.update("You arrive at countertop 1. You see nothing.")
+    _record_location_inspection(
+        tracker, "go to countertop 1",
+        "You arrive at countertop 1. You see nothing.", accepted=True)
+    assert tracker.state()["meta"]["checked_locations"] == ["countertop_1"]
+
+
 def test_acquire_location_discovery_is_bounded_and_deduplicated():
     class _SearchEnv:
         def __init__(self):
@@ -244,13 +376,101 @@ def test_acquire_location_discovery_is_bounded_and_deduplicated():
         task, "mug", resume=resume, max_locations=5,
         node_ref="skill://acquire@1", tool_ref="tool://acquire@1")
     assert binding == {"object": "mug_2", "object_location": "countertop_1"}
-    assert env.calls == ["go to countertop 1"]
+    assert env.calls == ["go to cabinet 1", "open cabinet 1",
+                         "go to countertop 1"]
     assert len(env.calls) == len(set(env.calls)), "位置搜索不应重复动作/循环"
     checked = result.states[-1]["state"]["meta"]["checked_locations"]
-    assert checked == ["countertop_1"]
+    assert checked == ["cabinet_1", "countertop_1"]
     assert not result.direct_used
     assert all(action["origin"] == "framework_discovery"
                and not action["tool_ref"] for action in result.actions)
+
+
+def test_discovery_retries_one_rejected_visit_before_marking_checked():
+    class _TransientVisitEnv:
+        def __init__(self):
+            self.calls = []
+
+        def step(self, action: str):
+            self.calls.append(action)
+            if len(self.calls) == 1:
+                observation = "Nothing happens."
+                accepted = False
+                commands = ["go to countertop 1"]
+            else:
+                observation = ("You arrive at countertop 1. On the countertop 1, "
+                               "you see a mug 2.")
+                accepted = True
+                commands = ["take mug 2 from countertop 1"]
+            return type("_StepResult", (), {
+                "observation": observation, "score": 0.0,
+                "done": False, "won": False, "accepted": accepted,
+                "admissible_commands": commands,
+            })()
+
+    adapter = AlfWorldAdapter()
+    env = _TransientVisitEnv()
+    adapter._current_env = env
+    task = Task(task_id="transient", benchmark="alfworld",
+                task_type="unseen", goal="find an object", context={})
+    resume = {
+        "observation": "room", "admissible": ["go to countertop 1"],
+        "actions": [], "states": [],
+        "state": {"facts": [], "inventory": [], "meta": {}},
+    }
+
+    binding, result = adapter.discover_object_location(
+        task, "mug", resume=resume, max_locations=1)
+
+    assert binding == {"object": "mug_2", "object_location": "countertop_1"}
+    assert env.calls == ["go to countertop 1", "go to countertop 1"]
+    assert [item["accepted"] for item in result.actions] == [False, True]
+    assert result.states[-1]["state"]["meta"]["checked_locations"] == [
+        "countertop_1"]
+
+
+def test_discovery_never_marks_twice_rejected_location_as_checked():
+    class _RejectedThenValidEnv:
+        def __init__(self):
+            self.calls = []
+
+        def step(self, action: str):
+            self.calls.append(action)
+            if action == "go to cabinet 1":
+                observation = "Nothing happens."
+                accepted = False
+                commands = ["go to cabinet 1", "go to countertop 1"]
+            else:
+                observation = ("You arrive at countertop 1. On the countertop 1, "
+                               "you see a mug 2.")
+                accepted = True
+                commands = ["take mug 2 from countertop 1"]
+            return type("_StepResult", (), {
+                "observation": observation, "score": 0.0,
+                "done": False, "won": False, "accepted": accepted,
+                "admissible_commands": commands,
+            })()
+
+    adapter = AlfWorldAdapter()
+    env = _RejectedThenValidEnv()
+    adapter._current_env = env
+    task = Task(task_id="rejected", benchmark="alfworld",
+                task_type="unseen", goal="find an object", context={})
+    resume = {
+        "observation": "room",
+        "admissible": ["go to cabinet 1", "go to countertop 1"],
+        "actions": [], "states": [],
+        "state": {"facts": [], "inventory": [], "meta": {}},
+    }
+
+    binding, result = adapter.discover_object_location(
+        task, "mug", resume=resume, max_locations=2)
+
+    assert binding == {"object": "mug_2", "object_location": "countertop_1"}
+    assert env.calls == ["go to cabinet 1", "go to cabinet 1",
+                         "go to countertop 1"]
+    checked = result.states[-1]["state"]["meta"]["checked_locations"]
+    assert checked == ["countertop_1"]
 
 
 def test_acquire_admission_setup_discovers_then_exposes_take():
@@ -345,6 +565,30 @@ def test_discovery_keeps_current_observed_instance_over_remote_take_hint():
         task, "mug", resume=resume, max_locations=5)
     assert binding == {"object": "mug_2", "object_location": "countertop_1"}
     assert result.actions == []
+
+
+def test_non_acquire_navigable_entity_binds_without_consuming_tool_step():
+    class _NoStepEnv:
+        def step(self, action):
+            raise AssertionError(f"passive binding must leave navigation to Tool: {action}")
+
+    adapter = AlfWorldAdapter()
+    adapter._current_env = _NoStepEnv()
+    task = Task(task_id="fixture", benchmark="generic_env",
+                task_type="hidden_label", goal="inspect a fixture", context={})
+    resume = {
+        "observation": "room", "admissible": ["go to fixture 3"],
+        "actions": [], "states": [],
+        "state": {"facts": [], "inventory": [], "meta": {}},
+    }
+    binding, result = adapter.discover_object_location(
+        task, "fixture", resume=resume, max_locations=2,
+        allow_passive_navigable=True)
+    assert binding == {"object": "fixture_3",
+                       "object_location": "fixture_3"}
+    assert result.actions == []
+    assert result.states == []
+    assert result.current_admissible == ["go to fixture 3"]
 
 
 def test_llm_errors_do_not_advance_environment_and_are_persisted():

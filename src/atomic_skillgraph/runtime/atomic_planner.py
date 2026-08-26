@@ -1,7 +1,7 @@
 """Atomic Planner（设计文档 v2.0 §21）。
 
 检索顺序（§21.2）：
-    解析目标状态 → task_type 弱召回 → Composite → Abstract Atomic
+    解析目标状态 → capability/effect 召回 → Composite → Abstract Atomic
     → I/O / Preconditions / Effect 硬过滤 → 结构与历史 Utility 重排
     → 最小充分 Runtime Graph → Implementation 选择（另模块）→ Tool 解析（另模块）
 task_type 禁止作为硬过滤（§21.3）；LLM 只规划 Atomic Skill（§13）。
@@ -47,13 +47,17 @@ class AtomicPlanner:
         features = self.config.features
         query = {
             "goal_text": task.goal,
-            "task_type": task.task_type,
             "state": task.state,
             "available_inputs": list((task.context.get("params") or {}).keys())
             + _extract_entity_names(task.goal),
             "target_effects": task.target_effects,
         }
         hard_restrict = features.task_type_hard_restricted or not features.enable_cross_task_type_reuse
+        # Official benchmark labels are retained for sampling/metrics only in
+        # the default method.  They enter retrieval solely in the explicit
+        # task-type-restricted ablation.
+        if hard_restrict:
+            query["task_type"] = task.task_type
         # Composite 的充分性判断必须看到完整候选集，不能让词面得分较低但
         # Effect 完整的 Composite 在 top-k 截断时先被丢掉。
         retrieval_limit = max(self.config.retrieval_top_k,
@@ -61,10 +65,15 @@ class AtomicPlanner:
         retrieved = self.registry.retrieve(
             query, top_k=retrieval_limit,
             hard_restrict_task_type=hard_restrict,
-            task_type_bonus=self.config.task_type_soft_bonus,
+            task_type_bonus=(self.config.task_type_soft_bonus if hard_restrict else 0.0),
         )
-        # 得分低于阈值 → 视为无可用能力（cold start，避免弱匹配负迁移）
-        retrieved = [h for h in retrieved if h.score >= self.config.planning_min_score]
+        # A formal target contract is a stronger retrieval key than lexical
+        # similarity. Keep the complete structural pool so a low-summary-score
+        # producer can close an Effect→Precondition dependency. With no formal
+        # target, retain the conservative score gate.
+        if not task.target_effects:
+            retrieved = [h for h in retrieved
+                         if h.score >= self.config.planning_min_score]
         if not retrieved:
             return RuntimePlan(start_mode="cold", notes=["no_capability_retrieved"])
 
@@ -72,38 +81,39 @@ class AtomicPlanner:
         # 只能在同等充分的候选之间重排，不能让两步链压过完整三步链。
         if features.enable_composite:
             composites = [h for h in retrieved if h.kind == SkillNodeKind.COMPOSITE]
-            eligible = [h for h in composites if h.score >= self.composite_min_score]
             if self.config.freeze_skills:
-                eligible = [h for h in eligible if (
+                composites = [h for h in composites if (
                     h.obj.status.value == "active"
                     or (h.obj.status.value == "draft" and (
                         self.config.llm.mock
                         or bool((h.obj.metadata.get("candidate") or {}).get(
                             "semantic_extraction_validated")))))]
-            if eligible:
-                complete = [h for h in eligible
-                            if self._composite_covers_targets(h.obj,
-                                                              task.target_effects)]
-                if complete:
-                    active = [h for h in complete
-                              if h.obj.status.value == "active"]
-                    # Online may perform one controlled candidate exploration
-                    # to obtain independent support. Frozen replay is strictly
-                    # active-only and therefore cannot evaluate one-trace drafts.
-                    selectable = active or [
-                        h for h in complete if h.obj.status.value == "draft"]
-                    if not selectable:
-                        complete = []
-                    else:
-                        selected = max(selectable, key=lambda h: h.score)
-                        plan = self._plan_from_composite(task, selected, retrieved)
-                        plan.notes.append("composite_effect_complete")
-                        if selected.obj.status.value == "draft":
-                            plan.notes.append("controlled_candidate_exploration")
-                            if self.config.freeze_skills:
-                                plan.notes.append("strict_frozen_candidate_replay")
-                        return plan
+            # Sufficiency is a hard gate before lexical/utility score. A fully
+            # covering Composite cannot be discarded merely because its summary
+            # is phrased differently from the new goal.
+            complete = [h for h in composites
+                        if self._composite_covers_targets(h.obj,
+                                                          task.target_effects)]
+            if complete:
+                active = [h for h in complete
+                          if h.obj.status.value == "active"]
+                # Online may perform one controlled candidate exploration to
+                # obtain independent support. Frozen replay stays active-only.
+                selectable = active or [
+                    h for h in complete if h.obj.status.value == "draft"]
+                if selectable:
+                    selected = max(selectable, key=lambda h: h.score)
+                    plan = self._plan_from_composite(task, selected, retrieved)
+                    plan.notes.append("composite_effect_complete")
+                    if selected.obj.status.value == "draft":
+                        plan.notes.append("controlled_candidate_exploration")
+                        if self.config.freeze_skills:
+                            plan.notes.append("strict_frozen_candidate_replay")
+                    return plan
 
+            eligible = [h for h in composites
+                        if h.score >= self.composite_min_score]
+            if eligible:
                 # 没有完整 Composite 时才允许用 partial + dynamic gap。若 gap
                 # 参数无法完全绑定，则继续走 Atomic greedy，而不是执行占位符。
                 partial = max(
@@ -178,10 +188,9 @@ class AtomicPlanner:
         for key, value in stored.items():
             if isinstance(value, str) and value.startswith("$task."):
                 role = value[len("$task."):]
-                # Source location is hidden in ALFWorld and must be discovered.
-                # Never reinterpret the final destination as an Acquire source,
-                # including when replaying an older bank that persisted this
-                # erroneous role mapping.
+                # A hidden source location must be discovered, not rebound from
+                # a semantically different destination role. This also guards
+                # replay of older banks containing an unsafe role mapping.
                 if (str(key) in {"object_location", "source_location"}
                         and role in {"target_location", "target_receptacle",
                                      "destination", "destination_location"}):
@@ -198,6 +207,8 @@ class AtomicPlanner:
             selected = self._cover_target_effects(task.target_effects, hits)
             selected = self._close_and_order_dependencies(selected, hits,
                                                           task.target_effects)
+            selected = self._expand_cardinality_workflow(
+                selected, task.target_effects)
         else:
             selected = self._llm_plan(task, hits) or hits[:3]
         nodes: list[PlannedNode] = []
@@ -210,15 +221,31 @@ class AtomicPlanner:
         return nodes
 
     @staticmethod
+    def _expand_cardinality_workflow(
+            selected: list[RetrievalHit],
+            target_effects: list[dict[str, Any]]) -> list[RetrievalHit]:
+        """Repeat a minimal causal branch for an explicit N-object goal.
+
+        Repeating only a terminal node can violate its producer dependencies;
+        repeating the already dependency-closed ordered branch preserves the
+        executable data flow for any explicit cardinality target.
+        """
+        repeat = max(
+            [max(1, int(effect.get("cardinality", 1) or 1))
+             for effect in target_effects if isinstance(effect, dict)] or [1])
+        if repeat <= 1 or not selected:
+            return selected
+        return [hit for _ in range(repeat) for hit in selected]
+
+    @staticmethod
     def _close_and_order_dependencies(selected: list[RetrievalHit],
                                       hits: list[RetrievalHit],
                                       target_effects: list[dict]) -> list[RetrievalHit]:
         """补齐前置能力并按 Effect→Precondition 数据流拓扑排序。
 
         目标 Effect 的覆盖只决定“需要哪些终点能力”；执行顺序不能继续沿用
-        retrieval score。比如 Heat 与 Place 都依赖 ``agent.holds``，因此必须先
-        纳入 Acquire；同层节点再按任务目标 Effect 的声明顺序稳定排序，得到
-        Acquire→Heat→Place，而不是 Place→Heat。
+        retrieval score。共享前置状态的节点必须先纳入对应 producer；同层节点
+        再按任务目标 Effect 的声明顺序稳定排序。
         """
         def keys(items: list[dict]) -> set[str]:
             return {_canonical_predicate(str(item.get("predicate") or ""))
@@ -326,6 +353,28 @@ class AtomicPlanner:
                     keys.add(_canonical_predicate(str(effect["predicate"])))
         return keys
 
+    def _composite_effect_counts(self, composite: CompositeSkill) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for step in composite.step_instances():
+            logical = SkillRef.parse(str(step["node_ref"])).logical_id
+            atomic = self.registry.get_recommended(logical)
+            for effect in list(getattr(atomic, "effects", []) or []):
+                if isinstance(effect, dict) and effect.get("predicate"):
+                    key = _canonical_predicate(str(effect["predicate"]))
+                    counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    @staticmethod
+    def _target_effect_counts(target_effects: list[dict]) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for effect in target_effects:
+            if not isinstance(effect, dict) or not effect.get("predicate"):
+                continue
+            key = _canonical_predicate(str(effect["predicate"]))
+            counts[key] = counts.get(key, 0) + max(
+                1, int(effect.get("cardinality", 1) or 1))
+        return counts
+
     @staticmethod
     def _target_effect_keys(target_effects: list[dict]) -> set[str]:
         return {
@@ -336,15 +385,20 @@ class AtomicPlanner:
 
     def _composite_covers_targets(self, composite: CompositeSkill,
                                   target_effects: list[dict]) -> bool:
-        target = self._target_effect_keys(target_effects)
-        return not target or target.issubset(self._composite_effect_keys(composite))
+        target = self._target_effect_counts(target_effects)
+        actual = self._composite_effect_counts(composite)
+        return all(actual.get(predicate, 0) >= required
+                   for predicate, required in target.items())
 
     def _composite_target_coverage(self, composite: CompositeSkill,
                                    target_effects: list[dict]) -> float:
-        target = self._target_effect_keys(target_effects)
+        target = self._target_effect_counts(target_effects)
         if not target:
             return 1.0
-        return len(target & self._composite_effect_keys(composite)) / len(target)
+        actual = self._composite_effect_counts(composite)
+        covered = sum(min(required, actual.get(predicate, 0))
+                      for predicate, required in target.items())
+        return covered / max(sum(target.values()), 1)
 
     @staticmethod
     def _bind_dynamic_effect_params(task, effect: dict[str, Any]) -> dict[str, Any]:
@@ -428,7 +482,6 @@ class AtomicPlanner:
             )
         prompt = (
             f"Task goal: {task.goal}\n"
-            f"Task type: {task.task_type}\n"
             "Available atomic skills:\n" + "\n".join(skill_lines)
         )
         try:
@@ -468,7 +521,7 @@ class AtomicPlanner:
 
     # ------------------------------------------------------------------
     def _bind_params(self, task, atomic: AbstractAtomicSkill) -> dict[str, Any]:
-        """参数绑定：context.params 优先 → goal 文本弱解析。"""
+        """Bind from explicit goal roles and learned contract evidence only."""
         context_params = dict(task.context.get("params") or {})
         input_names = [str(i.get("name", "")) for i in atomic.inputs]
         params: dict[str, Any] = {}
@@ -478,7 +531,72 @@ class AtomicPlanner:
         goal_params = parse_goal_params(task.goal, input_names)
         for name, value in goal_params.items():
             params.setdefault(name, value)
+        learned_families = dict(
+            (getattr(atomic, "metadata", {}) or {}).get(
+                "observed_parameter_families") or {})
+        candidates = _task_entity_candidates(task)
+        for name in input_names:
+            if params.get(name) not in (None, ""):
+                continue
+            families = [str(value) for value in learned_families.get(name, [])
+                        if value not in (None, "")]
+            matches = [candidate for candidate in candidates
+                       if any(_same_entity_family(candidate, family)
+                              for family in families)]
+            if len(matches) == 1:
+                params[name] = matches[0]
+
+        # A position may already be known in the current structured state. This
+        # is evidence binding, not benchmark-specific navigation advice.
+        for name in input_names:
+            if params.get(name) not in (None, "") or not name.endswith("_location"):
+                continue
+            entity_role = name[:-len("_location")]
+            entity = params.get(entity_role)
+            location = _state_location_of(task.state, entity)
+            if location:
+                params[name] = location
         return params
+
+
+def _task_entity_candidates(task: Any) -> list[str]:
+    values: list[Any] = []
+    context = dict(getattr(task, "context", {}) or {})
+    roles = dict(context.get("goal_roles") or {})
+    values.extend(roles.values())
+    values.extend(context.get("goal_entities") or [])
+    values.extend(context.get("exposed_entities") or [])
+    values.extend(dict(context.get("params") or {}).values())
+    candidates: list[str] = []
+    for value in values:
+        normalized = _normalize_entity(value)
+        if normalized and not normalized.isdigit() and normalized not in candidates:
+            candidates.append(normalized)
+    return candidates
+
+
+def _normalize_entity(value: Any) -> str:
+    return re.sub(r"\s+", "_", str(value or "").strip().lower())
+
+
+def _same_entity_family(left: Any, right: Any) -> bool:
+    left_value, right_value = _normalize_entity(left), _normalize_entity(right)
+    if not left_value or not right_value:
+        return False
+    strip_instance = lambda value: re.sub(r"_\d+$", "", value)
+    return strip_instance(left_value) == strip_instance(right_value)
+
+
+def _state_location_of(state: dict[str, Any], entity: Any) -> str:
+    wanted = _normalize_entity(entity)
+    if not wanted:
+        return ""
+    matches: list[str] = []
+    for fact in (state or {}).get("facts", []) or []:
+        match = re.fullmatch(r"object_at\((.+?),\s*(.+?)\)", str(fact))
+        if match and _same_entity_family(match.group(1), wanted):
+            matches.append(_normalize_entity(match.group(2)))
+    return matches[0] if len(set(matches)) == 1 else ""
 
 
 def _extract_entity_names(text: str) -> list[str]:
