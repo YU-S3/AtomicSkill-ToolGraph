@@ -52,12 +52,14 @@ from atomic_skillgraph.core.config import SystemConfig  # noqa: E402
 from atomic_skillgraph.system import AtomicSkillGraphSystem  # noqa: E402
 from atomic_skillgraph.graph.validator import validate_graph  # noqa: E402
 from experiments.common import (  # noqa: E402
+    BASELINE_FLOWEVO_CONDITIONS,
     PROJECT_ROOT,
     apply_condition,
     balanced_task_subset,
     load_conda_config,
     make_adapter,
     make_llm,
+    run_baseline_condition,
 )
 from experiments.report import (  # noqa: E402
     aggregate_results,
@@ -136,9 +138,32 @@ def run_frozen_condition(condition: str, run_dir: Path, eval_dir: Path,
         "skills": system.registry.stats(),
         "tools": system.tool_registry.stats(),
     }
-    episodes = []
-    for index, task in enumerate(tasks, start=1):
+    task_signature = [{
+        "task_id": str(task.task_id),
+        "task_type": str(task.task_type),
+        "game_file": str(task.context.get("game_file") or ""),
+    } for task in tasks]
+    progress_path = eval_dir / condition / "frozen_progress.json"
+    episodes: list[dict] = []
+    if progress_path.exists():
+        progress = json.loads(progress_path.read_text(encoding="utf-8"))
+        if progress.get("task_signature") != task_signature:
+            raise RuntimeError(
+                f"{condition} 冻结评估断点与本次任务清单不一致；请使用新输出目录")
+        episodes = list(progress.get("episodes") or [])
+    completed = len(episodes)
+    if monitor is not None and completed:
+        monitor.task_update(completed, note=f"resume {completed}/{len(tasks)}")
+    for index, task in enumerate(tasks[completed:], start=completed + 1):
         episodes.append(system.run_task(task))
+        temporary = progress_path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps({
+            "condition": condition,
+            "task_signature": task_signature,
+            "completed": len(episodes),
+            "episodes": episodes,
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(progress_path)
         if monitor is not None:
             monitor.task_update(index, note=str(task.task_id))
     frozen_after = {
@@ -163,6 +188,8 @@ def run_frozen_condition(condition: str, run_dir: Path, eval_dir: Path,
 
 def run_flowevo_frozen(run_dir: Path, eval_dir: Path, config_path: str, *,
                        limit: int, max_steps: int, task_type: str | None,
+                       alfworld_split: str = "eval_out_of_distribution",
+                       alfworld_data: str | None = None,
                        start_index: int = 0,
                        on_progress=None,
                        flowevo_run_dir: Path | None = None) -> dict:
@@ -177,6 +204,8 @@ def run_flowevo_frozen(run_dir: Path, eval_dir: Path, config_path: str, *,
         config_path=config_path,
         limit=limit,
         task_type=task_type,
+        alfworld_split=alfworld_split,
+        alfworld_data=alfworld_data,
         max_steps=max_steps,
         start_index=start_index,
         on_progress=on_progress,
@@ -208,13 +237,32 @@ def main() -> int:
                         help="评估任务数（默认取在线运行的任务数）")
     parser.add_argument("--max-steps", type=int, default=50,
                         help="步数预算（需与在线运行一致）")
-    parser.add_argument("--split", choices=["train", "test"], default="train",
-                        help="train=在同一批任务上重放；test=hold-out 泛化评估")
+    parser.add_argument("--split", choices=["train", "test", "heldout"],
+                        default="train",
+                        help=("train=同批重放；test=同一数据 split 内按索引留出；"
+                              "heldout=在显式 --alfworld-split 上完整评估"))
     parser.add_argument("--train-limit", type=int, default=None,
                         help="test 模式下在线训练使用的任务数（跳过前 train-limit 个）")
     parser.add_argument("--alfworld-data", default=None)
+    parser.add_argument(
+        "--alfworld-split",
+        choices=["train", "eval_in_distribution", "eval_out_of_distribution"],
+        default="eval_out_of_distribution",
+        help="评估数据 split；valid_unseen 对应 eval_out_of_distribution",
+    )
+    parser.add_argument(
+        "--baseline-conditions", nargs="*", default=[],
+        choices=list(BASELINE_FLOWEVO_CONDITIONS),
+        help="在评估 split 上从原始入口运行的非冻结 baseline",
+    )
+    parser.add_argument("--expected-train-count", type=int, default=None,
+                        help="heldout 协议门禁：在线训练任务数必须等于该值")
+    parser.add_argument("--expected-heldout-count", type=int, default=None,
+                        help="heldout 协议门禁：评估任务数必须等于该值")
     parser.add_argument("--config-path", default=str(PROJECT_ROOT / "configs" / "default.yaml"))
     parser.add_argument("--output-dir", default=str(PROJECT_ROOT / "runs" / "evolve_eval"))
+    parser.add_argument("--eval-dir", default=None,
+                        help="精确复用冻结评估目录（支持逐题断点续跑）")
     parser.add_argument("--eval-flowevo", action="store_true",
                         help="同时冻结评估 FlowEvo 完整库（加载在线 checkpoint）")
     parser.add_argument("--flowevo-run-dir", default=None,
@@ -227,6 +275,8 @@ def main() -> int:
         parser.error("--task-type 与 --task-types 不能同时使用")
     if args.task_types and (args.per_type_limit is None or args.per_type_limit <= 0):
         parser.error("--task-types 需要正整数 --per-type-limit")
+    if args.eval_flowevo and "flowevo" in args.baseline_conditions:
+        parser.error("--eval-flowevo 与 --baseline-conditions flowevo 不能同时使用")
 
     run_dir = Path(args.run_dir)
     if not run_dir.exists():
@@ -246,7 +296,8 @@ def main() -> int:
         config = dataclasses.replace(config, llm=dataclasses.replace(config.llm, mock=True))
 
     output_dir = Path(args.output_dir)
-    eval_dir = output_dir / f"{run_dir.name}_{args.split}_{time.strftime('%Y%m%dT%H%M%S')}"
+    eval_dir = (Path(args.eval_dir).resolve() if args.eval_dir else
+                output_dir / f"{run_dir.name}_{args.split}_{time.strftime('%Y%m%dT%H%M%S')}")
     eval_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 78)
@@ -257,9 +308,12 @@ def main() -> int:
 
     # 加载全部任务（供 train/test 切分）
     adapter = make_adapter(args.benchmark, config, task_type=args.task_type,
+                           split=args.alfworld_split,
                            alfworld_data=args.alfworld_data, max_steps=args.max_steps,
                            kinds=("code", "math", "env"))
-    all_tasks = adapter.load_tasks(limit=0, task_type=args.task_type)
+    load_limit = (int(args.limit) if args.split == "heldout"
+                  and args.limit and not args.task_types else 0)
+    all_tasks = adapter.load_tasks(limit=load_limit, task_type=args.task_type)
     if args.task_types:
         all_tasks = balanced_task_subset(
             all_tasks, list(args.task_types), int(args.per_type_limit))
@@ -276,12 +330,87 @@ def main() -> int:
         return 1
     print(f"评估任务 {len(tasks)} 个：{tasks[0].task_id} ... {tasks[-1].task_id}")
 
+    eval_manifest = {
+        "benchmark": args.benchmark,
+        "split": args.alfworld_split if args.benchmark == "alfworld" else args.split,
+        "task_count": len(tasks),
+        "tasks": [{
+            "task_id": task.task_id,
+            "task_type": task.task_type,
+            "game_file": str(task.context.get("game_file") or ""),
+        } for task in tasks],
+    }
+    if args.benchmark == "alfworld":
+        eval_manifest_path = eval_dir / "task_manifest.json"
+        if eval_manifest_path.exists():
+            previous = json.loads(eval_manifest_path.read_text(encoding="utf-8"))
+            if previous != eval_manifest:
+                print("[错误] eval-dir 已绑定另一组任务，拒绝跨 split 续跑")
+                return 1
+        eval_manifest_path.write_text(
+            json.dumps(eval_manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    if args.split == "heldout":
+        source_manifest_path = run_dir / "task_manifest.json"
+        if not source_manifest_path.exists():
+            print("[错误] heldout 评估要求在线目录含 task_manifest.json，"
+                  "无法证明训练/测试隔离")
+            return 1
+        source_manifest = json.loads(
+            source_manifest_path.read_text(encoding="utf-8"))
+        if args.benchmark == "alfworld":
+            source_split = str(source_manifest.get("split"))
+            if source_split != "train":
+                print(f"[错误] 正式 heldout 的在线 bank 必须来自 train，实际为 {source_split}")
+                return 1
+            if source_split == args.alfworld_split:
+                print("[错误] heldout split 与在线进化 split 相同，拒绝数据泄漏")
+                return 1
+        source_task_count = int(source_manifest.get("selection", {}).get(
+            "task_count", len(source_manifest.get("tasks") or [])))
+        if (args.expected_train_count is not None
+                and source_task_count != args.expected_train_count):
+            print(f"[错误] 在线训练任务数应为 {args.expected_train_count}，"
+                  f"实际为 {source_task_count}")
+            return 1
+        if (args.expected_heldout_count is not None
+                and len(tasks) != args.expected_heldout_count):
+            print(f"[错误] heldout 任务数应为 {args.expected_heldout_count}，"
+                  f"实际为 {len(tasks)}")
+            return 1
+        train_files = {str(item.get("game_file") or "")
+                       for item in source_manifest.get("tasks") or []
+                       if str(item.get("game_file") or "")}
+        eval_files = {str(item.get("game_file") or "")
+                      for item in eval_manifest["tasks"]
+                      if str(item.get("game_file") or "")}
+        overlap = sorted(train_files & eval_files)
+        if overlap:
+            print(f"[错误] train/heldout game_file 重叠 {len(overlap)} 项，拒绝评估")
+            return 1
+        (eval_dir / "protocol_manifest.json").write_text(json.dumps({
+            "protocol": "train_evolve_freeze_heldout",
+            "source_run_dir": str(run_dir),
+            "train_split": source_manifest.get("split"),
+            "train_task_count": source_task_count,
+            "heldout_split": eval_manifest["split"],
+            "heldout_task_count": len(tasks),
+            "game_file_overlap_count": 0,
+            "frozen_ours_conditions": conditions,
+            "heldout_baseline_conditions": list(args.baseline_conditions),
+            "heldout_baseline_modes": {
+                "baseline_dynamic": "stateless_dynamic",
+                "flowevo": "original_online_full_library",
+            },
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+
     from atomic_skillgraph.adapters.toy_benchmarks import build_mock_script
     from experiments.progress import ProgressMonitor
     mock_script = build_mock_script() if args.benchmark == "toy" else None
 
     monitor = ProgressMonitor()
-    monitor.set_total_conditions(len(conditions) + (1 if args.eval_flowevo else 0))
+    monitor.set_total_conditions(
+        len(conditions) + len(args.baseline_conditions)
+        + (1 if args.eval_flowevo else 0))
     results: dict = {}
     for condition in conditions:
         print(f"[frozen_eval] condition={condition} ...")
@@ -289,6 +418,19 @@ def main() -> int:
         results[condition] = run_frozen_condition(
             condition, run_dir, eval_dir, config, adapter, tasks,
             mock_script=mock_script, monitor=monitor)
+        monitor.condition_finish()
+
+    for condition in args.baseline_conditions:
+        print(f"[heldout_baseline] condition={condition} split={args.alfworld_split} ...")
+        monitor.condition_start(condition, task_total=len(tasks))
+        results[condition] = run_baseline_condition(
+            condition, args.benchmark,
+            config_path=str(PROJECT_ROOT / "configs" / "flowevo_default.yaml"),
+            output_dir=eval_dir / f"{condition}_flowevo",
+            limit=len(tasks), task_type=args.task_type,
+            alfworld_split=args.alfworld_split,
+            alfworld_data=args.alfworld_data,
+            max_steps=args.max_steps, monitor=monitor)
         monitor.condition_finish()
 
     if args.eval_flowevo:
@@ -306,6 +448,8 @@ def main() -> int:
             str(PROJECT_ROOT / "configs" / "flowevo_default.yaml"),
             limit=limit, start_index=start_index,
             max_steps=args.max_steps, task_type=args.task_type,
+            alfworld_split=args.alfworld_split,
+            alfworld_data=args.alfworld_data,
             on_progress=_flowevo_progress,
             flowevo_run_dir=flowevo_run_dir)
         monitor.condition_finish()

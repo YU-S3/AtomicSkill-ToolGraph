@@ -174,6 +174,8 @@ def run_flowevo_baseline(*, project_root: str | Path, benchmark: str,
                          output_dir: str | Path, conditions: list[str],
                          config_path: str | Path, limit: int = 0,
                          task_type: str | None = None,
+                         alfworld_split: str = "eval_out_of_distribution",
+                         alfworld_data: str | None = None,
                          max_steps: int | None = None,
                          start_index: int | None = None,
                          on_progress: Callable[[int, int, str], None] | None = None,
@@ -215,6 +217,9 @@ def run_flowevo_baseline(*, project_root: str | Path, benchmark: str,
             cmd += ["--limit", str(limit)]
         if task_type:
             cmd += ["--task-type", task_type]
+        cmd += ["--split", str(alfworld_split)]
+        if alfworld_data:
+            cmd += ["--alfworld-data", str(alfworld_data)]
         if max_steps and max_steps > 0:
             cmd += ["--max-steps", str(max_steps)]
         if start_index and start_index > 0:

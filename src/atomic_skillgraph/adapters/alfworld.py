@@ -55,50 +55,88 @@ class AlfWorldAdapter:
         from alfworld_.env import load_alfworld_tasks
         wanted_type = task_type or self.task_type_filter
         raw_tasks = load_alfworld_tasks(split=self.split, limit=None,
-                                        task_type=wanted_type)
+                                        task_type=wanted_type,
+                                        alfworld_data=self.alfworld_data,
+                                        max_steps=self.max_steps)
         if wanted_type:
             raw_tasks = [t for t in raw_tasks if t.task_type == wanted_type]
         if limit and limit > 0:
             raw_tasks = raw_tasks[:limit]
-        tasks: list[Task] = []
-        for index, raw in enumerate(raw_tasks):
-            task_id = f"alfworld_{index}_{raw.task_type}"
-            self._task_indices[task_id] = index
-            state = _parse_alfworld_state(raw.initial_observation)
-            # Goal roles come only from the task sentence and entities exposed
-            # by the environment.  In particular, the official task-type label
-            # is never used to inject a station, workflow, or operation boundary.
-            goal_roles = _goal_roles_from_text(str(raw.goal))
-            exposed_entities = _entities_from_admissible(raw.initial_admissible)
-            params = _executable_goal_params(goal_roles, exposed_entities)
-            if params.get("object_type"):
-                params.setdefault("object", params["object_type"])
-            semantic_params = _semantic_goal_params(str(raw.goal), params)
-            tasks.append(Task(
-                task_id=task_id,
-                benchmark="alfworld",
-                task_type=str(raw.task_type),
-                goal=str(raw.goal),
-                context={
-                    "kind": "env",
-                    "env_index": index,
-                    "initial_observation": str(raw.initial_observation),
-                    "initial_admissible": list(raw.initial_admissible),
-                    "goal_roles": goal_roles,
-                    "goal_entities": sorted(set(goal_roles.values())),
-                    "exposed_entities": exposed_entities,
-                    "game_file": str(getattr(raw, "game_file", "")),
-                    "params": params,
-                    # Goal contract keeps a receptacle family (cabinet), while
-                    # executable params keep a concrete admissible instance.
-                    "semantic_params": semantic_params,
-                },
-                state=state,
-                target_effects=_target_effects_of(
-                    "", str(raw.goal), params),
-                metadata={},
-            ))
-        return tasks
+        return [self._task_from_raw(raw, index)
+                for index, raw in enumerate(raw_tasks)]
+
+    def load_balanced_tasks(self, task_types: list[str],
+                            per_type_limit: int) -> list[Task]:
+        """Select a deterministic balanced prefix without loading all train games.
+
+        ALFWorld train expands to roughly ten thousand game instances.  Loading
+        all of them merely to keep 50 per label is both slow and unnecessary.
+        This scans the deterministic environment order only until every bucket
+        is full while preserving the global environment index used by replay.
+        """
+        ensure_flowevo_path()
+        from alfworld_.env import AlfWorldEnv, TASK_TYPE_IDS
+        labels = [str(item) for item in task_types]
+        unknown = sorted(set(labels) - set(TASK_TYPE_IDS))
+        if unknown:
+            raise ValueError(f"未知 ALFWorld task_type: {unknown}")
+        env = AlfWorldEnv(split=self.split, max_steps=self.max_steps,
+                          alfworld_data=self.alfworld_data, task_type=None)
+        total = env.initialize()
+        buckets: dict[str, list[Task]] = {label: [] for label in labels}
+        for index in range(total):
+            raw, _observation, _admissible = env.reset()
+            label = str(raw.task_type)
+            game_file = str(getattr(raw, "game_file", "")).replace("\\", "/")
+            # AlfredTWEnv's ``train`` iterator also contains valid_train.
+            # The formal protocol requested here uses physical train only.
+            if (self.split == "train"
+                    and "/json_2.1.1/train/" not in game_file):
+                continue
+            if label in buckets and len(buckets[label]) < per_type_limit:
+                buckets[label].append(self._task_from_raw(raw, index))
+            if all(len(bucket) >= per_type_limit for bucket in buckets.values()):
+                break
+        missing = {label: len(bucket) for label, bucket in buckets.items()
+                   if len(bucket) < per_type_limit}
+        if missing:
+            raise ValueError(
+                f"均衡任务不足：要求每类 {per_type_limit} 个，实际不足 {missing}")
+        selected = [task for label in labels for task in buckets[label]]
+        # Keep the randomized ALFWorld environment order.  Besides avoiding a
+        # label-blocked curriculum, monotonic indices let the adapter advance
+        # the same environment instead of reinitializing it for every task.
+        return sorted(selected, key=lambda task: int(task.context["env_index"]))
+
+    def _task_from_raw(self, raw, env_index: int) -> Task:
+        task_id = f"alfworld_{env_index}_{raw.task_type}"
+        self._task_indices[task_id] = env_index
+        state = _parse_alfworld_state(raw.initial_observation)
+        # Goal roles come only from the task sentence and entities exposed by
+        # the environment; the official label never injects an operation.
+        goal_roles = _goal_roles_from_text(str(raw.goal))
+        exposed_entities = _entities_from_admissible(raw.initial_admissible)
+        params = _executable_goal_params(goal_roles, exposed_entities)
+        if params.get("object_type"):
+            params.setdefault("object", params["object_type"])
+        semantic_params = _semantic_goal_params(str(raw.goal), params)
+        return Task(
+            task_id=task_id, benchmark="alfworld",
+            task_type=str(raw.task_type), goal=str(raw.goal),
+            context={
+                "kind": "env", "env_index": env_index,
+                "initial_observation": str(raw.initial_observation),
+                "initial_admissible": list(raw.initial_admissible),
+                "goal_roles": goal_roles,
+                "goal_entities": sorted(set(goal_roles.values())),
+                "exposed_entities": exposed_entities,
+                "game_file": str(getattr(raw, "game_file", "")),
+                "params": params, "semantic_params": semantic_params,
+            },
+            state=state,
+            target_effects=_target_effects_of("", str(raw.goal), params),
+            metadata={},
+        )
 
     def parse_task_type(self, task: Task) -> str:
         return task.task_type
@@ -111,7 +149,20 @@ class AlfWorldAdapter:
         """把环境定位到指定任务并返回 (observation, admissible)。"""
         env = self._get_env()
         index = int(task.context.get("env_index", 0))
-        _task, obs, admissible = env.reset_to_task(index)
+        current = int(getattr(env, "_task_index", 0))
+        if getattr(env, "initialized", False) and current <= index:
+            while current < index:
+                env.reset()
+                current += 1
+            _task, obs, admissible = env.reset()
+        else:
+            _task, obs, admissible = env.reset_to_task(index)
+        expected_file = str(task.context.get("game_file") or "").replace("\\", "/")
+        actual_file = str(getattr(_task, "game_file", "") or "").replace("\\", "/")
+        if expected_file and actual_file and expected_file != actual_file:
+            raise RuntimeError(
+                "ALFWorld deterministic task mapping changed: "
+                f"index={index}, expected={expected_file}, actual={actual_file}")
         self._current_env = env
         return obs, admissible
 

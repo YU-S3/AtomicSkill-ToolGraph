@@ -293,6 +293,8 @@ def load_alfworld_tasks(
     split: str = "eval_out_of_distribution",
     limit: int | None = None,
     task_type: str | None = None,
+    alfworld_data: str | None = None,
+    max_steps: int = 50,
 ) -> list[AlfWorldTask]:
     """Pre-load ALFWorld task metadata by iterating env.reset().
 
@@ -300,7 +302,8 @@ def load_alfworld_tasks(
     that downstream code can inspect them without holding the environment
     open.
     """
-    env = AlfWorldEnv(split=split, task_type=task_type)
+    env = AlfWorldEnv(split=split, task_type=task_type,
+                      alfworld_data=alfworld_data, max_steps=max_steps)
     count = env.initialize()
     if limit is not None:
         count = min(count, limit)

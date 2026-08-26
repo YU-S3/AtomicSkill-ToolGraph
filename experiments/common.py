@@ -148,14 +148,41 @@ def run_our_condition(condition: str, adapter, config: SystemConfig,
     """
     import dataclasses
     config = apply_condition(config, condition)
+    progress_path: Path | None = None
+    task_signature = [{
+        "task_id": str(task.task_id),
+        "task_type": str(task.task_type),
+        "game_file": str(task.context.get("game_file") or ""),
+    } for task in tasks]
+    episodes: list[dict[str, Any]] = []
     if output_dir is not None:
-        config = dataclasses.replace(
-            config, data_dir=Path(output_dir) / condition / "data")
+        condition_dir = Path(output_dir) / condition
+        config = dataclasses.replace(config, data_dir=condition_dir / "data")
+        progress_path = condition_dir / "online_progress.json"
+        if progress_path.exists():
+            progress = json.loads(progress_path.read_text(encoding="utf-8"))
+            if progress.get("task_signature") != task_signature:
+                raise RuntimeError(
+                    f"{condition} 已有进度的任务清单与本次不一致；"
+                    "请使用新 run-dir 或 --fresh-conditions")
+            episodes = list(progress.get("episodes") or [])
     llm = make_llm(config, mock_script=mock_script)
     system = AtomicSkillGraphSystem(config, adapter, llm)
-    episodes = []
-    for index, task in enumerate(tasks, start=1):
+    completed = len(episodes)
+    if monitor is not None and completed:
+        monitor.task_update(completed, note=f"resume {completed}/{len(tasks)}")
+    for index, task in enumerate(tasks[completed:], start=completed + 1):
         episodes.append(system.run_task(task))
+        if progress_path is not None:
+            progress_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = progress_path.with_suffix(".json.tmp")
+            temporary.write_text(json.dumps({
+                "condition": condition,
+                "task_signature": task_signature,
+                "completed": len(episodes),
+                "episodes": episodes,
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(progress_path)
         if monitor is not None:
             monitor.task_update(index, note=str(task.task_id))
     return {
@@ -170,6 +197,8 @@ def run_our_condition(condition: str, adapter, config: SystemConfig,
 def run_baseline_condition(condition: str, benchmark: str, *, config_path: str,
                            output_dir: str | Path, limit: int = 0,
                            task_type: str | None = None,
+                           alfworld_split: str = "eval_out_of_distribution",
+                           alfworld_data: str | None = None,
                            max_steps: int | None = None,
                            monitor=None) -> dict[str, Any]:
     """运行 vendored FlowEvo 原版 baseline 条件（子进程）。"""
@@ -188,6 +217,8 @@ def run_baseline_condition(condition: str, benchmark: str, *, config_path: str,
         config_path=config_path,
         limit=limit,
         task_type=task_type,
+        alfworld_split=alfworld_split,
+        alfworld_data=alfworld_data,
         max_steps=max_steps,
         on_progress=on_progress,
     )
@@ -267,6 +298,8 @@ def run_conditions(*, conditions: list[str], benchmark: str, config: SystemConfi
                    adapter=None, tasks: list | None = None,
                    output_dir: str | Path, limit: int = 0,
                    config_path: str, task_type: str | None = None,
+                   alfworld_split: str = "eval_out_of_distribution",
+                   alfworld_data: str | None = None,
                    max_steps: int | None = None,
                    mock_script: dict[str, Any] | None = None,
                    initial_results: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -286,7 +319,9 @@ def run_conditions(*, conditions: list[str], benchmark: str, config: SystemConfi
             result = run_baseline_condition(
                 condition, benchmark, config_path=config_path,
                 output_dir=output_dir / f"{condition}_flowevo", limit=limit,
-                task_type=task_type, max_steps=max_steps, monitor=monitor)
+                task_type=task_type, alfworld_split=alfworld_split,
+                alfworld_data=alfworld_data,
+                max_steps=max_steps, monitor=monitor)
         else:
             if tasks is None or adapter is None:
                 raise ValueError("ours 条件需要 adapter 与 tasks")

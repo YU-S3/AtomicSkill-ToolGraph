@@ -196,14 +196,16 @@ def run_condition(
     output_dir: Path | None = None,
     task_type: str | None = None,
     start_index: int = 0,
+    split: str = "eval_out_of_distribution",
+    alfworld_data: str | None = None,
 ) -> list[dict[str, Any]]:
 
     print("\n" + "=" * 72)
     print("  Condition: %s — %s" % (condition_name, cfg["display"]))
     print("=" * 72)
 
-    env = AlfWorldEnv(split="eval_out_of_distribution", max_steps=max_steps,
-                      task_type=task_type)
+    env = AlfWorldEnv(split=split, max_steps=max_steps,
+                      task_type=task_type, alfworld_data=alfworld_data)
     total = env.initialize()
     # limit 表示从 start_index 起要运行的任务数（hold-out 评估时 start_index>0）
     n_tasks = min(total, start_index + limit)
@@ -787,6 +789,13 @@ def main() -> None:
         default=0,
         help="从第 N 个（类型过滤后的）任务开始（hold-out 冻结评估用）",
     )
+    parser.add_argument(
+        "--split",
+        choices=["train", "eval_in_distribution", "eval_out_of_distribution"],
+        default="eval_out_of_distribution",
+        help="ALFWorld split；valid_unseen 对应 eval_out_of_distribution",
+    )
+    parser.add_argument("--alfworld-data", default=None)
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -828,6 +837,7 @@ def main() -> None:
             cond, CONDITIONS[cond], llm, args.limit, args.max_steps,
             output_dir=output_dir, task_type=args.task_type,
             start_index=args.start_index,
+            split=args.split, alfworld_data=args.alfworld_data,
         )
         all_eps[cond] = eps
         s = _summary(eps)

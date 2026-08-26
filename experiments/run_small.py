@@ -68,6 +68,12 @@ def main() -> int:
                         help="无 API 走完整实验链路（ours 条件用 MockLLM；baseline 条件跳过）")
     parser.add_argument("--alfworld-data", default=None,
                         help="ALFWorld 数据目录（默认 ~/.cache/alfworld 或 ALFWORLD_DATA）")
+    parser.add_argument(
+        "--alfworld-split",
+        choices=["train", "eval_in_distribution", "eval_out_of_distribution"],
+        default="eval_out_of_distribution",
+        help="ALFWorld split；valid_unseen 对应 eval_out_of_distribution",
+    )
     parser.add_argument("--max-steps", type=int, default=None,
                         help="交互环境步数预算（默认 50；ours 与 baseline 对称生效）")
     parser.add_argument("--resume", action="store_true",
@@ -85,6 +91,8 @@ def main() -> int:
     if args.task_types and (args.per_type_limit is None or args.per_type_limit <= 0):
         parser.error("--task-types 需要正整数 --per-type-limit")
     limit = args.limit if args.limit is not None else DEFAULT_LIMITS[args.benchmark]
+    if args.task_types:
+        limit = int(args.per_type_limit) * len(args.task_types)
     task_type = (None if args.task_types else args.task_type or (
         "pick_heat_then_place_in_recep" if args.benchmark == "alfworld" else None))
     config = load_conda_config(args.config_path)
@@ -136,19 +144,49 @@ def main() -> int:
     print("=" * 78)
 
     adapter = make_adapter(args.benchmark, config,
-                           task_type=task_type, alfworld_data=args.alfworld_data,
+                           task_type=task_type, split=args.alfworld_split,
+                           alfworld_data=args.alfworld_data,
                            max_steps=config.max_steps,
                            kinds=("code", "math", "env"))
-    tasks = adapter.load_tasks(
-        limit=0 if args.task_types else limit, task_type=task_type)
     if args.task_types:
-        tasks = balanced_task_subset(
-            tasks, list(args.task_types), int(args.per_type_limit))
+        if args.benchmark == "alfworld" and hasattr(adapter, "load_balanced_tasks"):
+            tasks = adapter.load_balanced_tasks(
+                list(args.task_types), int(args.per_type_limit))
+        else:
+            tasks = balanced_task_subset(
+                adapter.load_tasks(limit=0, task_type=task_type),
+                list(args.task_types), int(args.per_type_limit))
         limit = len(tasks)
+    else:
+        tasks = adapter.load_tasks(limit=limit, task_type=task_type)
     if not tasks:
         print(f"[错误] 未加载到任务。请检查数据可用性（HF 网络 / ALFWorld 数据目录）。")
         return 1
     print(f"已加载任务 {len(tasks)} 个：{tasks[0].task_id} ... {tasks[-1].task_id}")
+    if args.benchmark == "alfworld":
+        manifest = {
+            "benchmark": "alfworld",
+            "split": args.alfworld_split,
+            "selection": {
+                "task_types": list(args.task_types or ([task_type] if task_type else [])),
+                "per_type_limit": args.per_type_limit,
+                "task_count": len(tasks),
+            },
+            "tasks": [{
+                "task_id": task.task_id,
+                "task_type": task.task_type,
+                "game_file": str(task.context.get("game_file") or ""),
+            } for task in tasks],
+        }
+        manifest_path = run_dir / "task_manifest.json"
+        if manifest_path.exists():
+            previous = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if previous != manifest:
+                raise RuntimeError(
+                    "run-dir 已绑定另一组 ALFWorld 任务；请使用新目录，"
+                    "不能跨 split 复用进化 bank")
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # mock 模式下跳过 baseline（FlowEvo 原版无 mock LLM）；toy 无 baseline 映射
     skip_baseline = args.mock or args.benchmark == "toy"
@@ -188,6 +226,8 @@ def main() -> int:
         limit=limit,
         config_path=str(PROJECT_ROOT / "configs" / "flowevo_default.yaml"),
         task_type=task_type,
+        alfworld_split=args.alfworld_split,
+        alfworld_data=args.alfworld_data,
         max_steps=config.max_steps if args.benchmark == "alfworld" else None,
         mock_script=mock_script,
         initial_results=prior_results,
