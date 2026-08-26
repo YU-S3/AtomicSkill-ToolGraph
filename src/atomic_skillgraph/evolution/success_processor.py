@@ -129,6 +129,14 @@ class SuccessProcessor:
             legacy_test_mode = bool(
                 self.config.llm.mock
                 or getattr(self.atomicizer, "allow_legacy_fallback", False))
+            # A terminal certificate proves a multi-fact terminal relation,
+            # not that its final event is a standalone executable template.
+            # Keep the Abstract capability and Composite occurrence, but never
+            # compile this slice into a misleading one-action Direct Tool.
+            if bool(segment.get("terminal_effect_origin")):
+                result.notes.append(
+                    f"tool_mining_blocked_terminal_certificate:{atomic_ref.logical_id}")
+                continue
             if (is_env_segment and not legacy_test_mode
                     and not safe_event_slice):
                 result.notes.append(

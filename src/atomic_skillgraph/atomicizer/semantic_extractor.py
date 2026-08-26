@@ -35,6 +35,13 @@ observed_effects (pre-existing facts newly revealed by perception). observed_eff
 later external Precondition or setup search, but they are not capability Effects and must never define
 an Atomic occurrence or be copied into effect_predicates.
 
+Some environments expose a successful terminal relation without repeating it in the final observation.
+In that case an event may contain terminal_verified_effects. Each such item is a concrete target
+relation independently certified by code from benchmark success plus all required terminal state facts.
+It may anchor a terminal Atomic occurrence and be copied into effect_predicates. It is not an ordinary
+single-action delta: infer the smallest causal terminal occurrence from its evidence and never claim
+that the final action alone implements the relation.
+
 Discover the smallest sufficient set of reusable Atomic capability occurrences from this evidence.
 An Atomic occurrence is an independently meaningful and independently verifiable state transition
 with a coherent intent, explicit external inputs/outputs, and a minimal causal action subsequence.
@@ -232,6 +239,25 @@ def build_structured_events(trace: TraceRecord) -> list[dict[str, Any]]:
     """Convert persisted actions/snapshots into auditable transition events."""
     actions = [a.to_dict() if hasattr(a, "to_dict") else dict(a) for a in trace.actions]
     snapshots = [dict(item.get("state") or {}) for item in trace.state_snapshots]
+    terminal_by_event: dict[int, list[dict[str, Any]]] = {}
+    diagnostics = dict(trace.metrics.get("runtime_diagnostics") or {})
+    for certificate in diagnostics.get("terminal_verified_effects") or []:
+        if not isinstance(certificate, dict):
+            continue
+        try:
+            event_index = int(certificate.get("action_index"))
+        except (TypeError, ValueError):
+            continue
+        effect = certificate.get("effect")
+        if (0 <= event_index < len(actions) and isinstance(effect, dict)
+                and effect.get("predicate")):
+            terminal_by_event.setdefault(event_index, []).append({
+                **dict(effect),
+                "certificate": {
+                    key: value for key, value in certificate.items()
+                    if key != "effect"
+                },
+            })
     events: list[dict[str, Any]] = []
     for index, action in enumerate(actions):
         before = snapshots[index] if index < len(snapshots) else {}
@@ -258,6 +284,7 @@ def build_structured_events(trace: TraceRecord) -> list[dict[str, Any]]:
             "before": before,
             "after": after,
             "positive_effects": causal_positive,
+            "terminal_verified_effects": terminal_by_event.get(index, []),
             "observed_effects": observed_predicates,
             "negative_effects": negative,
             "state_changed": bool(causal_positive or negative),
@@ -295,7 +322,7 @@ def _extract_origin_aware_effect(events: list[dict[str, Any]], start: int,
             if key not in negative_keys:
                 negative.append(dict(raw))
                 negative_keys.add(key)
-        for raw in event.get("positive_effects") or []:
+        for raw in _event_capability_effects(event):
             if not isinstance(raw, dict):
                 continue
             key = _predicate_key(raw)
@@ -339,7 +366,7 @@ def _split_overmerged_phase_proposals(
             if not bool(event.get("accepted", True)):
                 continue
             names = sorted({str(item.get("predicate") or "")
-                            for item in (event.get("positive_effects") or [])
+                            for item in _event_capability_effects(event)
                             if isinstance(item, dict) and item.get("predicate")})
             if names:
                 producers.append((index, names))
@@ -523,6 +550,13 @@ def validate_phase_proposal(trace: TraceRecord, events: list[dict[str, Any]],
                 set(range(causal_window_start, raw_end + 1))
                 - set(causal_event_indices)),
             "effect_producer_indices": [core_index],
+            "terminal_effect_origin": any(
+                _predicate_key(item) in {
+                    _predicate_key(effect)
+                    for effect in (events[core_index].get(
+                        "terminal_verified_effects") or [])
+                }
+                for item in effect.positive),
             "event_slice_validated": True,
             "replay_safe": bool(slice_diagnostics.get("replay_safe")),
             "event_slice_diagnostics": slice_diagnostics,
@@ -806,6 +840,7 @@ def _compact_event(event: dict[str, Any]) -> dict[str, Any]:
         "event_index": event["event_index"], "action": event["action"],
         "params": event["params"], "accepted": event["accepted"],
         "mode": event["mode"], "positive_effects": event["positive_effects"],
+        "terminal_verified_effects": event.get("terminal_verified_effects") or [],
         "observed_effects": event.get("observed_effects") or [],
         "negative_effects": event["negative_effects"],
         "before_facts": list(event["before"].get("facts") or []),
@@ -868,7 +903,7 @@ def _infer_execution_location_roles(
 
     effect_entities = {
         normalize_value(value)
-        for effect in (event.get("positive_effects") or [])
+        for effect in _event_capability_effects(event)
         if str(effect.get("predicate") or "") in core_names
         for value in (effect.get("args") or {}).values()
     }
@@ -974,7 +1009,7 @@ def _last_core_effect_event(events: list[dict[str, Any]], start: int, end: int,
                       and (not core_effects or any(
                           _predicate_key(item) == _predicate_key(anchor)
                           for anchor in core_effects))
-                      for item in (events[index].get("positive_effects") or []))]
+                       for item in _event_capability_effects(events[index]))]
     return max(matches) if matches else None
 
 
@@ -1029,7 +1064,7 @@ def _minimal_causal_event_indices(events: list[dict[str, Any]], start: int, end:
         if _forward_validate_event_slice(
                 events, start, trial, core_effects or [
                     effect for effect in
-                    (events[core_index].get("positive_effects") or [])
+                    _event_capability_effects(events[core_index])
                     if str(effect.get("predicate") or "") in core_names],
                 params):
             retained = trial
@@ -1037,7 +1072,7 @@ def _minimal_causal_event_indices(events: list[dict[str, Any]], start: int, end:
     forward_valid = _forward_validate_event_slice(
         events, start, retained, core_effects or [
             effect for effect in
-            (events[core_index].get("positive_effects") or [])
+            _event_capability_effects(events[core_index])
             if str(effect.get("predicate") or "") in core_names],
         params)
     replay_safe = (bool(retained) and core_index in selected
@@ -1115,7 +1150,7 @@ def _forward_validate_event_slice(events: list[dict[str, Any]], entry_index: int
             return False
         for effect in event.get("negative_effects") or []:
             state_keys.discard(_predicate_key(effect))
-        for effect in event.get("positive_effects") or []:
+        for effect in _event_capability_effects(event):
             state_keys.add(_predicate_key(effect))
     return all(_predicate_key(effect) in state_keys for effect in core_effects)
 
@@ -1132,7 +1167,7 @@ def _state_predicates(state: dict[str, Any]) -> list[dict[str, Any]]:
 def _event_operational_requirements(event: dict[str, Any],
                                     params: dict[str, Any]) -> list[dict[str, Any]]:
     """Infer event reads from grounded state relations, without a verb table."""
-    positives = [item for item in (event.get("positive_effects") or [])
+    positives = [item for item in _event_capability_effects(event)
                  if isinstance(item, dict)]
     event_params = {**dict(params or {}), **dict(event.get("params") or {})}
 
@@ -1230,7 +1265,7 @@ def _latest_event_producer(events: list[dict[str, Any]], start: int, end: int,
         if not events[index].get("accepted", True):
             continue
         if any(_predicate_key(effect) == key
-               for effect in (events[index].get("positive_effects") or [])):
+               for effect in _event_capability_effects(events[index])):
             return index
     return None
 
@@ -1239,6 +1274,27 @@ def _predicate_key(predicate: dict[str, Any]) -> tuple[str, tuple[tuple[str, str
     return (str(predicate.get("predicate") or ""),
             tuple(sorted((str(key), normalize_value(value))
                          for key, value in (predicate.get("args") or {}).items())))
+
+
+def _event_capability_effects(event: dict[str, Any]) -> list[dict[str, Any]]:
+    """Action deltas plus separately certified terminal relations.
+
+    Certificate audit metadata is stripped before predicate comparison and
+    parameterization.  ``observed_effects`` remain excluded.
+    """
+    effects: list[dict[str, Any]] = []
+    seen: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
+    for raw in [*(event.get("positive_effects") or []),
+                *(event.get("terminal_verified_effects") or [])]:
+        if not isinstance(raw, dict) or not raw.get("predicate"):
+            continue
+        predicate = {"predicate": str(raw.get("predicate")),
+                     "args": dict(raw.get("args") or {})}
+        key = _predicate_key(predicate)
+        if key not in seen:
+            seen.add(key)
+            effects.append(predicate)
+    return effects
 
 
 def _canonical_phase_params(params: dict[str, Any], family: str) -> dict[str, Any]:
@@ -1280,6 +1336,24 @@ def _prune_phase_params(params: dict[str, Any], effects: list[dict[str, Any]],
     for role, value in kept.items():
         by_value.setdefault(normalize_value(value), []).append(role)
     for roles in by_value.values():
+        # When multiple semantic labels bind the same concrete participant,
+        # prefer the role named by the verified Effect argument.  This removes
+        # aliases such as ``required_position=container`` without a
+        # capability- or benchmark-specific role whitelist.
+        effect_argument_roles = {
+            _canonical_role_name(str(argument_role))
+            for effect in effects
+            for argument_role, argument_value in (effect.get("args") or {}).items()
+            if normalize_value(argument_value)
+            == normalize_value(kept.get(roles[0]))
+        }
+        direct_matches = [role for role in roles if role in effect_argument_roles]
+        if direct_matches:
+            preferred = sorted(direct_matches)[0]
+            for role in roles:
+                if role != preferred:
+                    kept.pop(role, None)
+            continue
         core_matches = [role for role in roles if role in core_roles]
         if not core_matches:
             continue

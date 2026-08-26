@@ -452,7 +452,10 @@ class AtomicSkillGraphSystem:
             trace.planning_mode = "pure_dynamic"
             runtime_graph.record_usage(ExecutionMode.DYNAMIC)
             result = self.adapter.run_env_episode(task, self.llm, seed_context="",
-                                                  max_steps=self.config.max_steps)
+                                                  max_steps=self.config.max_steps,
+                                                  stop_effects=task.target_effects,
+                                                  effect_inputs=dict(
+                                                      task.context.get("params") or {}))
             self._fill_env_trace(trace, result, runtime_graph)
             return trace
 

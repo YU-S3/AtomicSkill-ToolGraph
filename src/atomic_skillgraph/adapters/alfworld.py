@@ -522,6 +522,9 @@ class AlfWorldAdapter:
                     # local Effect boundary.
                     if env_result.won:
                         result.success = True
+                        _record_terminal_effect_certificates(
+                            result, tracker.state(), stop_effects, effect_inputs,
+                            action_index=len(result.actions) - 1)
                         result.atomic_complete = _effects_met(
                             tracker.state(), stop_effects, effect_inputs)
                         result.steps = len(result.actions)
@@ -623,6 +626,9 @@ class AlfWorldAdapter:
             # for an unfinished episode that needs a second Dynamic call.
             if env_result.won:
                 result.success = True
+                _record_terminal_effect_certificates(
+                    result, tracker.state(), stop_effects, effect_inputs,
+                    action_index=len(result.actions) - 1)
                 result.atomic_complete = _effects_met(
                     tracker.state(), stop_effects, effect_inputs)
                 result.steps = len(result.actions)
@@ -929,6 +935,117 @@ def _same_object_family(candidate: str, requested: str) -> bool:
     left = re.sub(r"_\d+$", "", _norm(candidate))
     right = re.sub(r"_\d+$", "", _norm(requested))
     return bool(left and left == right)
+
+
+def _record_terminal_effect_certificates(
+        result: EnvRunResult, state: dict[str, Any],
+        target_effects: list[dict[str, Any]] | None,
+        effect_inputs: dict[str, Any] | None, *, action_index: int) -> None:
+    """Persist latent terminal relations only when their evidence is complete.
+
+    ALFWorld may report ``won`` after a final navigation while its observation
+    does not spell out the achieved relation.  ``won`` alone is deliberately
+    insufficient: each supported predicate has a predicate-level certificate
+    that binds concrete participants and cites all terminal state facts.  The
+    certificate is extraction evidence, not a mutation of the tracked world
+    state and not evidence that the last action is a standalone Tool.
+    """
+    certificates = _terminal_effect_certificates(
+        state, target_effects, effect_inputs, action_index=action_index)
+    if certificates:
+        result.diagnostics.setdefault(
+            "terminal_verified_effects", []).extend(certificates)
+
+
+def _terminal_effect_certificates(
+        state: dict[str, Any], target_effects: list[dict[str, Any]] | None,
+        effect_inputs: dict[str, Any] | None, *, action_index: int
+        ) -> list[dict[str, Any]]:
+    """Return auditable certificates for latent goal relations.
+
+    This dispatch is predicate-driven and never reads an ALFWorld task label.
+    A new latent predicate must provide its own evidence rule; unknown
+    predicates fail closed.
+    """
+    facts = {str(item) for item in (state.get("facts") or [])}
+    inventory = {_norm(item) for item in (state.get("inventory") or [])}
+    inputs = dict(effect_inputs or {})
+
+    def fact_values(name: str, arity: int) -> list[tuple[str, ...]]:
+        values: list[tuple[str, ...]] = []
+        for fact in facts:
+            match = re.fullmatch(rf"{re.escape(name)}\((.*)\)", fact)
+            if not match:
+                continue
+            args = tuple(_norm(part) for part in match.group(1).split(","))
+            if len(args) == arity:
+                values.append(args)
+        return values
+
+    def requested(value: Any) -> str:
+        text = str(value or "")
+        if text.startswith("$"):
+            key = text[1:].split(".")[-1]
+            return _norm(inputs.get(key, ""))
+        return _norm(text)
+
+    certificates: list[dict[str, Any]] = []
+    held = inventory | {item[0] for item in fact_values("agent_holds", 1)}
+    toggled = {item[0] for item in fact_values("object_toggled", 1)}
+    agent_locations = {item[0] for item in fact_values("agent_at", 1)}
+    object_locations = fact_values("object_at", 2)
+    for target in target_effects or []:
+        if not isinstance(target, dict):
+            continue
+        # Explicit state deltas remain the primary evidence path.  This
+        # certificate is only for a relation ALFWorld keeps latent at success.
+        if str(target.get("predicate") or "") != "object.observed_with":
+            continue
+        args = dict(target.get("args") or {})
+        wanted_object = requested(args.get("object"))
+        wanted_associated = requested(args.get("associated_entity"))
+        objects = sorted(item for item in held
+                         if _same_object_family(item, wanted_object))
+        associated = sorted(item for item in toggled
+                            if _same_object_family(item, wanted_associated))
+        for concrete_object in objects:
+            for concrete_associated in associated:
+                locations = sorted(
+                    location for entity, location in object_locations
+                    if entity == concrete_associated and location in agent_locations)
+                if not locations:
+                    continue
+                location = locations[0]
+                evidence = [
+                    f"agent_holds({concrete_object})",
+                    f"object_toggled({concrete_associated})",
+                    f"object_at({concrete_associated}, {location})",
+                    f"agent_at({location})",
+                ]
+                if not all(item in facts or (
+                        item == f"agent_holds({concrete_object})"
+                        and concrete_object in inventory) for item in evidence):
+                    continue
+                certificates.append({
+                    "effect": {
+                        "predicate": "object.observed_with",
+                        "args": {"object": concrete_object,
+                                 "associated_entity": concrete_associated},
+                    },
+                    "action_index": int(action_index),
+                    "source": "benchmark_terminal_certificate_v1",
+                    "benchmark_won": True,
+                    "evidence_facts": evidence,
+                    "evidence_rule": (
+                        "target_held_and_associated_entity_toggled_and_colocated"),
+                    # The relation is certified at the terminal boundary.  It
+                    # is not attributed to the final navigation action alone.
+                    "standalone_action_effect": False,
+                })
+                break
+            if certificates:
+                break
+    return certificates
 
 
 def _goal_roles_from_text(goal: str) -> dict[str, str]:

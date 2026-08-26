@@ -9,10 +9,12 @@
 from __future__ import annotations
 
 import re
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
 from ..core.skill_ir import AbstractAtomicSkill, CompositeSkill, ImplementationAtom, ToolBinding
+from ..core.refs import SkillRef
 from ..core.status import SkillNodeKind
 from .registry import SkillGraphRegistry
 
@@ -153,11 +155,11 @@ def align_composite(candidate: CompositeSkill, registry: SkillGraphRegistry) -> 
     data flow are unchanged.  Search every historical version so an insight
     update cannot hide the canonical Composite from later occurrences.
     """
-    candidate_signature = _composite_occurrence_signature(candidate)
+    candidate_signature = _composite_occurrence_signature(candidate, registry)
     matches = [
         existing
         for existing in registry.list_all_versions(SkillNodeKind.COMPOSITE)
-        if _composite_occurrence_signature(existing) == candidate_signature
+        if _composite_occurrence_signature(existing, registry) == candidate_signature
     ]
     if matches:
         status_rank = {"active": 2, "draft": 1}
@@ -177,34 +179,87 @@ def align_composite(candidate: CompositeSkill, registry: SkillGraphRegistry) -> 
     return AlignDecision(matched=False, reason="no_same_chain_composite")
 
 
-def _composite_occurrence_signature(composite: CompositeSkill) -> tuple[Any, ...]:
-    """Canonical identity of a reusable Composite occurrence topology."""
-    steps = tuple(
-        (str(step["node_ref"]).rsplit("@", 1)[0],
-         tuple(sorted((str(k), str(v))
-                      for k, v in step.get("params", {}).items())))
-        for step in composite.step_instances()
-    )
-    control = tuple(sorted(
-        (edge.source_step, edge.target_step, edge.type.value)
-        for edge in composite.edge_objects() if edge.category == "control"
-    ))
+def _composite_occurrence_signature(
+        composite: CompositeSkill, registry: SkillGraphRegistry
+        ) -> tuple[Any, ...]:
+    """Canonical semantic contract + causal partial-order identity.
+
+    Versioned/hashed Atomic refs with the same verified Effect contract share a
+    label.  Pure temporal NEXT edges are intentionally excluded: independent
+    occurrences observed in a different order are the same partial-order DAG.
+    Multiplicity is retained through the sorted step-label and edge multisets.
+    """
+    step_objects = composite.step_instances()
+    labels = {
+        str(step["step_id"]): _atomic_occurrence_label(step, registry)
+        for step in step_objects
+    }
+    steps = tuple(sorted(labels.values()))
     data = tuple(sorted(
-        (edge.source_step, edge.target_step,
+        (labels.get(str(edge.source_step), ("missing",)),
+         labels.get(str(edge.target_step), ("missing",)),
          str((edge.mapping or {}).get("source_output") or ""),
          str((edge.mapping or {}).get("target_input") or ""),
          str((edge.mapping or {}).get("transform") or "identity"))
         for edge in composite.edge_objects() if edge.category == "data"
     ))
     dependencies = tuple(sorted(
-        (edge.source_step, edge.target_step,
+        (labels.get(str(edge.source_step), ("missing",)),
+         labels.get(str(edge.target_step), ("missing",)),
          str((edge.metadata or {}).get("predicate") or ""))
         for edge in composite.edge_objects()
         if edge.category == "dependency"
         and str((edge.metadata or {}).get("origin") or "")
         != "llm_semantic_proposal"
     ))
-    return steps, control, data, dependencies
+    targets = tuple(sorted(
+        _predicate_contract(item)
+        for item in (composite.validator.get("target_effects") or [])
+        if isinstance(item, dict) and item.get("predicate")
+    ))
+    return steps, data, dependencies, targets
+
+
+def _atomic_occurrence_label(step: dict[str, Any],
+                             registry: SkillGraphRegistry) -> tuple[Any, ...]:
+    node_ref = str(step.get("node_ref") or "")
+    atomic = None
+    try:
+        parsed = SkillRef.parse(node_ref)
+        atomic = registry.get(parsed) or registry.get_recommended(parsed.logical_id)
+    except ValueError:
+        parsed = None
+    if atomic is None:
+        fallback = node_ref.rsplit("@", 1)[0]
+        return ("logical", fallback,
+                tuple(sorted((str(key), str(value))
+                             for key, value in (step.get("params") or {}).items())))
+    effects = tuple(sorted(_predicate_contract(item)
+                           for item in (getattr(atomic, "effects", None) or [])
+                           if isinstance(item, dict)))
+    relevant_roles = {
+        value[len("$inputs."):]
+        for effect in (getattr(atomic, "effects", None) or [])
+        for value in (effect.get("args") or {}).values()
+        if isinstance(value, str) and value.startswith("$inputs.")
+    }
+    params = tuple(sorted(
+        (str(role), str(value))
+        for role, value in (step.get("params") or {}).items()
+        if str(role) in relevant_roles
+    ))
+    return ("effect_contract", effects, params)
+
+
+def _predicate_contract(predicate: dict[str, Any]) -> str:
+    payload = {
+        "predicate": str(predicate.get("predicate") or ""),
+        "args": {str(key): str(value)
+                 for key, value in sorted((predicate.get("args") or {}).items())},
+        "cardinality": int(predicate.get("cardinality", 1) or 1),
+    }
+    return json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                      separators=(",", ":"))
 
 
 def _version_key(version: str) -> tuple[int, int, int]:

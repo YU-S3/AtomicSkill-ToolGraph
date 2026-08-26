@@ -21,8 +21,13 @@ from atomic_skillgraph.core.status import SkillStatus
 from atomic_skillgraph.core.trace_ir import ActionRecord, TraceRecord
 from atomic_skillgraph.evolution.composite_builder import CompositeBuilder, _role_params
 from atomic_skillgraph.evolution.insight_updater import InsightUpdater
+from atomic_skillgraph.evolution.success_processor import SuccessProcessor
 from atomic_skillgraph.graph.registry import SkillGraphRegistry
 from atomic_skillgraph.graph.aligner import align_atomic
+from atomic_skillgraph.graph.aligner import align_composite
+from atomic_skillgraph.core.skill_ir import CompositeSkill
+from atomic_skillgraph.persistence import TraceStore
+from atomic_skillgraph.tools.registry import ToolRegistry
 
 
 class _ExtractorLLM:
@@ -565,6 +570,211 @@ def test_extractor_prompt_requires_entity_independent_capability_names():
             "acquire_object", "heat_object", "clean_object", "cool_object",
             "place_object", "open_container", "intermediate placement"):
         assert leaked_boundary not in EXTRACTOR_PROMPT
+
+
+def test_terminal_certificate_survives_extraction_but_is_not_single_action_tool(
+        workspace_tmp):
+    """离线正式链路：持久轨迹→Extractor→因果切片→Atomic→Tool 治理。"""
+    states = [
+        {"facts": [], "inventory": []},
+        {"facts": ["agent_at(desk_1)",
+                    "object_exists(desklamp_1)",
+                    "object_at(desklamp_1, desk_1)"], "inventory": []},
+        {"facts": ["agent_at(desk_1)", "object_exists(desklamp_1)",
+                    "object_at(desklamp_1, desk_1)",
+                    "object_toggled(desklamp_1)"], "inventory": []},
+        {"facts": ["agent_at(desk_2)", "object_exists(desklamp_1)",
+                    "object_at(desklamp_1, desk_1)",
+                    "object_toggled(desklamp_1)", "object_exists(bowl_2)",
+                    "object_at(bowl_2, desk_2)"], "inventory": []},
+        {"facts": ["agent_at(desk_2)", "object_exists(desklamp_1)",
+                    "object_at(desklamp_1, desk_1)",
+                    "object_toggled(desklamp_1)", "object_exists(bowl_2)",
+                    "agent_holds(bowl_2)"], "inventory": ["bowl_2"]},
+        {"facts": ["agent_at(desk_1)", "object_exists(desklamp_1)",
+                    "object_at(desklamp_1, desk_1)",
+                    "object_toggled(desklamp_1)", "object_exists(bowl_2)",
+                    "agent_holds(bowl_2)"], "inventory": ["bowl_2"]},
+    ]
+    action_specs = [
+        ("go to desk 1", {}),
+        ("use desklamp 1", {"associated_entity": "desklamp 1"}),
+        ("go to desk 2", {}),
+        ("take bowl 2 from desk 2",
+         {"object": "bowl 2", "object_location": "desk 2"}),
+        ("go to desk 1", {}),
+    ]
+    trace = TraceRecord(
+        trace_id="latent_formal_path", task_id="latent_formal_path",
+        task_type="opaque_label", task_goal="examine bowl with desklamp",
+        benchmark="alfworld", success=True,
+        actions=[ActionRecord(step=index, name=name, params=params)
+                 for index, (name, params) in enumerate(action_specs)],
+        state_snapshots=[{"step": index, "state": state}
+                         for index, state in enumerate(states)],
+        provenance={
+            "params": {"object": "bowl", "associated_entity": "desklamp"},
+            "semantic_params": {"object": "bowl",
+                                "associated_entity": "desklamp"},
+            "target_effects": [{"predicate": "object.observed_with", "args": {
+                "object": "$object", "associated_entity": "$associated_entity"}}],
+        },
+        metrics={"runtime_diagnostics": {"terminal_verified_effects": [{
+            "effect": {"predicate": "object.observed_with", "args": {
+                "object": "bowl_2", "associated_entity": "desklamp_1"}},
+            "action_index": 4, "source": "benchmark_terminal_certificate_v1",
+            "benchmark_won": True,
+            "evidence_facts": ["agent_holds(bowl_2)",
+                               "object_toggled(desklamp_1)",
+                               "object_at(desklamp_1, desk_1)",
+                               "agent_at(desk_1)"],
+            "standalone_action_effect": False,
+        }]}})
+
+    class _LatentExtractor:
+        usage = LLMUsage()
+
+        def generate(self, *, instructions, **_kwargs):
+            if "Composite Graph Proposal Agent" in instructions:
+                return type("R", (), {"text": json.dumps({
+                    "ordered_phase_ids": ["toggle", "acquire", "observe"],
+                    "summary": "reuse validated transitions",
+                    "implicit_dependencies": [], "tool_plan": [],
+                })})()
+            return type("R", (), {"text": json.dumps({
+                "phases": [
+                    {"phase_id": "toggle", "intent": "activate_resource",
+                     "event_start": 1, "event_end": 1,
+                     "parameter_roles": {"associated_entity": "desklamp_1"},
+                     "effect_predicates": ["object.toggled"],
+                     "precondition_predicates": ["agent_at"]},
+                    {"phase_id": "acquire", "intent": "retain_entity",
+                     "event_start": 3, "event_end": 3,
+                     "parameter_roles": {"object": "bowl_2",
+                                         "object_location": "desk_2"},
+                     "effect_predicates": ["agent.holds"],
+                     "precondition_predicates": ["agent_at"]},
+                    {"phase_id": "observe", "intent": "establish_relation",
+                     "event_start": 4, "event_end": 4,
+                     "parameter_roles": {"object": "bowl_2",
+                                         "associated_entity": "desklamp_1"},
+                     "effect_predicates": ["object.observed_with"],
+                     "precondition_predicates": ["agent.holds", "object.toggled",
+                                                 "object.at_location"]},
+                ],
+                "discarded_event_indices": [0, 2],
+                "discard_reasons": {"0": "setup", "2": "setup"},
+                "workflow_summary": "activate, retain, establish relation",
+            })})()
+
+    registry = SkillGraphRegistry(workspace_tmp / "latent_formal_graph")
+    result = TraceAtomicizer(
+        registry, extractor_agent=SemanticExtractorAgent(_LatentExtractor()),
+        allow_legacy_fallback=False).apply(trace)
+
+    assert result.semantic_extraction["method"] == "llm_proposal_code_validated"
+    terminal = next(segment for segment in result.segments
+                    if any(effect["predicate"] == "object.observed_with"
+                           for effect in segment["effect"]))
+    assert terminal["terminal_effect_origin"] is True
+    assert terminal["replay_safe"] is True
+    node = next(candidate.skill for candidate in result.candidates
+                if candidate.skill.effects[0]["predicate"]
+                == "object.observed_with")
+    assert node.effects == [{"predicate": "object.observed_with", "args": {
+        "object": "$inputs.object",
+        "associated_entity": "$inputs.associated_entity"}}]
+
+    # Run the same trace through the production success processor (no API).
+    # The terminal Abstract/Composite evidence survives, while Tool governance
+    # blocks compilation of the final navigation as a Direct implementation.
+    production_registry = SkillGraphRegistry(
+        workspace_tmp / "latent_production_graph")
+    config = SystemConfig(data_dir=workspace_tmp / "latent_production_data")
+    config.llm.mock = False
+    processor = SuccessProcessor(
+        production_registry,
+        ToolRegistry(workspace_tmp / "latent_production_tools"),
+        TraceStore(workspace_tmp / "latent_production_traces"),
+        config, extractor_llm=_LatentExtractor())
+    processed = processor.process_success(trace, run_maintenance=False)
+    assert any(note.startswith("tool_mining_blocked_terminal_certificate:")
+               for note in processed.notes)
+    assert any(ref.startswith("skill://alfworld.object_observed_with@")
+               for ref in processed.atomic_refs)
+    assert processed.composite["composite"] is not None
+
+
+def test_composite_alignment_uses_effect_contract_and_causal_partial_order(
+        workspace_tmp):
+    registry = SkillGraphRegistry(workspace_tmp / "partial_order_composite")
+    open_a = _atomic(
+        "env.container_open", [],
+        [{"predicate": "container.open",
+          "args": {"container": "$inputs.container"}}],
+        [{"name": "container"}], [{"name": "container"}])
+    open_b = _atomic(
+        "env.container_open__variant", [],
+        [{"predicate": "container.open",
+          "args": {"container": "$inputs.container"}}],
+        [{"name": "container"}, {"name": "required_position"}],
+        [{"name": "container"}])
+    acquire = _atomic(
+        "env.acquire", [],
+        [{"predicate": "agent.holds",
+          "args": {"object": "$inputs.object"}}],
+        [{"name": "object"}], [{"name": "object"}])
+    for item in (open_a, open_b, acquire):
+        registry.register(item)
+
+    def composite(ref: str, order: list[AbstractAtomicSkill]) -> CompositeSkill:
+        steps = []
+        for index, atomic in enumerate(order):
+            params = ({"container": "$task.target_location",
+                       "required_position": "$task.target_location"}
+                      if "container_open" in atomic.ref.logical_id
+                      else {"object": "$task.object"})
+            steps.append({"step_id": f"s{index}",
+                          "node_ref": str(atomic.ref), "params": params})
+        return CompositeSkill(
+            ref=SkillRef(ref, "1.0.0"), summary="semantic partial order",
+            graph={"steps": steps, "control": [
+                {"source_step": "s0", "target_step": "s1", "type": "next"}],
+                   "data": [], "dependencies": []},
+            validator={"target_effects": [
+                {"predicate": "agent.holds",
+                 "args": {"object": "$object"}}]},
+            status=SkillStatus.DRAFT)
+
+    first = composite("composite.env.first", [open_a, acquire])
+    second = composite("composite.env.second", [acquire, open_b])
+    registry.register(first)
+    decision = align_composite(second, registry)
+    assert decision.matched is True
+    assert decision.matched_ref == str(first.ref)
+
+
+def test_duplicate_same_value_role_prefers_verified_effect_argument():
+    state0 = {"facts": ["agent_at(cabinet_1)"], "inventory": []}
+    state1 = {"facts": ["agent_at(cabinet_1)",
+                        "container_open(cabinet_1)"], "inventory": []}
+    trace = TraceRecord(
+        trace_id="dedupe_role", task_id="dedupe_role", success=True,
+        actions=[ActionRecord(step=0, name="open cabinet 1", params={
+            "container": "cabinet 1", "required_position": "cabinet 1"})],
+        state_snapshots=[{"step": 0, "state": state0},
+                         {"step": 1, "state": state1}])
+    phases, errors = validate_phase_proposal(
+        trace, build_structured_events(trace), {"phases": [{
+            "phase_id": "open", "intent": "change_access_state",
+            "event_start": 0, "event_end": 0,
+            "parameter_roles": {"container": "cabinet_1",
+                                "required_position": "cabinet_1"},
+            "effect_predicates": ["container.open"],
+            "precondition_predicates": ["agent_at"],
+        }]})
+    assert errors == []
+    assert phases[0]["params"] == {"container": "cabinet 1"}
 
 
 def test_extractor_failure_cannot_fall_back_and_mutate_skillgraph(workspace_tmp):

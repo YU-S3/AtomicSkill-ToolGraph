@@ -749,3 +749,85 @@ def test_action_cycle_gets_bounded_agent_recovery_before_failure():
     events = result.diagnostics.get("action_cycle_events") or []
     assert len(events) == 1
     assert events[0]["recovery_allowed"] is True
+
+
+def test_latent_terminal_relation_requires_complete_auditable_evidence():
+    """真实 episode 路径签发终局证书；错误实例不能靠 won 混入。"""
+    script = {
+        "go to desk 1": (
+            "You arrive at desk 1. On the desk 1, you see a desklamp 1.",
+            ["use desklamp 1", "go to desk 2"], False),
+        "use desklamp 1": (
+            "You turn on the desklamp 1.", ["go to desk 2"], False),
+        "go to desk 2": (
+            "You arrive at desk 2. On the desk 2, you see a bowl 2.",
+            ["take bowl 2 from desk 2"], False),
+        "take bowl 2 from desk 2": (
+            "You pick up the bowl 2 from the desk 2.",
+            ["go to desk 1"], False),
+        "return to desk 1": (
+            "You arrive at desk 1.", [], True),
+    }
+
+    class _LookEnv:
+        def step(self, action: str):
+            key = ("return to desk 1" if action == "go to desk 1"
+                   and getattr(self, "visited", False) else action)
+            if action == "go to desk 1":
+                self.visited = True
+            observation, admissible, won = script[key]
+            return type("_StepResult", (), {
+                "observation": observation, "score": float(won),
+                "done": won, "won": won,
+                "admissible_commands": admissible, "accepted": True,
+            })()
+
+    class _SequenceLLM:
+        def __init__(self):
+            self.actions = iter([
+                "go to desk 1", "use desklamp 1", "go to desk 2",
+                "take bowl 2 from desk 2", "go to desk 1"])
+
+        def generate(self, **_kwargs):
+            return type("_Resp", (), {"text": f"Act: {next(self.actions)}"})()
+
+    adapter = AlfWorldAdapter()
+    adapter._current_env = _LookEnv()
+    task = Task(task_id="latent_look", benchmark="alfworld", task_type="hidden",
+                goal="examine the bowl with the desklamp", context={"env_index": 0})
+    resume = {
+        "observation": "You are in a room.",
+        "admissible": ["go to desk 1"], "actions": [],
+        "states": [{"step": 0, "state": {"facts": [], "inventory": []}}],
+        "state": {"facts": [], "inventory": []},
+    }
+    target = [{"predicate": "object.observed_with", "args": {
+        "object": "$object", "associated_entity": "$associated_entity"}}]
+    result = adapter.run_env_episode(
+        task, _SequenceLLM(), resume=resume, max_steps=10,
+        stop_effects=target,
+        effect_inputs={"object": "bowl", "associated_entity": "desklamp"})
+
+    assert result.success is True
+    certificates = result.diagnostics["terminal_verified_effects"]
+    assert certificates == [{
+        "effect": {"predicate": "object.observed_with", "args": {
+            "object": "bowl_2", "associated_entity": "desklamp_1"}},
+        "action_index": 4,
+        "source": "benchmark_terminal_certificate_v1",
+        "benchmark_won": True,
+        "evidence_facts": [
+            "agent_holds(bowl_2)", "object_toggled(desklamp_1)",
+            "object_at(desklamp_1, desk_1)", "agent_at(desk_1)"],
+        "evidence_rule": (
+            "target_held_and_associated_entity_toggled_and_colocated"),
+        "standalone_action_effect": False,
+    }]
+
+    # 同一终态不能为错误主题签发证书，即使调用方声称 benchmark won。
+    from atomic_skillgraph.adapters.alfworld import _terminal_effect_certificates
+    wrong = _terminal_effect_certificates(
+        result.states[-1]["state"], target,
+        {"object": "pencil", "associated_entity": "desklamp"},
+        action_index=4)
+    assert wrong == []
