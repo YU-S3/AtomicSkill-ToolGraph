@@ -93,8 +93,7 @@ def test_official_task_type_is_ignored_by_goal_contract():
     look = _target_effects_of(
         "look_at_obj_in_light", "examine the book with the lamp.",
         {"object": "book", "associated_entity": "lamp"})
-    assert [item["predicate"] for item in look] == [
-        "object.toggled", "agent.holds"]
+    assert [item["predicate"] for item in look] == ["object.observed_with"]
     pick_two = _target_effects_of(
         "pick_two_obj_and_place", "put two cd in safe.",
         {"object_type": "cd", "target_location": "safe"})
@@ -117,8 +116,7 @@ def test_goal_contract_is_compositional_not_task_type_enumerated():
     light = _target_effects_of(
         "unseen_inspection_task", "examine the book with the lamp",
         {"object": "book", "associated_entity": "lamp 1"})
-    assert [item["predicate"] for item in light] == [
-        "object.toggled", "agent.holds"]
+    assert [item["predicate"] for item in light] == ["object.observed_with"]
 
 
 def test_goal_roles_do_not_inject_unstated_station_or_workflow():
@@ -224,21 +222,25 @@ def test_structured_event_exposes_light_toggle_effect_and_parameter():
         task_id="look", task_type="look_at_obj_in_light",
         task_goal="examine the cd with the desklamp.", benchmark="alfworld",
         success=True, provenance={"params": {
-            "object": "cd", "light_source": "desklamp 1"}},
+            "object": "cd", "associated_entity": "desklamp 1"}},
     )
     tracker = _AlfStateTracker()
+    tracker.update("You pick up the cd 1 from the desk 1.")
     trace.state_snapshots.append({"step": 0, "state": tracker.state()})
     observation = "You turn on the desklamp 1."
-    tracker.update(observation)
+    tracker.update(observation, action="use desklamp 1", accepted=True)
     trace.actions.append(ActionRecord(
         step=0, name="use desklamp 1",
         params=_parse_action_params("use desklamp 1"),
         observation=observation, accepted=True))
     trace.state_snapshots.append({"step": 1, "state": tracker.state()})
     event = build_structured_events(trace)[0]
-    assert event["params"] == {"light_source": "desklamp 1"}
-    assert event["positive_effects"] == [{
-        "predicate": "object.toggled", "args": {"object": "desklamp_1"}}]
+    assert event["params"] == {"associated_entity": "desklamp 1"}
+    assert {item["predicate"] for item in event["positive_effects"]} == {
+        "object.toggled", "object.observed_with"}
+    assert {"predicate": "object.observed_with", "args": {
+        "object": "cd_1", "associated_entity": "desklamp_1"}} \
+        in event["positive_effects"]
 
 
 def test_atomicizer_on_pddl_trace(workspace_tmp):

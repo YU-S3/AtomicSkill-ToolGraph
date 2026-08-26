@@ -40,8 +40,10 @@ event from them is causally necessary for the verified transition.
 Use state evidence rather than action wording as authority. Setup actions and temporary helper state
 belong inside an occurrence only when they are necessary to replay its core transition. A durable
 transition should be a separate occurrence when it is independently useful, independently consumed,
-or required by the task goal. This rule must be applied from the observed data; no domain-specific
-boundary rule is supplied.
+or required by the task goal. Never merge distinct effect-producing events merely to minimize the
+number of phases: one phase has one primary effect-producing boundary, although one indivisible event
+may have multiple simultaneous deltas. This rule must be applied from the observed data; no
+domain-specific boundary rule is supplied.
 
 Invent a concise snake_case intent that describes the reusable transition. The name must remain valid
 when every concrete entity is replaced by another entity with the same semantic role. Do not include
@@ -161,7 +163,8 @@ class SemanticExtractorAgent:
                 input_text=json.dumps(payload, ensure_ascii=False),
                 temperature=0.1, thinking=self.thinking,
                 structured_output=True)
-            proposal = _parse_json_object(response.text)
+            proposal = _split_overmerged_phase_proposals(
+                events, _parse_json_object(response.text))
             result.proposal = proposal
             phases, errors = validate_phase_proposal(trace, events, proposal)
             result.validated_phases = phases
@@ -239,6 +242,57 @@ def build_structured_events(trace: TraceRecord) -> list[dict[str, Any]]:
             "state_changed": bool(positive or negative),
         })
     return events
+
+
+def _split_overmerged_phase_proposals(
+        events: list[dict[str, Any]], proposal: dict[str, Any]) -> dict[str, Any]:
+    """Split a proposed macro at independently observed Effect producers."""
+    normalized = dict(proposal or {})
+    expanded: list[dict[str, Any]] = []
+    for ordinal, raw in enumerate(proposal.get("phases") or []):
+        if not isinstance(raw, dict):
+            expanded.append(raw)
+            continue
+        try:
+            start, end = int(raw["event_start"]), int(raw["event_end"])
+        except (KeyError, TypeError, ValueError):
+            expanded.append(dict(raw))
+            continue
+        if start < 0 or end < start or end >= len(events):
+            expanded.append(dict(raw))
+            continue
+        producers: list[tuple[int, list[str]]] = []
+        for index in range(start, end + 1):
+            event = events[index]
+            if not bool(event.get("accepted", True)):
+                continue
+            names = sorted({str(item.get("predicate") or "")
+                            for item in (event.get("positive_effects") or [])
+                            if isinstance(item, dict) and item.get("predicate")})
+            if names:
+                producers.append((index, names))
+        if len(producers) <= 1:
+            expanded.append(dict(raw))
+            continue
+        base_id = str(raw.get("phase_id") or f"phase_{ordinal:03d}")
+        for offset, (index, names) in enumerate(producers):
+            item = dict(raw)
+            item["phase_id"] = f"{base_id}_effect_{offset:02d}"
+            item["event_start"] = index
+            item["event_end"] = index
+            item["effect_predicates"] = names
+            item["rationale"] = (
+                f"Code split independent effect producer event {index} from "
+                f"the proposed macro; original rationale: "
+                f"{str(raw.get('rationale') or '')}")[:500]
+            expanded.append(item)
+    normalized["phases"] = expanded
+    normalized["code_boundary_normalization"] = {
+        "method": "split_independent_effect_producers",
+        "raw_phase_count": len(proposal.get("phases") or []),
+        "normalized_phase_count": len(expanded),
+    }
+    return normalized
 
 
 def validate_phase_proposal(trace: TraceRecord, events: list[dict[str, Any]],

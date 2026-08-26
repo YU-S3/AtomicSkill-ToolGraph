@@ -68,9 +68,10 @@ class CompositeBuilder:
         atomic_refs = [pair[0] for pair in pairs]
         segments = [pair[1] for pair in pairs]
         node_refs = [f"{ref.logical_id}@{ref.version}" for ref in atomic_refs]
+        occurrence_params = _role_params_for_segments(segments, trace)
         steps = [
             {"step_id": f"step_{index:03d}", "node_ref": node_ref,
-             "params": _role_params(segment.get("params") or {}, trace),
+             "params": occurrence_params[index],
              "metadata": {"source_trace_id": trace.trace_id,
                           "phase_id": str(segment.get("phase_id") or f"phase_{index:03d}"),
                           "event_start": segment.get("event_start"),
@@ -413,4 +414,87 @@ def _role_params(params: dict[str, Any], trace: TraceRecord) -> dict[str, Any]:
                 break
         if matched_role:
             result[str(key)] = f"$task.{matched_role}"
+    return result
+
+
+def _role_params_for_segments(segments: list[dict[str, Any]],
+                              trace: TraceRecord) -> list[dict[str, Any]]:
+    """Parameterize a whole occurrence chain without losing local roles.
+
+    A location can appear as ``target_location`` on a navigation occurrence
+    and as ``object_location`` or ``transformation_resource`` on the following
+    capability.  Parameterizing each phase independently used to discard the
+    former because it was not the task's final destination.  This whole-chain
+    pass aligns equal grounded values first, then emits either a task role or
+    an occurrence-scoped ``$flow`` role.
+    """
+    from ..core.predicates import normalize_value
+
+    known = dict(trace.provenance.get("params") or {})
+    semantic = dict(trace.provenance.get("semantic_params") or {})
+    def task_role(value: Any, preferred_role: str) -> str:
+        value_norm = normalize_value(value)
+        # A grounded executable parameter is unambiguous and wins first.
+        # Example: the final cabinet_1 can safely bind target_location even
+        # when the semantic goal merely says "cabinet".
+        for role, task_value in known.items():
+            role_norm = normalize_value(task_value)
+            if not value_norm or not role_norm:
+                continue
+            same = value_norm == role_norm
+            family = (str(role) == str(preferred_role)
+                      and not re.search(r"_\d+$", role_norm)
+                      and re.sub(r"_\d+$", "", value_norm) == role_norm)
+            if same or family:
+                return str(role)
+
+        # A generic semantic value (for example "cabinet") may match several
+        # concrete instances.  Only accept that family match when the role
+        # discovered from this occurrence chain agrees with the task role;
+        # otherwise an object source cabinet could be mistaken for the final
+        # destination cabinet.
+        for role, task_value in semantic.items():
+            if str(role) != str(preferred_role):
+                continue
+            role_norm = normalize_value(task_value)
+            if not value_norm or not role_norm:
+                continue
+            same = value_norm == role_norm
+            family = (not re.search(r"_\d+$", role_norm)
+                      and re.sub(r"_\d+$", "", value_norm) == role_norm)
+            if same or family:
+                return str(role)
+        return ""
+
+    roles_by_value: dict[str, set[str]] = {}
+    for segment in segments:
+        for raw_role, value in dict(segment.get("params") or {}).items():
+            normalized = normalize_value(value)
+            if normalized:
+                roles_by_value.setdefault(normalized, set()).add(str(raw_role))
+
+    def preferred_flow_role(value: Any, local_role: str) -> str:
+        normalized = normalize_value(value)
+        candidates = roles_by_value.get(normalized) or {str(local_role)}
+        # A specific occurrence role carries more information than the generic
+        # role used by a navigation node.  This is a naming preference only;
+        # no operation, entity, or benchmark taxonomy is encoded.
+        def rank(role: str) -> tuple[int, int, str]:
+            generic = role in {"target_location", "execution_location", "location"}
+            relational = role.endswith("_location") or role.endswith("_resource") \
+                or role.endswith("_station")
+            return (1 if generic else 0, 0 if relational else 1, role)
+        return sorted(candidates, key=rank)[0]
+
+    result: list[dict[str, Any]] = []
+    for segment in segments:
+        mapped: dict[str, Any] = {}
+        for key, value in dict(segment.get("params") or {}).items():
+            flow_role = preferred_flow_role(value, str(key))
+            role = task_role(value, flow_role)
+            if role:
+                mapped[str(key)] = f"$task.{role}"
+            elif value not in (None, ""):
+                mapped[str(key)] = f"$flow.{flow_role}"
+        result.append(mapped)
     return result

@@ -27,6 +27,7 @@ _PREDICATE_FACT_NAMES: dict[str, tuple[str, tuple[str, ...]]] = {
     "object.cooled": ("object_cooled", ("object",)),
     "object.lit": ("object_lit", ("object",)),
     "object.toggled": ("object_toggled", ("object",)),
+    "object.observed_with": ("object_observed_with", ("object", "associated_entity")),
     "object.in_receptacle": ("object_in_receptacle", ("object", "receptacle")),
     "container.open": ("container_open", ("container",)),
     "location.checked": ("location_checked", ("location",)),

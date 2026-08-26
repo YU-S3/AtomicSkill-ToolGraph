@@ -32,13 +32,16 @@ def _atomic(logical_id: str, predicate: str, inputs: list[str]):
     )
 
 
-def _composite(logical_id: str, refs: list[str], summary: str, utility: float):
+def _composite(logical_id: str, refs: list[str], summary: str, utility: float,
+               *, status: SkillStatus = SkillStatus.ACTIVE,
+               target_effects: list[dict] | None = None):
     return CompositeSkill(
         ref=SkillRef(logical_id, "1.0.0"), summary=summary,
         task_type_labels=[TASK_TYPE],
         graph={"nodes": refs},
+        validator={"target_effects": target_effects or []},
         metadata={"statistics": {"utility": utility}},
-        status=SkillStatus.ACTIVE,
+        status=status,
     )
 
 
@@ -102,6 +105,64 @@ def test_partial_composite_dynamic_gap_binds_task_params(workspace_tmp):
     assert gaps[0].params["target_location"] == "cabinet 1"
     assert gaps[0].params["heating_station"] == "microwave 1"
     assert "composite_partial_with_bound_gap" in plan.notes
+
+
+def test_irrelevant_broader_composite_is_not_selected_for_simple_goal(workspace_tmp):
+    registry = _registry(workspace_tmp, include_complete=False)
+    place = registry.get_recommended("alfworld.place_object")
+    cool = _atomic("alfworld.cool_object", "object.cooled", ["object"])
+    registry.register(cool)
+    registry.register(_composite(
+        "composite.alfworld.cool-place",
+        [str(cool.ref), str(place.ref)], "cool then place", 1.0,
+        target_effects=[
+            {"predicate": "object.cooled", "args": {"object": "$object"}},
+            {"predicate": "object.at_location",
+             "args": {"object": "$object", "location": "$target_location"}},
+        ],
+    ))
+    simple = _task(params={"object": "mug", "target_location": "cabinet 1"})
+    simple.target_effects = [simple.target_effects[-1]]
+    plan = AtomicPlanner(registry, SystemConfig()).compile_runtime_graph(simple)
+    assert "cool-place" not in plan.composite_ref
+    assert all(node.ref.logical_id != "alfworld.cool_object" for node in plan.nodes)
+
+
+def test_frozen_replay_never_selects_single_trace_draft_composite(workspace_tmp):
+    registry = _registry(workspace_tmp, include_complete=False)
+    acquire = registry.get_recommended("alfworld.acquire_object")
+    heat = registry.get_recommended("alfworld.heat_object")
+    place = registry.get_recommended("alfworld.place_object")
+    registry.register(_composite(
+        "composite.alfworld.unconfirmed",
+        [str(acquire.ref), str(heat.ref), str(place.ref)], "complete draft", 1.0,
+        status=SkillStatus.DRAFT,
+        target_effects=_task().target_effects,
+    ))
+    config = SystemConfig(freeze_skills=True)
+    plan = AtomicPlanner(registry, config).compile_runtime_graph(_task(params={
+        "object": "mug", "target_location": "cabinet 1"}))
+    assert "unconfirmed" not in plan.composite_ref
+    assert "controlled_candidate_exploration" not in plan.notes
+
+
+def test_dynamic_transformation_gap_is_inserted_before_delivery(workspace_tmp):
+    registry = _registry(workspace_tmp, include_complete=False)
+    acquire = registry.get_recommended("alfworld.acquire_object")
+    place = registry.get_recommended("alfworld.place_object")
+    registry.register(_composite(
+        "composite.alfworld.acquire-place",
+        [str(acquire.ref), str(place.ref)], "acquire then place", 0.99,
+        target_effects=[_task().target_effects[-1]],
+    ))
+    plan = AtomicPlanner(registry, SystemConfig()).compile_runtime_graph(
+        _task(params={"object": "mug", "target_location": "cabinet 1",
+                      "heating_station": "microwave 1"}))
+    predicates = [
+        next(iter(node.target_effects), {}).get("predicate")
+        for node in plan.nodes
+    ]
+    assert predicates.index("object.heated") < predicates.index("object.at_location")
 
 
 def test_unbound_partial_composite_falls_back_to_atomic_plan(workspace_tmp):

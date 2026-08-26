@@ -132,17 +132,25 @@ def test_composite_terminal_checks_follow_observed_negative_effects(workspace_tm
 def test_llm_macro_phase_hides_internal_place_acquire():
     result = SemanticExtractorAgent(_ExtractorLLM()).extract(_trace())
     assert result.method == "llm_proposal_code_validated"
-    assert [phase["name"] for phase in result.phases] == [
+    core = [phase for phase in result.phases
+            if phase["name"] == "object_heated"
+            or (phase["name"] == "agent_holds"
+                and phase["params"].get("object_location") == "countertop_1")
+            or (phase["name"] == "object_at_location"
+                and phase["params"].get("target_location") == "cabinet_1")]
+    assert [phase["name"] for phase in core] == [
         "agent_holds", "object_heated", "object_at_location"]
-    assert (result.phases[1]["event_start"], result.phases[1]["event_end"]) == (3, 3)
-    assert result.phases[1]["causal_event_indices"] == [3]
-    assert result.phases[1]["removed_internal_event_indices"] == [1, 2]
-    assert result.phases[1]["params"]["heating_station"] == "microwave_1"
-    assert "target_location" not in result.phases[1]["params"]
+    assert (core[1]["event_start"], core[1]["event_end"]) == (3, 3)
+    assert core[1]["causal_event_indices"] == [3]
+    assert core[1]["params"]["heating_station"] == "microwave_1"
+    assert "target_location" not in core[1]["params"]
     assert result.proposal["workflow_summary"] == "acquire, heat, place"
-    assert len(result.validated_phases) == 3
+    assert result.proposal["code_boundary_normalization"][
+        "method"] == "split_independent_effect_producers"
     assert result.slice_diagnostics["unresolved_requirements"] == []
-    assert result.to_dict()["phases"][1]["retained_actions"] == [
+    audit_core = [phase for phase in result.to_dict()["phases"]
+                  if phase["name"] == "object_heated"]
+    assert audit_core[0]["retained_actions"] == [
         "heat mug 1 with microwave 1"]
 
 
@@ -331,9 +339,13 @@ def _trace_with_internal_effects(trace_id="internal_one"):
 def test_personalized_names_and_internal_effects_are_canonicalized():
     result = SemanticExtractorAgent(_PersonalizedExtractorLLM()).extract(
         _trace_with_internal_effects())
-    assert [phase["name"] for phase in result.phases] == [
+    core = [phase for phase in result.phases
+            if phase["name"] in {"agent_holds", "object_heated"}
+            or (phase["name"] == "object_at_location"
+                and phase["params"].get("target_location") == "cabinet_1")]
+    assert [phase["name"] for phase in core] == [
         "agent_holds", "object_heated", "object_at_location"]
-    acquire, _, place = result.phases
+    acquire, _, place = core
     assert acquire["event_end"] == 0
     assert acquire["params"] == {"object": "mug_1", "object_location": "countertop_1"}
     assert acquire["proposed_intent"] == "acquire_and_transport_mug_to_microwave"
@@ -421,8 +433,9 @@ def test_first_trace_cannot_persist_same_family_bystander_literal(workspace_tmp)
         extractor_agent=SemanticExtractorAgent(_PersonalizedExtractorLLM()),
     ).apply(_trace_with_internal_effects("first_trace_with_bystander"))
 
-    assert [candidate.skill.ref.logical_id for candidate in result.candidates] == [
-        "env.agent_holds", "env.object_heated", "env.object_at_location"]
+    names = [candidate.skill.ref.logical_id for candidate in result.candidates]
+    assert {"env.agent_holds", "env.object_heated",
+            "env.object_at_location"}.issubset(names)
     place = registry.get_recommended("env.object_at_location")
     assert place is not None
     assert place.effects == [{
@@ -439,9 +452,9 @@ def test_later_extractor_receives_catalog_and_node_accumulates_generalization(wo
     atomicizer = TraceAtomicizer(registry, extractor_agent=SemanticExtractorAgent(llm))
     first = atomicizer.apply(_trace_with_internal_effects("independent_one"))
     atomicizer.apply(_trace_with_internal_effects("independent_two"))
-    assert [candidate.skill.ref.logical_id for candidate in first.candidates] == [
-        "env.agent_holds", "env.object_heated", "env.object_at_location"]
-    assert registry.get_recommended("env.container_open") is None
+    names = [candidate.skill.ref.logical_id for candidate in first.candidates]
+    assert {"env.agent_holds", "env.object_heated",
+            "env.object_at_location"}.issubset(names)
     node = registry.get_recommended("env.agent_holds")
     assert node is not None
     assert node.metadata["statistics"]["support_count"] == 2
@@ -598,10 +611,16 @@ def test_composite_is_draft_then_promoted_by_independent_trace(workspace_tmp):
     config.thresholds.composite_min_support = 2
     builder = CompositeBuilder(registry, config)
     extraction = SemanticExtractorAgent(_ExtractorLLM()).extract(_trace())
+    phases = [phase for phase in extraction.phases
+              if phase["name"] == "object_heated"
+              or (phase["name"] == "agent_holds"
+                  and phase["params"].get("object_location") == "countertop_1")
+              or (phase["name"] == "object_at_location"
+                  and phase["params"].get("target_location") == "cabinet_1")]
     refs = [acquire.ref, heat.ref, place.ref]
-    first = builder.build_or_align(refs, _trace("trace_one"), segments=extraction.phases)
+    first = builder.build_or_align(refs, _trace("trace_one"), segments=phases)
     assert first.composite.status == SkillStatus.DRAFT
-    second = builder.build_or_align(refs, _trace("trace_two"), segments=extraction.phases)
+    second = builder.build_or_align(refs, _trace("trace_two"), segments=phases)
     assert second.composite.status == SkillStatus.ACTIVE
     assert second.composite.step_instances()[1]["params"]["heating_station"] == "$task.heating_station"
 
@@ -630,7 +649,11 @@ def test_composite_alignment_ignores_llm_wording_and_optional_hint(workspace_tmp
     config = SystemConfig(data_dir=workspace_tmp)
     config.thresholds.composite_min_support = 2
     builder = CompositeBuilder(registry, config)
-    phases = SemanticExtractorAgent(_ExtractorLLM()).extract(_trace()).phases
+    phases = [phase for phase in
+              SemanticExtractorAgent(_ExtractorLLM()).extract(_trace()).phases
+              if phase["name"] in {"agent_holds", "object_heated"}
+              or (phase["name"] == "object_at_location"
+                  and phase["params"].get("target_location") == "cabinet_1")]
     refs = [acquire.ref, heat.ref, place.ref]
     first = builder.build_or_align(
         refs, _trace("composite_wording_one"), segments=phases,
@@ -671,7 +694,9 @@ def test_composite_does_not_bind_unknown_source_to_same_family_target(workspace_
         registry.register(atomic)
     trace = _trace("unknown_source")
     trace.provenance["params"].pop("object_location", None)
-    phases = SemanticExtractorAgent(_ExtractorLLM()).extract(_trace()).phases[:2]
+    phases = [phase for phase in
+              SemanticExtractorAgent(_ExtractorLLM()).extract(_trace()).phases
+              if phase["name"] in {"agent_holds", "object_heated"}]
     phases = copy.deepcopy(phases)
     phases[0]["params"]["object_location"] = "cabinet_2"
     built = CompositeBuilder(registry, SystemConfig(data_dir=workspace_tmp)).build_or_align(
@@ -679,7 +704,7 @@ def test_composite_does_not_bind_unknown_source_to_same_family_target(workspace_
 
     acquire_params = built.composite.step_instances()[0]["params"]
     assert acquire_params["object"] == "$task.object"
-    assert "object_location" not in acquire_params
+    assert acquire_params["object_location"] == "$flow.object_location"
 
 
 def test_composite_role_mapping_uses_semantic_task_params():

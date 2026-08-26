@@ -82,18 +82,19 @@ class AtomicPlanner:
         if features.enable_composite:
             composites = [h for h in retrieved if h.kind == SkillNodeKind.COMPOSITE]
             if self.config.freeze_skills:
-                composites = [h for h in composites if (
-                    h.obj.status.value == "active"
-                    or (h.obj.status.value == "draft" and (
-                        self.config.llm.mock
-                        or bool((h.obj.metadata.get("candidate") or {}).get(
-                            "semantic_extraction_validated")))))]
+                # Frozen evaluation may only consume promoted knowledge.  A
+                # single-trace draft is an online exploration candidate, not a
+                # frozen reusable capability, even when its schema validates.
+                composites = [h for h in composites
+                              if h.obj.status.value == "active"]
             # Sufficiency is a hard gate before lexical/utility score. A fully
             # covering Composite cannot be discarded merely because its summary
             # is phrased differently from the new goal.
             complete = [h for h in composites
-                        if self._composite_covers_targets(h.obj,
-                                                          task.target_effects)]
+                        if (self._composite_covers_targets(
+                                h.obj, task.target_effects)
+                            and self._composite_goal_relevant(
+                                h.obj, task.target_effects))]
             if complete:
                 active = [h for h in complete
                           if h.obj.status.value == "active"]
@@ -102,7 +103,11 @@ class AtomicPlanner:
                 selectable = active or [
                     h for h in complete if h.obj.status.value == "draft"]
                 if selectable:
-                    selected = max(selectable, key=lambda h: h.score)
+                    selected = max(
+                        selectable,
+                        key=lambda h: self._composite_selection_rank(
+                            h, task.target_effects),
+                    )
                     plan = self._plan_from_composite(task, selected, retrieved)
                     plan.notes.append("composite_effect_complete")
                     if selected.obj.status.value == "draft":
@@ -112,7 +117,9 @@ class AtomicPlanner:
                     return plan
 
             eligible = [h for h in composites
-                        if h.score >= self.composite_min_score]
+                        if (h.score >= self.composite_min_score
+                            and self._composite_goal_relevant(
+                                h.obj, task.target_effects))]
             if eligible:
                 # 没有完整 Composite 时才允许用 partial + dynamic gap。若 gap
                 # 参数无法完全绑定，则继续走 Atomic greedy，而不是执行占位符。
@@ -160,17 +167,34 @@ class AtomicPlanner:
             obj = self.registry.get_recommended(logical)
             if obj is None:
                 continue
-            params = self._bind_params(task, obj)
             occurrence = occurrences.get(logical, 0)
             occurrences[logical] = occurrence + 1
             stored_steps = steps_by_logical.get(logical, [])
             if occurrence < len(stored_steps):
-                params.update(self._resolve_composite_params(
-                    stored_steps[occurrence].get("params") or {}, task))
+                # The occurrence role map is authoritative.  Falling back to
+                # global task bindings here used to bind every navigation node
+                # to the final destination and erased source/station roles.
+                stored = dict(stored_steps[occurrence].get("params") or {})
+                params = self._resolve_composite_params(stored, task)
+                fallback = self._bind_params(task, obj)
+                for key, value in list(params.items()):
+                    if not (isinstance(value, str)
+                            and value.startswith("$flow.")):
+                        continue
+                    flow_role = value[len("$flow."):]
+                    replacement = ((task.context.get("params") or {}).get(flow_role)
+                                   or fallback.get(key) or fallback.get(flow_role))
+                    if replacement not in (None, ""):
+                        params[key] = replacement
+                    else:
+                        params.pop(key, None)
+            else:
+                params = self._bind_params(task, obj)
             nodes.append(PlannedNode(ref=obj.ref, step_id=f"step_{index:03d}",
                                      params=params, source="composite",
                                      target_effects=list(getattr(obj, "effects", []))))
-        nodes = self._append_dynamic_gaps(task, nodes)
+        nodes = self._prune_unbound_support_nodes(
+            task, self._append_dynamic_gaps(task, nodes))
         return RuntimePlan(
             start_mode="warm",
             composite_ref=str(composite.ref),
@@ -179,6 +203,51 @@ class AtomicPlanner:
             retrieved=[h.to_dict() for h in retrieved],
             notes=[f"composite_plan:{composite.ref.logical_id}"],
         )
+
+    def _prune_unbound_support_nodes(self, task,
+                                     nodes: list[PlannedNode]) -> list[PlannedNode]:
+        """Drop only unexecutable helper occurrences subsumed downstream.
+
+        A hidden source/resource location can make a standalone helper
+        occurrence unbound, while the later state-changing capability can
+        discover that location itself.  The decision is contract-driven: the
+        node must have missing declared inputs, produce no requested goal, and
+        all of its Effects must be consumed as later Preconditions.
+        """
+        target_keys = self._target_effect_keys(task.target_effects)
+        kept: list[PlannedNode] = []
+        for index, node in enumerate(nodes):
+            atomic = None if node.dynamic else self.registry.get_recommended(
+                node.ref.logical_id)
+            if atomic is None:
+                kept.append(node)
+                continue
+            required_inputs = {str(item.get("name") or "")
+                               for item in (atomic.inputs or [])
+                               if isinstance(item, dict) and item.get("name")}
+            missing = {name for name in required_inputs
+                       if node.params.get(name) in (None, "")}
+            effects = {
+                _canonical_predicate(str(item.get("predicate") or ""))
+                for item in (atomic.effects or []) if isinstance(item, dict)
+            }
+            later_preconditions = {
+                _canonical_predicate(str(item.get("predicate") or ""))
+                for later in nodes[index + 1:]
+                for later_obj in ([self.registry.get_recommended(
+                    later.ref.logical_id)] if not later.dynamic else [])
+                if later_obj is not None
+                for item in (later_obj.preconditions or [])
+                if isinstance(item, dict)
+            }
+            removable = (bool(missing) and bool(effects)
+                         and not (effects & target_keys)
+                         and effects.issubset(later_preconditions))
+            if not removable:
+                kept.append(node)
+        for index, node in enumerate(kept):
+            node.step_id = f"step_{index:03d}"
+        return kept
 
     @staticmethod
     def _resolve_composite_params(stored: dict[str, Any], task) -> dict[str, Any]:
@@ -197,6 +266,11 @@ class AtomicPlanner:
                     continue
                 if context.get(role) not in (None, ""):
                     resolved[str(key)] = context[role]
+            elif isinstance(value, str) and value.startswith("$flow."):
+                # Preserve an occurrence-scoped role until runtime evidence or
+                # an incoming DATA_FLOW edge grounds it.  Never replace it with
+                # a semantically unrelated task-level location.
+                resolved[str(key)] = value
             elif value not in (None, ""):
                 resolved[str(key)] = value
         return resolved
@@ -333,13 +407,35 @@ class AtomicPlanner:
             if canonical in covered:
                 continue
             slug = re.sub(r"[^a-z0-9_.]+", "_", predicate.lower()).strip("_") or "effect"
-            nodes.append(PlannedNode(
+            gap = PlannedNode(
                 ref=SkillRef(f"runtime.dynamic.{slug}", "0.0.0"),
-                step_id=f"step_{len(nodes):03d}", source="dynamic_gap",
+                source="dynamic_gap",
                 params=self._bind_dynamic_effect_params(task, effect),
                 target_effects=[dict(effect)], dynamic=True,
-            ))
+            )
+            # Missing target Effects participate in the same declared goal
+            # order as learned producers.  Appending every gap at the end made
+            # transformation goals execute after final delivery.
+            target_order = {
+                _canonical_predicate(str(item.get("predicate") or "")): rank
+                for rank, item in enumerate(task.target_effects)
+                if isinstance(item, dict) and item.get("predicate")
+            }
+            gap_rank = target_order.get(canonical, len(target_order))
+            insert_at = len(nodes)
+            for index, node in enumerate(nodes):
+                ranks = [target_order.get(
+                    _canonical_predicate(str(item.get("predicate") or "")),
+                    -1)
+                    for item in node.target_effects if isinstance(item, dict)]
+                ranks = [rank for rank in ranks if rank >= 0]
+                if ranks and min(ranks) > gap_rank:
+                    insert_at = index
+                    break
+            nodes.insert(insert_at, gap)
             covered.add(canonical)
+        for index, node in enumerate(nodes):
+            node.step_id = f"step_{index:03d}"
         return nodes
 
     def _composite_effect_keys(self, composite: CompositeSkill) -> set[str]:
@@ -389,6 +485,34 @@ class AtomicPlanner:
         actual = self._composite_effect_counts(composite)
         return all(actual.get(predicate, 0) >= required
                    for predicate, required in target.items())
+
+    def _composite_goal_relevant(self, composite: CompositeSkill,
+                                 target_effects: list[dict]) -> bool:
+        """Require the learned goal contract to be no broader than this task.
+
+        Structural helper Effects (navigation, open state, possession) are not
+        inferred from names here.  The comparison uses the goal contract saved
+        when the successful Composite occurrence was built.  Thus a workflow
+        learned for ``changed + delivered`` cannot be selected for a task that
+        asks only for ``delivered``.
+        """
+        learned = list((composite.validator or {}).get("target_effects") or [])
+        if not learned:
+            return True  # compatibility for historical non-v2 artifacts
+        wanted = self._target_effect_counts(target_effects)
+        declared = self._target_effect_counts(learned)
+        return all(predicate in wanted and required <= wanted[predicate]
+                   for predicate, required in declared.items())
+
+    def _composite_selection_rank(self, hit: RetrievalHit,
+                                  target_effects: list[dict]) -> tuple:
+        """Prefer exact/minimal verified contracts before lexical utility."""
+        declared = self._target_effect_counts(
+            list((hit.obj.validator or {}).get("target_effects") or []))
+        wanted = self._target_effect_counts(target_effects)
+        mismatch = sum(abs(declared.get(key, 0) - wanted.get(key, 0))
+                       for key in set(declared) | set(wanted))
+        return (-mismatch, -len(hit.obj.step_instances()), hit.score)
 
     def _composite_target_coverage(self, composite: CompositeSkill,
                                    target_effects: list[dict]) -> float:

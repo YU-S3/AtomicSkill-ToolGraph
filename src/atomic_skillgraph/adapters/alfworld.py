@@ -168,7 +168,8 @@ class AlfWorldAdapter:
             if _is_noop_step(prefix_step):
                 continue
             prefix_result = env.step(str(prefix_step))
-            tracker.update(prefix_result.observation)
+            tracker.update(prefix_result.observation, action=str(prefix_step),
+                           accepted=_env_step_accepted(prefix_result))
             admissible = list(prefix_result.admissible_commands)
             if prefix_result.done and not prefix_result.won:
                 return {"passed": False, "after": tracker.state(),
@@ -193,7 +194,8 @@ class AlfWorldAdapter:
                 continue
             filled = _fill_template(step, replay_bindings)
             result = env.step(filled)
-            tracker.update(result.observation)
+            tracker.update(result.observation, action=filled,
+                           accepted=_env_step_accepted(result))
             admissible = list(result.admissible_commands)
             if result.done:
                 break
@@ -339,7 +341,7 @@ class AlfWorldAdapter:
                 "mode": "dynamic", "node_ref": node_ref, "tool_ref": "",
                 "origin": "framework_discovery",
             })
-            tracker.update(obs)
+            tracker.update(obs, action=action, accepted=accepted)
             result.states.append({"step": len(result.actions), "state": tracker.state()})
             return env_result
 
@@ -510,7 +512,8 @@ class AlfWorldAdapter:
                         "node_ref": step_spec.get("node_ref", ""),
                         "tool_ref": step_spec.get("tool_ref", ""),
                     })
-                    tracker.update(env_result.observation)
+                    tracker.update(env_result.observation, action=filled,
+                                   accepted=_env_step_accepted(env_result))
                     result.states.append({"step": len(result.actions),
                                           "state": tracker.state()})
                     # The action that establishes the final atomic Effect may
@@ -600,7 +603,8 @@ class AlfWorldAdapter:
                 "node_ref": node_ref,
                 "tool_ref": "",
             })
-            tracker.update(env_result.observation)
+            tracker.update(env_result.observation, action=action,
+                           accepted=accepted)
             _record_location_inspection(
                 tracker, action, env_result.observation, accepted=accepted)
             result.states.append({"step": len(result.actions),
@@ -768,7 +772,8 @@ class _AlfStateTracker:
         if initial_observation:
             self.update(initial_observation)
 
-    def update(self, observation: str) -> None:
+    def update(self, observation: str, *, action: str = "",
+               accepted: bool = True) -> None:
         text = str(observation or "").lower()
 
         arrive = re.search(r"you arrive at (.+?)\.", text)
@@ -841,6 +846,17 @@ class _AlfStateTracker:
                 if obj != "nothing":
                     self.inventory.append(obj)
                     self.facts.add(f"agent_holds({obj})")
+
+        # Record the achieved relation only when the environment accepts the
+        # interaction and its observation confirms activation while an object
+        # is held.  This uses protocol evidence, never the official task label.
+        used = re.fullmatch(r"use\s+(.+)", str(action or "").strip(),
+                            flags=re.IGNORECASE)
+        if accepted and used and re.search(r"\byou turn on\b", text):
+            associated = _norm(used.group(1))
+            for obj in self.inventory:
+                self.facts.add(
+                    f"object_observed_with({_norm(obj)}, {associated})")
 
     def state(self) -> dict[str, Any]:
         return {"facts": sorted(self.facts), "inventory": list(self.inventory),
@@ -1034,7 +1050,8 @@ def _controlled_acquire_replay_setup(
         arrived = False
         for _attempt in range(2):
             step_result = env.step(go_action)
-            tracker.update(step_result.observation)
+            tracker.update(step_result.observation, action=go_action,
+                           accepted=_env_step_accepted(step_result))
             commands = list(step_result.admissible_commands)
             if step_result.done and not step_result.won:
                 return resolved, commands, False
@@ -1054,7 +1071,8 @@ def _controlled_acquire_replay_setup(
             opened = False
             for _attempt in range(2):
                 step_result = env.step(open_action)
-                tracker.update(step_result.observation)
+                tracker.update(step_result.observation, action=open_action,
+                               accepted=_env_step_accepted(step_result))
                 commands = list(step_result.admissible_commands)
                 if step_result.done and not step_result.won:
                     return resolved, commands, False
@@ -1107,9 +1125,9 @@ def _target_effects_of(task_type: str, goal: str = "",
         associated and re.search(r"\b(?:examine|look at)\b", text))
     if is_observation_goal:
         return [
-            {"predicate": "object.toggled",
-             "args": {"object": "$associated_entity"}},
-            {"predicate": "agent.holds", "args": {"object": "$object"}},
+            {"predicate": "object.observed_with",
+             "args": {"object": "$object",
+                      "associated_entity": "$associated_entity"}},
         ]
 
     has_destination = bool(
@@ -1334,7 +1352,7 @@ def _parse_action_params(action: str) -> dict[str, Any]:
         params["cooling_station"] = cool_match.group(2).strip()
     use_match = re.match(r"use (.+)", action)
     if use_match:
-        params["light_source"] = use_match.group(1).strip()
+        params["associated_entity"] = use_match.group(1).strip()
     return params
 
 

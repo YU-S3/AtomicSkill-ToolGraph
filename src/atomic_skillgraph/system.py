@@ -14,7 +14,7 @@ from .adapters.benchmark import BenchmarkAdapter, Task
 from .atomicizer.trace_atomicizer import TraceAtomicizer
 from .core.config import SystemConfig
 from .core.llm import LLM
-from .core.status import ExecutionMode, SkillNodeKind, SkillStatus, ToolLifecycle
+from .core.status import EdgeType, ExecutionMode, SkillNodeKind, SkillStatus, ToolLifecycle
 from .core.trace_ir import (
     ActionRecord,
     AttemptRecord,
@@ -569,9 +569,12 @@ class AtomicSkillGraphSystem:
         """在同一环境 episode 中逐原子节点执行并局部降级。"""
         resume: dict[str, Any] | None = None
         last_result: Any = None
+        shared_bindings = dict(task.context.get("params") or {})
         for index, planned in enumerate(plan.nodes):
             node = runtime_graph.nodes[index]
             before = dict((resume or {}).get("state") or task.state or {})
+            planned.params = _apply_runtime_data_bindings(
+                planned.params, planned.step_id, runtime_graph, shared_bindings)
             # A plan may initially contain a class-valued entity slot because a
             # concrete instance is still hidden. Once execution establishes an
             # instance identity, carry it through later DATA_FLOW edges.
@@ -811,6 +814,8 @@ class AtomicSkillGraphSystem:
                 if mode == ExecutionMode.DIRECT and node.impl_ref:
                     self._record_impl_feedback([node.impl_ref], passed)
                 if passed:
+                    _update_verified_runtime_bindings(
+                        task, planned, runtime_graph, shared_bindings, index)
                     node_succeeded = True
                     break
                 if result.success:
@@ -1058,12 +1063,17 @@ class AtomicSkillGraphSystem:
             stats = dict(obj.metadata.get("statistics") or {})
             # 这一层记录实际路径的 task-level 证据；节点级 attempt 统计仍独立。
             stats["task_use_count"] = int(stats.get("task_use_count", 0)) + 1
+            stats["use_count"] = int(stats.get("use_count", 0)) + 1
             if success:
                 stats["task_success_count"] = int(stats.get("task_success_count", 0)) + 1
+                stats["execution_success_count"] = int(
+                    stats.get("execution_success_count", 0)) + 1
             else:
                 stats["task_failure_count"] = int(stats.get("task_failure_count", 0)) + 1
-            total = int(stats.get("task_use_count", 0))
-            empirical = int(stats.get("task_success_count", 0)) / max(total, 1)
+                stats["execution_failure_count"] = int(
+                    stats.get("execution_failure_count", 0)) + 1
+            total = int(stats.get("use_count", 0))
+            empirical = int(stats.get("execution_success_count", 0)) / max(total, 1)
             old = float(stats.get("utility", 0.5))
             stats["utility"] = round(0.5 * old + 0.5 * empirical, 4)
             obj.metadata["statistics"] = stats
@@ -1231,6 +1241,78 @@ def _remap_location_binding(binding: dict[str, Any], entity_role: str,
     if entity in (None, "") or location in (None, ""):
         return {}
     return {str(entity_role): entity, str(location_role): location}
+
+
+def _apply_runtime_data_bindings(params: dict[str, Any], step_id: str,
+                                 runtime_graph: RuntimeGraph,
+                                 shared: dict[str, Any]) -> dict[str, Any]:
+    """Ground a node from verified upstream occurrence data.
+
+    Explicit DATA_FLOW mappings take precedence.  Shared same-role bindings are
+    a fallback for an ordinary single-entity task and never replace a concrete
+    instance with another instance.
+    """
+    refined = dict(params or {})
+    by_step = {node.step_id: node for node in runtime_graph.nodes}
+    for edge in runtime_graph.edges:
+        if edge.target_step != step_id or edge.type != EdgeType.DATA_FLOW:
+            continue
+        source = by_step.get(edge.source_step)
+        if source is None or not source.passed:
+            continue
+        source_role = str((edge.mapping or {}).get("source_output") or "")
+        target_role = str((edge.mapping or {}).get("target_input") or "")
+        value = source.params.get(source_role)
+        if target_role and value not in (None, "") and (
+                refined.get(target_role) in (None, "")
+                or _runtime_binding_can_refine(refined.get(target_role), value)):
+            refined[target_role] = value
+    for role, value in shared.items():
+        if role not in refined or value in (None, ""):
+            continue
+        if _runtime_binding_can_refine(refined.get(role), value):
+            refined[role] = value
+    return refined
+
+
+def _update_verified_runtime_bindings(task: Task, planned: Any,
+                                      runtime_graph: RuntimeGraph,
+                                      shared: dict[str, Any], index: int) -> None:
+    """Commit concrete bindings only after the current Atomic validates."""
+    cardinality = max(
+        [max(1, int(effect.get("cardinality", 1) or 1))
+         for effect in task.target_effects if isinstance(effect, dict)] or [1])
+    for role, value in dict(planned.params or {}).items():
+        if value in (None, "") or str(value).startswith("$"):
+            continue
+        current = shared.get(role)
+        if current in (None, "") or _runtime_binding_can_refine(current, value):
+            # A cardinality workflow deliberately selects a new entity on each
+            # branch.  Its identity is carried by DATA_FLOW edges, not a global
+            # task binding that would force all branches to reuse object one.
+            if cardinality > 1 and role in {"object", "object_location"}:
+                continue
+            shared[role] = value
+
+    # Eagerly propagate mapped outputs so a later node is already concrete
+    # before Tool selection and controlled location discovery.
+    source_step = planned.step_id
+    for edge in runtime_graph.edges:
+        if edge.source_step != source_step or edge.type != EdgeType.DATA_FLOW:
+            continue
+        source_role = str((edge.mapping or {}).get("source_output") or "")
+        target_role = str((edge.mapping or {}).get("target_input") or "")
+        value = planned.params.get(source_role)
+        if not target_role or value in (None, ""):
+            continue
+        for future in runtime_graph.plan.nodes[index + 1:]:
+            if future.step_id != edge.target_step:
+                continue
+            if (future.params.get(target_role) in (None, "")
+                    or _runtime_binding_can_refine(
+                        future.params.get(target_role), value)):
+                future.params[target_role] = value
+            break
 
 
 def _ground_env_runtime_params(
