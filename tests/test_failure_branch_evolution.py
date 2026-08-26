@@ -202,6 +202,35 @@ def test_successful_atomic_is_not_penalized_by_downstream_task_failure(workspace
     assert stats["task_failure_count"] == 1
 
 
+def test_repeated_generator_failures_do_not_suppress_verified_contract(
+        workspace_tmp):
+    root = workspace_tmp / "contract_governance"
+    registry, _tools, atomic, _tool = _bank(root)
+    config = SystemConfig(data_dir=root)
+    shell = AtomicSkillGraphSystem.__new__(AtomicSkillGraphSystem)
+    shell.config = config
+    shell.registry = registry
+
+    for index in range(5):
+        trace = TraceRecord(
+            trace_id=f"generator_failure_{index}", task_id=f"failed_{index}",
+            task_type="toy", benchmark="toy_env", success=False,
+            realized_atomic_nodes=[{
+                "ref": str(atomic.ref), "passed": False,
+                "attempts": [{"mode": "seeded", "passed": False},
+                             {"mode": "dynamic", "passed": False}],
+            }],
+        )
+        shell._update_skill_evidence(trace, success=False)
+
+    saved = registry.get(atomic.ref)
+    assert saved.status == SkillStatus.ACTIVE
+    assert saved.metadata["statistics"]["execution_failure_count"] == 5
+    reviews = saved.metadata.get("governance_reviews") or []
+    assert reviews
+    assert reviews[-1]["decision"] == "retain_abstract_contract"
+
+
 def test_seeded_failure_dynamic_rescue_evolves_atomic_in_isolated_branch(workspace_tmp):
     root = workspace_tmp / "data"
     registry, tools, atomic, _tool = _bank(root)

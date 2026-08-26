@@ -177,6 +177,9 @@ class EnvRunResult:
     atomic_complete: bool = False
     # API/网络/超时异常属于基础设施证据，不与任务动作失败混在一起。
     infrastructure_errors: list[dict[str, Any]] = field(default_factory=list)
+    # Non-error runtime interventions (cycle recovery, bounded discovery, etc.)
+    # are persisted separately so failures remain attributable.
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -194,6 +197,7 @@ class EnvRunResult:
             "current_admissible": self.current_admissible,
             "atomic_complete": self.atomic_complete,
             "infrastructure_errors": self.infrastructure_errors,
+            "diagnostics": self.diagnostics,
         }
 
 

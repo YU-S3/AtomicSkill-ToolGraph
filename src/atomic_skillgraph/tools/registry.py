@@ -81,6 +81,14 @@ class ToolRegistry:
                 for tid in tool.provenance.get("source_trace_ids") or []:
                     if tid not in sources:
                         sources.append(tid)
+                # Independent successful source traces are the canonical Tool
+                # support evidence.  A shadow executable can later pass
+                # admission under the same immutable ref; max-merging two
+                # freshly compiled ``support_count=1`` records used to leave it
+                # at one even though provenance already contained two traces,
+                # preventing lifecycle activation and Direct reuse.
+                tool.statistics["support_count"] = max(
+                    int(tool.statistics.get("support_count", 0)), len(sources))
                 task_types = list(prior.provenance.get("source_task_types") or [])
                 for task_type in tool.provenance.get("source_task_types") or []:
                     if task_type not in task_types:

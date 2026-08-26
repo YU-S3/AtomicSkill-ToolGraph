@@ -443,6 +443,8 @@ class AtomicSkillGraphSystem:
         trace.provenance["params"] = dict(task.context.get("params") or {})
         trace.provenance["semantic_params"] = dict(
             task.context.get("semantic_params") or task.context.get("params") or {})
+        trace.metrics["planning_audit"] = _build_planning_audit(
+            task, plan, self.registry)
         runtime_graph = RuntimeGraph(task.task_id, plan)
         self._last_runtime_graph = runtime_graph
 
@@ -572,6 +574,17 @@ class AtomicSkillGraphSystem:
         shared_bindings = dict(task.context.get("params") or {})
         for index, planned in enumerate(plan.nodes):
             node = runtime_graph.nodes[index]
+            routing_audit: dict[str, Any] = {
+                "step_id": planned.step_id,
+                "node_ref": str(planned.ref),
+                "source": planned.source,
+                "dynamic": bool(planned.dynamic),
+                "initial_params": dict(planned.params),
+                "target_effects": list(planned.target_effects or []),
+                "implementation_candidates": [],
+            }
+            trace.metrics.setdefault("execution_routing", []).append(
+                routing_audit)
             node_start_actions = len((resume or {}).get("actions") or [])
             node_deadline = (int(self.config.max_steps) if planned.dynamic else min(
                 int(self.config.max_steps),
@@ -703,6 +716,20 @@ class AtomicSkillGraphSystem:
                             for template in item.tool.artifact.get("steps") or []:
                                 steps.append({"template": str(template),
                                               "params": dict(item.parameters)})
+                    routing_audit["implementation_candidates"].append({
+                        "implementation_ref": str(implementation.ref),
+                        "implementation_status": implementation.status.value,
+                        "resolved_tools": [{
+                            **item.to_dict(),
+                            "tool_status": (item.tool.status.value
+                                            if item.tool is not None else "missing"),
+                            "tool_usable": bool(item.tool is not None
+                                                and item.tool.is_usable()),
+                        } for item in resolved],
+                        "direct_gate": gate.to_dict(),
+                        "tool_validation": tool_checks,
+                        "direct_step_count": len(steps),
+                    })
                     if steps:
                         direct_payload = payload
                         node.impl_ref = str(implementation.ref)
@@ -739,6 +766,10 @@ class AtomicSkillGraphSystem:
                         candidates.append((ExecutionMode.SEEDED, guideline, []))
             # dynamic 是每个节点最终兜底；动态 gap 直接从这里开始。
             candidates.append((ExecutionMode.DYNAMIC, "", []))
+            routing_audit["candidate_modes"] = [mode.value
+                                                for mode, _, _ in candidates]
+            routing_audit["params_after_discovery"] = dict(planned.params)
+            routing_audit["location_discovered"] = bool(location_discovered)
 
             node_succeeded = False
             for mode, seed_context, steps in candidates:
@@ -764,6 +795,11 @@ class AtomicSkillGraphSystem:
                     phase_goal=_phase_goal_of(atomic, effects, planned.params),
                 )
                 last_result = result
+                if getattr(result, "diagnostics", None):
+                    routing_audit.setdefault("runtime_diagnostics", []).append({
+                        "mode": mode.value,
+                        "diagnostics": copy.deepcopy(result.diagnostics),
+                    })
                 after_payload = _env_resume_payload(result)
                 after = dict(after_payload.get("state") or attempt_before)
                 # Seeded/Dynamic agents can discover an initially unbound
@@ -833,6 +869,10 @@ class AtomicSkillGraphSystem:
                 node.fallback_reason = str(result.failure_type or "effect_not_met")
                 if not resume.get("admissible"):
                     break
+
+            routing_audit["attempts"] = [dict(item) for item in node.attempts]
+            routing_audit["final_passed"] = bool(node_succeeded)
+            routing_audit["fallback_reason"] = str(node.fallback_reason or "")
 
             if last_result is not None and last_result.success:
                 break
@@ -933,6 +973,15 @@ class AtomicSkillGraphSystem:
         if getattr(result, "infrastructure_errors", None):
             trace.metrics["infrastructure_errors"] = [
                 dict(item) for item in result.infrastructure_errors]
+        if getattr(result, "diagnostics", None):
+            runtime_diagnostics = trace.metrics.setdefault(
+                "runtime_diagnostics", {})
+            for key, value in dict(result.diagnostics).items():
+                if isinstance(value, list):
+                    runtime_diagnostics.setdefault(key, []).extend(
+                        copy.deepcopy(value))
+                else:
+                    runtime_diagnostics[key] = copy.deepcopy(value)
         trace.retries = sum(max(0, len(node.attempts) - 1)
                             for node in runtime_graph.nodes)
         trace.benchmark_result = {"passed": trace.success}
@@ -1085,7 +1134,24 @@ class AtomicSkillGraphSystem:
                     and failures >= failure_threshold
                     and stats["utility"] < float(
                         self.config.thresholds.retirement_utility)):
-                obj.status = SkillStatus.SUPPRESSED
+                # A failed Seeded/Dynamic attempt is evidence about the current
+                # executor, bindings or plan, not evidence that the verified
+                # declarative Atomic contract is harmful.  Suppressing the
+                # Abstract node here removes the only target producer from
+                # frozen planning and creates a self-reinforcing all-Dynamic
+                # fallback.  Keep the contract retrievable and record a
+                # governance review; executable Tool/Implementation failures
+                # are governed independently from actual Direct calls.
+                reviews = list(obj.metadata.get("governance_reviews") or [])
+                reviews.append({
+                    "trace_id": trace.trace_id,
+                    "decision": "retain_abstract_contract",
+                    "reason": "execution_failure_is_not_contract_invalidation",
+                    "use_count": total,
+                    "execution_failure_count": failures,
+                    "utility": stats["utility"],
+                })
+                obj.metadata["governance_reviews"] = reviews[-50:]
             self.registry.update_runtime_state(obj)
 
         if trace.selected_composite:
@@ -1123,6 +1189,65 @@ class AtomicSkillGraphSystem:
             "skill_graph": self.registry.stats(),
             "tool_repo": self.tool_registry.stats(),
         }
+
+
+def _build_planning_audit(task: Task, plan: Any,
+                          registry: SkillGraphRegistry) -> dict[str, Any]:
+    """Persist why a target was reusable, excluded, or made Dynamic."""
+    aliases = {
+        "object.in_receptacle": "object.at_location",
+        "object.in_container": "object.at_location",
+    }
+
+    def predicates(items: list[dict[str, Any]]) -> list[str]:
+        return sorted({
+            aliases.get(str(item.get("predicate") or ""),
+                        str(item.get("predicate") or ""))
+            for item in items if isinstance(item, dict) and item.get("predicate")
+        })
+
+    targets = predicates(list(task.target_effects or []))
+    producers: list[dict[str, Any]] = []
+    for obj in registry.list_by_kind(SkillNodeKind.ABSTRACT_ATOMIC):
+        effects = predicates(list(getattr(obj, "effects", []) or []))
+        overlap = sorted(set(targets) & set(effects))
+        if not overlap:
+            continue
+        producers.append({
+            "ref": str(obj.ref),
+            "status": obj.status.value,
+            "effects": effects,
+            "target_overlap": overlap,
+            "support_count": int(
+                (obj.metadata.get("statistics") or {}).get("support_count", 0)),
+        })
+
+    nodes: list[dict[str, Any]] = []
+    for planned in plan.nodes:
+        atomic = (None if planned.dynamic else
+                  registry.get(planned.ref)
+                  or registry.get_recommended(planned.ref.logical_id))
+        nodes.append({
+            "step_id": planned.step_id,
+            "ref": str(planned.ref),
+            "source": planned.source,
+            "dynamic": bool(planned.dynamic),
+            "params": dict(planned.params),
+            "target_effects": list(planned.target_effects or []),
+            "atomic_status": (atomic.status.value if atomic is not None else ""),
+            "inputs": list(getattr(atomic, "inputs", []) or []),
+            "preconditions": list(getattr(atomic, "preconditions", []) or []),
+            "effects": list(getattr(atomic, "effects", []) or []),
+        })
+    return {
+        "target_effects": list(task.target_effects or []),
+        "target_predicates": targets,
+        "start_mode": plan.start_mode,
+        "notes": list(plan.notes or []),
+        "selected_composite": str(plan.composite_ref or ""),
+        "planned_nodes": nodes,
+        "registered_target_producers_all_statuses": producers,
+    }
 
 
 def _env_resume_payload(result: Any) -> dict[str, Any]:

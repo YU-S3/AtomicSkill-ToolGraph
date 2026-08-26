@@ -703,3 +703,49 @@ def test_env_episode_preserves_won_when_final_effect_is_met():
     assert result.success is True
     assert result.atomic_complete is True
     assert result.steps == 1
+
+
+def test_action_cycle_gets_bounded_agent_recovery_before_failure():
+    class _CycleEnv:
+        def step(self, action: str):
+            won = action == "go to shelf 1"
+            return type("_StepResult", (), {
+                "observation": "You arrive at shelf 1." if won else "You see the desk 1.",
+                "score": 1.0 if won else 0.0,
+                "done": won,
+                "won": won,
+                "admissible_commands": ["examine desk 1", "go to shelf 1"],
+            })()
+
+    class _CycleAwareLLM:
+        def generate(self, *, input_text, **_kwargs):
+            action = ("go to shelf 1" if "Runtime cycle recovery" in input_text
+                      else "examine desk 1")
+            return type("_Resp", (), {
+                "text": f"Act: {action}", "prompt_tokens": 0,
+                "completion_tokens": 0, "total_tokens": 0,
+                "latency_ms": 0.0, "provider": "stub", "model": "stub",
+            })()
+
+    adapter = AlfWorldAdapter()
+    adapter._current_env = _CycleEnv()
+    task = Task(task_id="cycle_recovery", benchmark="alfworld",
+                task_type="generic", goal="reach the useful location",
+                context={"env_index": 0})
+    resume = {
+        "observation": "You see the desk 1.",
+        "admissible": ["examine desk 1", "go to shelf 1"],
+        "actions": [], "states": [{"step": 0, "state": {
+            "facts": [], "inventory": [], "meta": {}}}],
+        "state": {"facts": [], "inventory": [], "meta": {}},
+    }
+
+    result = adapter.run_env_episode(
+        task, _CycleAwareLLM(), resume=resume, max_steps=20)
+
+    assert result.success is True
+    assert result.failure_type == ""
+    assert result.actions[-1]["name"] == "go to shelf 1"
+    events = result.diagnostics.get("action_cycle_events") or []
+    assert len(events) == 1
+    assert events[0]["recovery_allowed"] is True

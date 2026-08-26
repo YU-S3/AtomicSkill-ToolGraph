@@ -188,3 +188,24 @@ def test_tool_registry_rejects_same_version_with_different_executable(
     with pytest.raises(ValueError, match="immutable_tool_version_collision"):
         registry.register(replacement)
     assert registry.get(tool.ref).artifact == tool.artifact
+
+
+def test_same_tool_ref_counts_independent_provenance_as_support(workspace_tmp):
+    actions = ["go to countertop 1", "take mug 1 from countertop 1"]
+    first = mine_action_template_tools(
+        _trace("support_trace_one", actions),
+        [_acquire_segment("mug 1", "countertop 1", actions)],
+    )[0]
+    second = copy.deepcopy(first)
+    second.provenance["source_trace_ids"] = ["support_trace_two"]
+    second.provenance["source_task_types"] = ["another_task"]
+    second.statistics["support_count"] = 1
+
+    registry = ToolRegistry(workspace_tmp / "support_tools")
+    registry.register(first)
+    registry.register(second)
+    saved = registry.get(first.ref)
+
+    assert saved.statistics["support_count"] == 2
+    assert saved.provenance["source_trace_ids"] == [
+        "support_trace_one", "support_trace_two"]

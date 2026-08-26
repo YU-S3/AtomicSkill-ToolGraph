@@ -560,6 +560,9 @@ class AlfWorldAdapter:
         # 下一个（与 FlowEvo executor 的 3 连败保护对齐），避免空烧步数
         llm_error_streak = 0
         max_llm_errors = max(1, int(getattr(self, "llm_max_consecutive_errors", 1)))
+        cycle_recoveries = 0
+        max_cycle_recoveries = max(0, int(getattr(
+            self, "max_action_cycle_recoveries", 2)))
         # 原地降级：步数预算扣除上一阶段已消耗的步数
         remaining_steps = max(0, int(max_steps) - result.steps)
         local_env_steps = 0
@@ -647,6 +650,33 @@ class AlfWorldAdapter:
             last_actions.append(action)
             if len(last_actions) >= 12 and _has_cycle(last_actions,
                                                       cycle_len=3, repeats=3):
+                cycle_window = list(last_actions[-9:])
+                result.diagnostics.setdefault("action_cycle_events", []).append({
+                    "action_count": len(result.actions),
+                    "cycle_actions": cycle_window,
+                    "recovery_index": cycle_recoveries + 1,
+                    "recovery_allowed": cycle_recoveries < max_cycle_recoveries,
+                })
+                if cycle_recoveries < max_cycle_recoveries:
+                    cycle_recoveries += 1
+                    # Preserve the real environment state and ask the Agent to
+                    # choose a different admissible branch.  The framework does
+                    # not invent an action or use task-type knowledge.
+                    prompt = _build_step_user(
+                        active_goal, obs, admissible,
+                        action_history=action_history,
+                        observation_history=observation_history,
+                        skill_context=_compact_seed_context(seed_context),
+                        checked_locations=_checked_locations(tracker),
+                    ) + (
+                        "\n\nRuntime cycle recovery: the following recent action "
+                        "sequence repeated without satisfying the current goal: "
+                        f"{cycle_window}. Choose a DIFFERENT admissible action or "
+                        "a different object/location branch. Do not repeat this "
+                        "sequence."
+                    )
+                    last_actions.clear()
+                    continue
                 result.failure_type = "action_cycle"
                 break
             # 重建 prompt（带最近 10 步历史，与 FlowEvo 一致）；
