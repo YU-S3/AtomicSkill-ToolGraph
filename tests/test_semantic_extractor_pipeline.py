@@ -683,6 +683,47 @@ def test_task_target_role_cannot_hide_observed_acquire_source_role():
     assert phases[0]["replay_safe"] is True
 
 
+def test_phase_validation_never_promotes_observation_to_action_effect():
+    """A visit reveals object location but only produces agent location."""
+    trace = TraceRecord(
+        trace_id="origin_aware_visit", task_id="origin_aware_visit",
+        task_type="generic", task_goal="find and later move the mug",
+        benchmark="env", success=True,
+        actions=[ActionRecord(
+            step=0, name="go to countertop 1",
+            params={"object_location": "countertop 1"})],
+        state_snapshots=[
+            {"step": 0, "state": {"facts": [], "inventory": [], "meta": {
+                "last_observed_facts": []}}},
+            {"step": 1, "state": {
+                "facts": ["agent_at(countertop_1)", "object_exists(mug_1)",
+                          "object_at(mug_1, countertop_1)"],
+                "inventory": [], "meta": {"last_observed_facts": [
+                    "object_exists(mug_1)",
+                    "object_at(mug_1, countertop_1)"]}}},
+        ],
+        provenance={"params": {"object": "mug",
+                                "object_location": "countertop 1"}},
+    )
+    events = build_structured_events(trace)
+    phases, errors = validate_phase_proposal(trace, events, {"phases": [{
+        "phase_id": "visit", "intent": "navigate_to_location",
+        "event_start": 0, "event_end": 0,
+        "parameter_roles": {"object": "mug 1",
+                            "object_location": "countertop 1"},
+        "effect_predicates": ["agent_at"],
+        "precondition_predicates": [],
+    }]})
+
+    assert errors == []
+    assert len(phases) == 1
+    assert phases[0]["effect"] == [
+        {"predicate": "agent_at", "args": {"arg0": "countertop_1"}}]
+    assert not any(item["predicate"] == "object.at_location"
+                   for item in phases[0]["effect"])
+    assert phases[0]["params"] == {"object_location": "countertop 1"}
+
+
 def test_composite_is_draft_then_promoted_by_independent_trace(workspace_tmp):
     registry = SkillGraphRegistry(workspace_tmp / "graph")
     acquire = _atomic("env.acquire", [], [{"predicate": "agent.holds", "args": {"object": "$inputs.object"}}],

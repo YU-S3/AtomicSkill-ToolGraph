@@ -49,12 +49,33 @@ _NOISE_FAMILIES = {"location_checked"}
 
 
 def extract_effect(before: dict[str, Any], after: dict[str, Any],
-                   bound_params: dict[str, Any] | None = None) -> ExtractedEffect:
-    """从前后状态快照提取 Effect + I/O + 前置条件 + 节点验证器。"""
+                   bound_params: dict[str, Any] | None = None, *,
+                   positive_effects: list[dict[str, Any]] | None = None,
+                   negative_effects: list[dict[str, Any]] | None = None,
+                   ) -> ExtractedEffect:
+    """从状态证据提取 Effect + I/O + 前置条件 + 节点验证器。
+
+    ``positive_effects``/``negative_effects`` are the authoritative transition
+    deltas when the adapter has already classified event origin.  Re-diffing
+    the snapshots in that case is unsound for partially observable
+    environments: facts discovered by an observation exist in ``after`` but
+    were not produced by the action.  Callers without origin-aware event data
+    may omit the arguments and retain the legacy snapshot-diff behaviour.
+    """
     bound_params = bound_params or {}
     before_snapshot = StateSnapshot(before)
     after_snapshot = StateSnapshot(after)
-    positive, negative = compute_effects(before_snapshot, after_snapshot)
+    if positive_effects is None or negative_effects is None:
+        computed_positive, computed_negative = compute_effects(
+            before_snapshot, after_snapshot)
+    else:
+        computed_positive, computed_negative = [], []
+    positive = [dict(item) for item in (
+        computed_positive if positive_effects is None else positive_effects)
+                if isinstance(item, dict)]
+    negative = [dict(item) for item in (
+        computed_negative if negative_effects is None else negative_effects)
+                if isinstance(item, dict)]
     # Keep genuine state transitions. Goal-relative slicing decides whether a
     # movement is a capability or merely setup/exploration.
     positive = [p for p in positive if _family_of(p) not in _NOISE_FAMILIES]

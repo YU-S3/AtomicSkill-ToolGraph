@@ -266,6 +266,56 @@ def build_structured_events(trace: TraceRecord) -> list[dict[str, Any]]:
     return events
 
 
+def _extract_origin_aware_effect(events: list[dict[str, Any]], start: int,
+                                 end: int,
+                                 params: dict[str, Any]) -> Any:
+    """Materialize a phase contract without losing transition provenance.
+
+    Structured events are the source of truth for action-caused deltas.  Their
+    ``observed_effects`` are intentionally excluded here: newly visible facts
+    may be used as knowledge by the runtime, but they are not capabilities
+    produced by the action that revealed them.
+    """
+    positive: list[dict[str, Any]] = []
+    negative: list[dict[str, Any]] = []
+    positive_keys: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
+    negative_keys: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
+
+    for event in events[start:end + 1]:
+        if not bool(event.get("accepted", True)):
+            continue
+        for raw in event.get("negative_effects") or []:
+            if not isinstance(raw, dict):
+                continue
+            inner = raw.get("not") if isinstance(raw.get("not"), dict) else raw
+            key = _predicate_key(inner)
+            positive = [item for item in positive
+                        if _predicate_key(item) != key]
+            positive_keys.discard(key)
+            if key not in negative_keys:
+                negative.append(dict(raw))
+                negative_keys.add(key)
+        for raw in event.get("positive_effects") or []:
+            if not isinstance(raw, dict):
+                continue
+            key = _predicate_key(raw)
+            retained_negative: list[dict[str, Any]] = []
+            for item in negative:
+                inner = (item.get("not")
+                         if isinstance(item.get("not"), dict) else item)
+                if _predicate_key(inner) != key:
+                    retained_negative.append(item)
+            negative = retained_negative
+            negative_keys.discard(key)
+            if key not in positive_keys:
+                positive.append(dict(raw))
+                positive_keys.add(key)
+
+    return extract_effect(
+        events[start]["before"], events[end]["after"], params,
+        positive_effects=positive, negative_effects=negative)
+
+
 def _split_overmerged_phase_proposals(
         events: list[dict[str, Any]], proposal: dict[str, Any]) -> dict[str, Any]:
     """Split a proposed macro at independently observed Effect producers."""
@@ -367,7 +417,7 @@ def validate_phase_proposal(trace: TraceRecord, events: list[dict[str, Any]],
         params.update(_infer_execution_location_roles(
             events, start, evidence_end if evidence_end is not None else end,
             params, semantic_core_names))
-        effect = extract_effect(events[start]["before"], events[end]["after"], params)
+        effect = _extract_origin_aware_effect(events, start, end, params)
         declared_aligned = True
         if declared:
             matched = [item for item in effect.positive
@@ -397,7 +447,7 @@ def validate_phase_proposal(trace: TraceRecord, events: list[dict[str, Any]],
             events, start, end, core_names, core_effects=effect.positive)
         if trimmed_end is not None and trimmed_end < end:
             end = trimmed_end
-            effect = extract_effect(events[start]["before"], events[end]["after"], params)
+            effect = _extract_origin_aware_effect(events, start, end, params)
             effect.positive = [item for item in effect.positive
                                if str(item.get("predicate")) in core_names]
             # ``extract_effect`` assigns its family before the semantic filter.
@@ -419,8 +469,8 @@ def validate_phase_proposal(trace: TraceRecord, events: list[dict[str, Any]],
         core_index = int(slice_diagnostics.get("core_event_index", end))
         # Recompute I/O, Preconditions and Validator from the canonical role
         # contract, then retain only the already evidence-validated core Effect.
-        canonical_effect = extract_effect(
-            events[core_index]["before"], events[core_index]["after"], params)
+        canonical_effect = _extract_origin_aware_effect(
+            events, core_index, core_index, params)
         canonical_effect.positive = [item for item in canonical_effect.positive
                                      if str(item.get("predicate")) in core_names]
         if "precondition_predicates" in raw:
