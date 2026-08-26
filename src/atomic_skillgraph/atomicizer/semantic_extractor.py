@@ -30,6 +30,11 @@ workflow. Your input is one successful trace normalized into structured events. 
 the executed action, grounded arguments, the state immediately before and after it, positive and
 negative state deltas, acceptance, and execution provenance.
 
+The adapter separates positive_effects (world transitions attributable to the accepted action) from
+observed_effects (pre-existing facts newly revealed by perception). observed_effects may justify a
+later external Precondition or setup search, but they are not capability Effects and must never define
+an Atomic occurrence or be copied into effect_predicates.
+
 Discover the smallest sufficient set of reusable Atomic capability occurrences from this evidence.
 An Atomic occurrence is an independently meaningful and independently verifiable state transition
 with a coherent intent, explicit external inputs/outputs, and a minimal causal action subsequence.
@@ -56,6 +61,11 @@ that the core action depends on it. In effect_predicates, copy only predicate na
 present in the structured state deltas, without arguments. Never invent an action, entity, parameter,
 state, Effect, Tool, Skill, or dependency.
 
+In precondition_predicates, list only predicates whose truth is semantically necessary for the core
+transition to be executable, not every fact that happened to be true beforehand. Incidental results
+of earlier operations must be excluded. Code accepts only listed predicates that are actually
+witnessed and grounded in the core event's before state.
+
 Return ONLY JSON:
 {
   "phases": [
@@ -66,6 +76,7 @@ Return ONLY JSON:
       "event_end": 3,
       "parameter_roles": {"semantic_role": "observed value"},
       "effect_predicates": ["predicate.name.copied.from.event"],
+      "precondition_predicates": ["necessary.predicate.from.before.state"],
       "rationale": "why this range is one capability"
     }
   ],
@@ -75,6 +86,7 @@ Return ONLY JSON:
 }
 
 Requirements: ranges must be valid, non-overlapping and ordered; effect_predicates must be non-empty;
+precondition_predicates must be present (it may be an empty list);
 prefer the fewest independently verifiable occurrences sufficient for the goal; do not infer success or
 atomicity merely from action wording.
 """
@@ -225,6 +237,14 @@ def build_structured_events(trace: TraceRecord) -> list[dict[str, Any]]:
         before = snapshots[index] if index < len(snapshots) else {}
         after = snapshots[index + 1] if index + 1 < len(snapshots) else before
         positive, negative = compute_effects(StateSnapshot(before), StateSnapshot(after))
+        observed_predicates = [
+            predicate for fact in ((after.get("meta") or {}).get(
+                "last_observed_facts") or [])
+            if (predicate := _fact_to_predicate(str(fact))) is not None
+        ]
+        observed_keys = {repr(item) for item in observed_predicates}
+        causal_positive = [item for item in positive
+                           if repr(item) not in observed_keys]
         events.append({
             "event_index": index,
             "step": int(action.get("step", index)),
@@ -237,9 +257,11 @@ def build_structured_events(trace: TraceRecord) -> list[dict[str, Any]]:
             "tool_ref": str(action.get("tool_ref") or ""),
             "before": before,
             "after": after,
-            "positive_effects": positive,
+            "positive_effects": causal_positive,
+            "observed_effects": observed_predicates,
             "negative_effects": negative,
-            "state_changed": bool(positive or negative),
+            "state_changed": bool(causal_positive or negative),
+            "observation_changed": bool(observed_predicates),
         })
     return events
 
@@ -401,6 +423,21 @@ def validate_phase_proposal(trace: TraceRecord, events: list[dict[str, Any]],
             events[core_index]["before"], events[core_index]["after"], params)
         canonical_effect.positive = [item for item in canonical_effect.positive
                                      if str(item.get("predicate")) in core_names]
+        if "precondition_predicates" in raw:
+            declared_preconditions = {
+                _declared_predicate_name(item)
+                for item in (raw.get("precondition_predicates") or [])
+            }
+            declared_preconditions.discard("")
+            canonical_effect.preconditions = [
+                item for item in canonical_effect.preconditions
+                if str(item.get("predicate") or "") in declared_preconditions
+            ]
+            canonical_effect.validator["pre_checks"] = sorted({
+                str(item.get("predicate") or "")
+                for item in canonical_effect.preconditions
+                if item.get("predicate")
+            })
         canonical_effect.validator["post_checks"] = sorted(core_names)
         if canonical_effect.positive:
             _refresh_effect_identity(canonical_effect)
@@ -719,6 +756,7 @@ def _compact_event(event: dict[str, Any]) -> dict[str, Any]:
         "event_index": event["event_index"], "action": event["action"],
         "params": event["params"], "accepted": event["accepted"],
         "mode": event["mode"], "positive_effects": event["positive_effects"],
+        "observed_effects": event.get("observed_effects") or [],
         "negative_effects": event["negative_effects"],
         "before_facts": list(event["before"].get("facts") or []),
         "after_facts": list(event["after"].get("facts") or []),

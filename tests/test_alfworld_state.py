@@ -206,7 +206,11 @@ def test_structured_events_expose_take_heat_place_effects():
     take = by_action["take mug 2 from countertop 1"]
     heat = by_action["heat mug 2 with microwave 1"]
     place = by_action["move mug 2 to coffeemachine 1"]
+    visit = by_action["go to countertop 1"]
 
+    assert {item["predicate"] for item in visit["positive_effects"]} == {"agent_at"}
+    assert {item["predicate"] for item in visit["observed_effects"]} == {
+        "object.exists", "object.at_location"}
     assert {item["predicate"] for item in take["positive_effects"]} == {"agent.holds"}
     assert any(item.get("not", {}).get("predicate") == "object.at_location"
                for item in take["negative_effects"])

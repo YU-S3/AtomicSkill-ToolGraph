@@ -42,6 +42,9 @@ thresholds:
   infrastructure_episode_retries: 2
   # 单条成功轨迹只产生 draft Composite；至少两条独立轨迹支持后才 active。
   composite_min_support: 2
+  # 防止一个错误 Atomic 或一种 fallback 模式耗尽整题交互预算。
+  env_node_max_steps: 30
+  env_attempt_max_steps: 15
 
 features:                             # 消融开关（实验入口可覆盖）
   enable_composite: true

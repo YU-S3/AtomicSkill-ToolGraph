@@ -66,12 +66,31 @@ def _io_names(io_list: list[dict[str, Any]]) -> set[str]:
     return {str(item.get("name", "")).lower() for item in io_list if item.get("name")}
 
 
+def _atomic_contract_compatible(left: AbstractAtomicSkill,
+                                right: AbstractAtomicSkill) -> bool:
+    """Hard merge gate for occurrence semantics.
+
+    Sharing a predicate name is insufficient: observing an existing relation
+    and producing that relation can expose different required roles.  Only
+    identical parameterized Effects and the same declared input/output role
+    interface may accumulate support under one immutable Atomic identity.
+    Preconditions are evidence refined across occurrences and are therefore
+    deliberately not part of this immutable gate.
+    """
+    return (
+        _norm_effects(left.effects) == _norm_effects(right.effects)
+        and _io_names(left.inputs) == _io_names(right.inputs)
+        and _io_names(left.outputs) == _io_names(right.outputs)
+    )
+
+
 def align_atomic(candidate: AbstractAtomicSkill, registry: SkillGraphRegistry) -> AlignDecision:
     """把 Atomic 候选对齐到已有 Abstract Atomic Skill（§37.1）。"""
     candidates = registry.list_by_kind(SkillNodeKind.ABSTRACT_ATOMIC)
     best: tuple[float, Any] | None = None
     for existing in candidates:
-        if existing.ref.logical_id == candidate.ref.logical_id:
+        compatible = _atomic_contract_compatible(candidate, existing)
+        if existing.ref.logical_id == candidate.ref.logical_id and compatible:
             best = (1.0, existing)
             break
         semantic = _overlap(_tokens(candidate.summary, *(candidate.guideline_rules())),
@@ -94,7 +113,10 @@ def align_atomic(candidate: AbstractAtomicSkill, registry: SkillGraphRegistry) -
         "effect_equivalent": _norm_effects(candidate.effects) == _norm_effects(existing.effects),
         "align_score": round(score, 3),
     }
-    matched = score >= 0.6 and evidence["effect_equivalent"]
+    evidence["contract_compatible"] = _atomic_contract_compatible(
+        candidate, existing)
+    matched = (score >= 0.6 and evidence["effect_equivalent"]
+               and evidence["contract_compatible"])
     return AlignDecision(matched=matched, matched_ref=str(existing.ref),
                          evidence=evidence, reason="semantic_plus_effect_match" if matched else "below_threshold")
 

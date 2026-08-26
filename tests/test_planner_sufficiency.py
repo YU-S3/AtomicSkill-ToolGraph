@@ -165,6 +165,22 @@ def test_dynamic_transformation_gap_is_inserted_before_delivery(workspace_tmp):
     assert predicates.index("object.heated") < predicates.index("object.at_location")
 
 
+def test_no_target_producer_never_executes_unrelated_top_hits(workspace_tmp):
+    registry = SkillGraphRegistry(workspace_tmp / "irrelevant_atomic_graph")
+    for atomic in (
+        _atomic("generic.cool", "object.cooled", ["object"]),
+        _atomic("generic.heat", "object.heated", ["object"]),
+        _atomic("generic.observe", "object.observed_with", ["object"]),
+    ):
+        registry.register(atomic)
+    simple = _task(params={"object": "mug", "target_location": "cabinet 1"})
+    simple.target_effects = [simple.target_effects[-1]]
+    plan = AtomicPlanner(registry, SystemConfig()).compile_runtime_graph(simple)
+    assert len(plan.nodes) == 1
+    assert plan.nodes[0].dynamic is True
+    assert plan.nodes[0].target_effects[0]["predicate"] == "object.at_location"
+
+
 def test_unbound_partial_composite_falls_back_to_atomic_plan(workspace_tmp):
     registry = _registry(workspace_tmp, include_complete=False)
     planner = AtomicPlanner(registry, SystemConfig())

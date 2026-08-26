@@ -7,6 +7,8 @@ Causal Trace Normalization → Candidate Boundary Detection → Effect Extractio
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -201,7 +203,9 @@ class TraceAtomicizer:
                     "independent_trace_count": 1,
                 },
             },
-            status=SkillStatus.ACTIVE,
+            # One successful occurrence is a candidate, not yet reusable
+            # frozen knowledge. Independent trace support promotes it below.
+            status=SkillStatus.DRAFT,
         )
 
     # ------------------------------------------------------------------
@@ -230,11 +234,19 @@ class TraceAtomicizer:
                 # ``$inputs.object`` contract in Full runs.
                 collision = self.registry.get(candidate.skill.ref)
                 if collision is not None:
-                    self._merge_evidence(collision, candidate.skill, trace)
-                    self.registry.update_runtime_state(collision)
-                    candidate.skill = collision
-                    result.decisions[candidate_index] = "reuse_contract_collision"
-                    continue
+                    # Same generated name with an incompatible I/O/Effect
+                    # contract must remain a separate capability instead of
+                    # corrupting the first immutable node.
+                    signature = json.dumps({
+                        "inputs": candidate.skill.inputs,
+                        "outputs": candidate.skill.outputs,
+                        "effects": candidate.skill.effects,
+                    }, sort_keys=True, ensure_ascii=False)
+                    suffix = hashlib.sha256(signature.encode("utf-8")).hexdigest()[:8]
+                    candidate.skill.ref = SkillRef(
+                        f"{candidate.skill.ref.logical_id}__{suffix}",
+                        candidate.skill.ref.version)
+                    result.decisions[candidate_index] = "add_contract_variant"
                 self.registry.register(candidate.skill)
                 score = float(candidate.alignment.evidence.get("align_score", 0.0))
                 if candidate.alignment.matched_ref and score >= 0.3:
@@ -255,14 +267,16 @@ class TraceAtomicizer:
             if label not in labels:
                 labels.append(label)
         stats = dict(existing.metadata.get("statistics") or {})
-        stats["support_count"] = int(stats.get("support_count", 0)) + 1
-        stats["success_count"] = int(stats.get("success_count", 0)) + 1
         existing.metadata["task_type_labels"] = labels
         existing.metadata["statistics"] = stats
         sources = list(existing.metadata.get("source_trace_ids") or [])
-        if trace.trace_id not in sources:
+        independent = trace.trace_id not in sources
+        if independent:
             sources.append(trace.trace_id)
+            stats["support_count"] = int(stats.get("support_count", 0)) + 1
+            stats["success_count"] = int(stats.get("success_count", 0)) + 1
         existing.metadata["source_trace_ids"] = sources
+        existing.metadata["statistics"] = stats
         alias_counts = dict(existing.metadata.get("semantic_alias_counts") or {})
         for alias, count in (incoming.metadata.get("semantic_alias_counts") or {}).items():
             alias_counts[str(alias)] = int(alias_counts.get(str(alias), 0)) + int(count)
@@ -281,6 +295,19 @@ class TraceAtomicizer:
             if effect not in negative_evidence:
                 negative_evidence.append(effect)
         existing.metadata["observed_negative_effects"] = negative_evidence
+        if independent:
+            # A necessary Precondition should recur.  Intersecting grounded,
+            # parameterized contracts removes incidental earlier state such as
+            # an unrelated transformation that happened to be true once.
+            incoming_pre = {repr(item): item for item in incoming.preconditions}
+            existing.preconditions = [
+                item for item in existing.preconditions
+                if repr(item) in incoming_pre
+            ]
+            existing.validator["pre_checks"] = sorted({
+                str(item.get("predicate") or "")
+                for item in existing.preconditions if item.get("predicate")
+            })
         trace_count = len(sources)
         existing.metadata["generalization"] = {
             "canonical_name": existing.ref.logical_id.rsplit(".", 1)[-1],
@@ -290,6 +317,8 @@ class TraceAtomicizer:
             "independent_trace_count": trace_count,
             "semantic_alias_count": len(alias_counts),
         }
+        if trace_count >= 2 and existing.status == SkillStatus.DRAFT:
+            existing.status = SkillStatus.ACTIVE
 
     def _known_atomic_contracts(self) -> list[dict[str, Any]]:
         """Small auditable catalog supplied to each independent Extractor call."""

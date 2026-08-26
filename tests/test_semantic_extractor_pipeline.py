@@ -21,6 +21,7 @@ from atomic_skillgraph.core.trace_ir import ActionRecord, TraceRecord
 from atomic_skillgraph.evolution.composite_builder import CompositeBuilder, _role_params
 from atomic_skillgraph.evolution.insight_updater import InsightUpdater
 from atomic_skillgraph.graph.registry import SkillGraphRegistry
+from atomic_skillgraph.graph.aligner import align_atomic
 
 
 class _ExtractorLLM:
@@ -91,6 +92,50 @@ def _atomic(logical_id, preconditions, effects, inputs, outputs):
         preconditions=preconditions, effects=effects,
         validator={"post_checks": [item["predicate"] for item in effects]},
         status=SkillStatus.ACTIVE)
+
+
+def test_atomic_requires_independent_trace_support_and_refines_preconditions():
+    existing = _atomic(
+        "generic.transform", [
+            {"predicate": "agent.holds", "args": {"object": "$inputs.object"}},
+            {"predicate": "object.incidental", "args": {"object": "$inputs.object"}},
+        ],
+        [{"predicate": "object.changed", "args": {"object": "$inputs.object"}}],
+        [{"name": "object"}], [{"name": "object"}])
+    existing.status = SkillStatus.DRAFT
+    existing.metadata = {
+        "source_trace_ids": ["trace_one"],
+        "statistics": {"support_count": 1, "success_count": 1},
+    }
+    incoming = copy.deepcopy(existing)
+    incoming.preconditions = [
+        {"predicate": "agent.holds", "args": {"object": "$inputs.object"}},
+    ]
+    TraceAtomicizer._merge_evidence(
+        existing, incoming, TraceRecord(trace_id="trace_two"))
+    assert existing.status == SkillStatus.ACTIVE
+    assert existing.metadata["statistics"]["support_count"] == 2
+    assert [item["predicate"] for item in existing.preconditions] == ["agent.holds"]
+
+
+def test_same_effect_name_cannot_merge_incompatible_role_contracts(workspace_tmp):
+    registry = SkillGraphRegistry(workspace_tmp / "atomic_contract_gate")
+    discovery_shaped = _atomic(
+        "generic.object_at_location", [],
+        [{"predicate": "object.at_location",
+          "args": {"object": "mug_1", "location": "$inputs.target_location"}}],
+        [{"name": "target_location"}], [{"name": "object"}, {"name": "location"}])
+    producer = _atomic(
+        "generic.object_at_location", [],
+        [{"predicate": "object.at_location",
+          "args": {"object": "$inputs.object",
+                   "location": "$inputs.target_location"}}],
+        [{"name": "object"}, {"name": "target_location"}],
+        [{"name": "object"}, {"name": "location"}])
+    registry.register(discovery_shaped)
+    decision = align_atomic(producer, registry)
+    assert decision.matched is False
+    assert decision.evidence["contract_compatible"] is False
 
 
 def test_composite_terminal_checks_follow_observed_negative_effects(workspace_tmp):
@@ -535,6 +580,7 @@ def test_event_slice_removes_navigation_loop_and_preserves_core_roles():
         "phase_id": "heat", "intent": "heat_object", "event_start": 0,
         "event_end": 5, "parameter_roles": dict(trace.provenance["params"]),
         "effect_predicates": ["object.heated"],
+        "precondition_predicates": ["agent_at", "agent.holds"],
     }]})
     assert errors == []
     assert len(phases) == 1
@@ -547,6 +593,8 @@ def test_event_slice_removes_navigation_loop_and_preserves_core_roles():
                                "heating_station": "microwave 1"}
     assert phase["effect"] == [
         {"predicate": "object.heated", "args": {"object": "cup_1"}}]
+    assert not any(item["predicate"] == "object.cooled"
+                   for item in phase["preconditions"])
     assert phase["replay_safe"] is True
     assert phase["event_slice_diagnostics"][
         "counterfactual_forward_validated"] is True

@@ -19,7 +19,7 @@ from ..core.edge_ir import GraphEdge
 from ..core.llm import LLM
 from ..core.refs import SkillRef
 from ..core.skill_ir import AbstractAtomicSkill, CompositeSkill
-from ..core.status import EdgeType, SkillNodeKind
+from ..core.status import EdgeType, SkillNodeKind, SkillStatus
 from ..graph.graph import composite_node_order
 from ..graph.registry import RetrievalHit, SkillGraphRegistry
 from .runtime_graph import PlannedNode, RuntimePlan
@@ -135,11 +135,15 @@ class AtomicPlanner:
 
         # 2. Abstract Atomic 直接规划
         atomics = [h for h in retrieved if h.kind == SkillNodeKind.ABSTRACT_ATOMIC]
+        if self.config.freeze_skills:
+            atomics = [h for h in atomics if h.obj.status == SkillStatus.ACTIVE]
         if not atomics:
+            dynamic = self._append_dynamic_gaps(task, [])
             return RuntimePlan(
-                start_mode="cold",
+                start_mode="cold", nodes=dynamic,
+                edges=self._runtime_edges(dynamic),
                 retrieved=[h.to_dict() for h in retrieved],
-                notes=["retrieved_but_no_safe_atomic_plan"],
+                notes=["no_reusable_target_producer_dynamic_only"],
             )
 
         nodes = self._plan_from_atomics(task, atomics)
@@ -396,7 +400,7 @@ class AtomicPlanner:
 
     def _append_dynamic_gaps(self, task, nodes: list[PlannedNode]) -> list[PlannedNode]:
         """把未被检索能力覆盖的目标效果显式化，供逐节点动态执行。"""
-        if not task.target_effects or not nodes:
+        if not task.target_effects:
             return nodes
         covered = {_canonical_predicate(str(effect.get("predicate") or ""))
                    for node in nodes for effect in node.target_effects
@@ -641,7 +645,9 @@ class AtomicPlanner:
                     break
         if selected:
             return selected
-        return hits[:3]
+        # No matching target producer is safer than arbitrary high-scoring
+        # capabilities. The caller materializes explicit Dynamic goal gaps.
+        return []
 
     # ------------------------------------------------------------------
     def _bind_params(self, task, atomic: AbstractAtomicSkill) -> dict[str, Any]:

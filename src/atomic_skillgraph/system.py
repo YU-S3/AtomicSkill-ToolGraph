@@ -572,6 +572,11 @@ class AtomicSkillGraphSystem:
         shared_bindings = dict(task.context.get("params") or {})
         for index, planned in enumerate(plan.nodes):
             node = runtime_graph.nodes[index]
+            node_start_actions = len((resume or {}).get("actions") or [])
+            node_deadline = (int(self.config.max_steps) if planned.dynamic else min(
+                int(self.config.max_steps),
+                node_start_actions + max(
+                    1, int(self.config.thresholds.env_node_max_steps))))
             before = dict((resume or {}).get("state") or task.state or {})
             planned.params = _apply_runtime_data_bindings(
                 planned.params, planned.step_id, runtime_graph, shared_bindings)
@@ -739,6 +744,10 @@ class AtomicSkillGraphSystem:
             for mode, seed_context, steps in candidates:
                 attempt_before = dict((resume or {}).get("state") or before)
                 action_start = len((resume or {}).get("actions") or [])
+                attempt_deadline = (node_deadline if planned.dynamic else min(
+                    node_deadline,
+                    action_start + max(
+                        1, int(self.config.thresholds.env_attempt_max_steps))))
                 runtime_graph.record_usage(mode)
                 node.mode = mode
                 direct_steps = None
@@ -749,7 +758,7 @@ class AtomicSkillGraphSystem:
                     }]
                 result = self.adapter.run_env_episode(
                     task, self.llm, seed_context=seed_context,
-                    direct_steps=direct_steps, max_steps=self.config.max_steps,
+                    direct_steps=direct_steps, max_steps=attempt_deadline,
                     resume=resume, stop_effects=effects,
                     effect_inputs=dict(planned.params), node_ref=str(planned.ref),
                     phase_goal=_phase_goal_of(atomic, effects, planned.params),
@@ -1034,53 +1043,73 @@ class AtomicSkillGraphSystem:
             return
         if not self.config.features.enable_governance:
             return
-        # Attribute evidence only to the path that actually executed. Retrieval
-        # is exposure, not use; an LLM rescue must not credit every candidate.
-        used_refs = [str(node["ref"]) for node in trace.realized_atomic_nodes
-                     if node.get("ref") and (not success or bool(node.get("passed")))]
-        composite_validation = trace.validation_layers.get("composite") or {}
-        if trace.selected_composite and (
-                not success or bool(composite_validation.get("passed"))):
-            used_refs.append(trace.selected_composite)
-        seen_task_skills: set[str] = set()
-        for ref_text in used_refs:
+        # Atomic utility is occurrence-local. A later node or the benchmark may
+        # fail without invalidating an upstream transition whose own Effect was
+        # verified. Composite utility, handled below, remains task/path-level.
+        seen_task_atomics: set[str] = set()
+        for realized in trace.realized_atomic_nodes:
+            ref_text = str(realized.get("ref") or "")
+            if not ref_text:
+                continue
             try:
                 from .core.refs import SkillRef
                 ref = SkillRef.parse(ref_text)
             except ValueError:
                 continue
-            # A Composite may call the same Atomic more than once, and some
-            # planners may return duplicate refs.  Task-level evidence is one
-            # Bernoulli observation per logical Skill per task, not per call.
-            if ref.logical_id in seen_task_skills:
-                continue
-            seen_task_skills.add(ref.logical_id)
             obj = self.registry.get(ref) or self.registry.get_recommended(ref.logical_id)
-            if obj is None:
-                continue
-            if not hasattr(obj, "metadata"):
+            if obj is None or not hasattr(obj, "metadata"):
                 continue  # ImplementationAtom 不承载 Skill 层证据
             stats = dict(obj.metadata.get("statistics") or {})
-            # 这一层记录实际路径的 task-level 证据；节点级 attempt 统计仍独立。
-            stats["task_use_count"] = int(stats.get("task_use_count", 0)) + 1
             stats["use_count"] = int(stats.get("use_count", 0)) + 1
-            if success:
-                stats["task_success_count"] = int(stats.get("task_success_count", 0)) + 1
+            node_passed = bool(realized.get("passed"))
+            if node_passed:
                 stats["execution_success_count"] = int(
                     stats.get("execution_success_count", 0)) + 1
             else:
-                stats["task_failure_count"] = int(stats.get("task_failure_count", 0)) + 1
                 stats["execution_failure_count"] = int(
                     stats.get("execution_failure_count", 0)) + 1
+            if ref.logical_id not in seen_task_atomics:
+                seen_task_atomics.add(ref.logical_id)
+                stats["task_use_count"] = int(stats.get("task_use_count", 0)) + 1
+                task_key = "task_success_count" if success else "task_failure_count"
+                stats[task_key] = int(stats.get(task_key, 0)) + 1
             total = int(stats.get("use_count", 0))
             empirical = int(stats.get("execution_success_count", 0)) / max(total, 1)
             old = float(stats.get("utility", 0.5))
             stats["utility"] = round(0.5 * old + 0.5 * empirical, 4)
             obj.metadata["statistics"] = stats
-            # 负迁移抑制：复用后失败 >=2 且 utility 低 → suppressed
-            if int(stats.get("task_failure_count", 0)) >= 2 and stats["utility"] < 0.35:
+            failures = int(stats.get("execution_failure_count", 0))
+            failure_threshold = int(
+                self.config.thresholds.suppress_failure_threshold)
+            if (total >= max(3, failure_threshold + 1)
+                    and failures >= failure_threshold
+                    and stats["utility"] < float(
+                        self.config.thresholds.retirement_utility)):
                 obj.status = SkillStatus.SUPPRESSED
             self.registry.update_runtime_state(obj)
+
+        if trace.selected_composite:
+            try:
+                from .core.refs import SkillRef
+                ref = SkillRef.parse(trace.selected_composite)
+            except ValueError:
+                ref = None
+            obj = ((self.registry.get(ref) if ref is not None else None)
+                   or (self.registry.get_recommended(ref.logical_id)
+                       if ref is not None else None))
+            if obj is not None and hasattr(obj, "metadata"):
+                stats = dict(obj.metadata.get("statistics") or {})
+                stats["use_count"] = int(stats.get("use_count", 0)) + 1
+                key = "execution_success_count" if success else "execution_failure_count"
+                stats[key] = int(stats.get(key, 0)) + 1
+                total = int(stats["use_count"])
+                empirical = int(stats.get(
+                    "execution_success_count", 0)) / max(total, 1)
+                stats["utility"] = round(
+                    0.5 * float(stats.get("utility", 0.5))
+                    + 0.5 * empirical, 4)
+                obj.metadata["statistics"] = stats
+                self.registry.update_runtime_state(obj)
 
     # ------------------------------------------------------------------
     def _get_recommended(self, logical_id: str):

@@ -33,6 +33,8 @@ class Thresholds:
     llm_max_consecutive_errors: int = 1       # provider 已重试；禁止决策层再放大
     infrastructure_episode_retries: int = 2  # 从任务初始状态重跑次数
     composite_min_support: int = 2            # 单轨迹 Composite 仅为 draft；多轨迹支持后晋升
+    env_node_max_steps: int = 30              # 单个 Atomic（含 fallback）的环境步数上限
+    env_attempt_max_steps: int = 15           # 单种执行模式的环境步数上限
 
 
 @dataclass
@@ -186,6 +188,8 @@ class SystemConfig:
                 "llm_max_consecutive_errors": self.thresholds.llm_max_consecutive_errors,
                 "infrastructure_episode_retries": self.thresholds.infrastructure_episode_retries,
                 "composite_min_support": self.thresholds.composite_min_support,
+                "env_node_max_steps": self.thresholds.env_node_max_steps,
+                "env_attempt_max_steps": self.thresholds.env_attempt_max_steps,
             },
             "features": self.features.to_dict(),
             "seed": self.seed,

@@ -775,6 +775,12 @@ class _AlfStateTracker:
     def update(self, observation: str, *, action: str = "",
                accepted: bool = True) -> None:
         text = str(observation or "").lower()
+        # Per-step epistemic additions are persisted separately from world
+        # transitions.  The facts remain available to later Preconditions,
+        # but opening/visiting a place must not be learned as an ability that
+        # physically moves every newly revealed object there.
+        observed_facts: set[str] = set()
+        self.meta["last_observed_facts"] = []
 
         arrive = re.search(r"you arrive at (.+?)\.", text)
         if arrive:
@@ -783,8 +789,14 @@ class _AlfStateTracker:
 
         def add_objects(phrase: str, loc: str) -> None:
             for obj in _extract_objects(phrase):
-                self.facts.add(f"object_exists({obj})")
-                self.facts.add(f"object_at({obj}, {_norm(loc)})")
+                exists_fact = f"object_exists({obj})"
+                location_fact = f"object_at({obj}, {_norm(loc)})"
+                if exists_fact not in self.facts:
+                    observed_facts.add(exists_fact)
+                if location_fact not in self.facts:
+                    observed_facts.add(location_fact)
+                self.facts.add(exists_fact)
+                self.facts.add(location_fact)
 
         for match in re.finditer(r"on the (.+?), you see (.+?)\.", text):
             add_objects(match.group(2), match.group(1))
@@ -857,6 +869,7 @@ class _AlfStateTracker:
             for obj in self.inventory:
                 self.facts.add(
                     f"object_observed_with({_norm(obj)}, {associated})")
+        self.meta["last_observed_facts"] = sorted(observed_facts)
 
     def state(self) -> dict[str, Any]:
         return {"facts": sorted(self.facts), "inventory": list(self.inventory),

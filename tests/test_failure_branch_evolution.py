@@ -180,6 +180,28 @@ def test_atomic_failure_is_not_double_counted_as_task_evidence(workspace_tmp):
     assert stats["task_use_count"] == 1
 
 
+def test_successful_atomic_is_not_penalized_by_downstream_task_failure(workspace_tmp):
+    root = workspace_tmp / "node_local_evidence"
+    registry, _tools, atomic, _tool = _bank(root)
+    config = SystemConfig(data_dir=root)
+    trace = TraceRecord(
+        trace_id="trace_upstream_passed", task_id="failed_later",
+        task_type="toy", benchmark="toy_env", success=False,
+        realized_atomic_nodes=[{
+            "ref": str(atomic.ref), "passed": True,
+            "validation": {"messages": []},
+        }],
+    )
+    shell = AtomicSkillGraphSystem.__new__(AtomicSkillGraphSystem)
+    shell.config = config
+    shell.registry = registry
+    shell._update_skill_evidence(trace, success=False)
+    stats = registry.get(atomic.ref).metadata["statistics"]
+    assert stats["execution_success_count"] == 1
+    assert stats.get("execution_failure_count", 0) == 0
+    assert stats["task_failure_count"] == 1
+
+
 def test_seeded_failure_dynamic_rescue_evolves_atomic_in_isolated_branch(workspace_tmp):
     root = workspace_tmp / "data"
     registry, tools, atomic, _tool = _bank(root)
