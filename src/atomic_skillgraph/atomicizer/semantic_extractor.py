@@ -21,7 +21,12 @@ from ..core.predicates import (
     normalize_value,
 )
 from ..core.trace_ir import TraceRecord
-from .effect_extractor import _FACT_FAMILY_NAMES, _family_of, extract_effect
+from .effect_extractor import (
+    _FACT_FAMILY_NAMES,
+    _family_of,
+    extract_effect,
+    parameterize_predicates,
+)
 
 
 EXTRACTOR_PROMPT = """You are the Trace Extractor Agent in a reusable capability-learning system.
@@ -467,6 +472,15 @@ def validate_phase_proposal(trace: TraceRecord, events: list[dict[str, Any]],
             errors.append(f"phase_{ordinal}:no_observed_stable_effect")
             continue
         _refresh_effect_identity(effect)
+        # The verified Effect and task contract own the public role names.
+        # LLM names such as ``target_object``/``associated_object`` remain
+        # useful proposal evidence, but must not fragment the executable I/O
+        # contract when the task already exposes ``object`` and
+        # ``associated_entity`` for the same grounded participants.
+        params = _canonicalize_verified_roles(
+            params, effect.positive, trace.provenance)
+        params.update(_terminal_certificate_params(
+            events[evidence_end if evidence_end is not None else end], params))
         # Remove trailing navigation/transport after the core transition.  The
         # retained range remains an actual contiguous occurrence in the trace.
         core_names = {str(item.get("predicate")) for item in effect.positive}
@@ -500,7 +514,18 @@ def validate_phase_proposal(trace: TraceRecord, events: list[dict[str, Any]],
             events, core_index, core_index, params)
         canonical_effect.positive = [item for item in canonical_effect.positive
                                      if str(item.get("predicate")) in core_names]
-        if "precondition_predicates" in raw:
+        terminal_preconditions = _terminal_certificate_preconditions(
+            events[core_index], params)
+        if terminal_preconditions:
+            # A terminal certificate is a stronger code-level contract than
+            # an LLM's optional precondition list. Only evidence already true
+            # immediately before the terminal boundary is admitted, so a
+            # simultaneous final movement is not mislabeled as a precondition.
+            canonical_effect.preconditions = terminal_preconditions
+            canonical_effect.validator["pre_checks"] = sorted({
+                str(item.get("predicate") or "")
+                for item in terminal_preconditions if item.get("predicate")})
+        elif "precondition_predicates" in raw:
             declared_preconditions = {
                 _declared_predicate_name(item)
                 for item in (raw.get("precondition_predicates") or [])
@@ -565,6 +590,8 @@ def validate_phase_proposal(trace: TraceRecord, events: list[dict[str, Any]],
                            "declared_effect_aligned": declared_aligned,
                            "state_evidence_precedence": True,
                            "identity_from_verified_effect": True,
+                           "terminal_certificate_preconditions": bool(
+                               terminal_preconditions),
                            "trailing_internal_events_removed": trimmed_end is not None
                            and trimmed_end < raw_end,
                            "internal_causal_slice_applied": len(causal_event_indices)
@@ -1295,6 +1322,129 @@ def _event_capability_effects(event: dict[str, Any]) -> list[dict[str, Any]]:
             seen.add(key)
             effects.append(predicate)
     return effects
+
+
+def _canonicalize_verified_roles(
+        params: dict[str, Any], effects: list[dict[str, Any]],
+        provenance: dict[str, Any]) -> dict[str, Any]:
+    """Align proposal aliases to task semantic roles using grounded equality.
+
+    This is benchmark-agnostic: role names and values come exclusively from
+    the persisted task contract and verified Effect arguments. No operation,
+    object, device, or dataset vocabulary is consulted.
+    """
+    canonical = dict(params or {})
+    task_roles = {
+        str(role): value
+        for source in (dict(provenance.get("semantic_params") or {}),
+                       dict(provenance.get("params") or {}))
+        for role, value in source.items() if value not in (None, "")
+    }
+    effect_values = [
+        (str(argument), value)
+        for effect in effects
+        for argument, value in (effect.get("args") or {}).items()
+        if value not in (None, "")
+    ]
+
+    def matches(grounded: Any, declared: Any) -> bool:
+        left, right = normalize_value(grounded), normalize_value(declared)
+        if not left or not right:
+            return False
+        if left == right:
+            return True
+        # A task-level family may bind a concrete occurrence, never vice versa.
+        return (not re.search(r"_\d+$", right)
+                and re.sub(r"_\d+$", "", left)
+                == re.sub(r"_\d+$", "", right))
+
+    preferred_by_value: dict[str, str] = {}
+    for argument, value in effect_values:
+        candidates = [role for role, declared in task_roles.items()
+                      if matches(value, declared)]
+        lexical = [role for role in candidates
+                   if argument in role or role in argument]
+        aliases = [role for role, current in canonical.items()
+                   if matches(value, current)]
+        if argument in candidates:
+            preferred = argument
+        elif argument in canonical and matches(value, canonical[argument]):
+            preferred = argument
+        elif lexical:
+            preferred = sorted(lexical, key=lambda role: (len(role), role))[0]
+        elif len(aliases) == 1:
+            preferred = aliases[0]
+        else:
+            # Predicate argument names provide a stable benchmark-independent
+            # fallback. Composite occurrence mapping may later bind this role
+            # to an equivalent task role through grounded co-reference.
+            preferred = argument
+        surface_value = next(
+            (canonical[role] for role in aliases if role == preferred),
+            next((canonical[role] for role in aliases), value))
+        canonical[preferred] = surface_value
+        preferred_by_value[normalize_value(value)] = preferred
+
+    task_role_names = set(task_roles)
+    for role, value in list(canonical.items()):
+        preferred = preferred_by_value.get(normalize_value(value))
+        if (preferred and role != preferred and role not in task_role_names):
+            canonical.pop(role, None)
+    return canonical
+
+
+def _terminal_certificate_params(event: dict[str, Any],
+                                 params: dict[str, Any]) -> dict[str, Any]:
+    """Recover missing replay roles from pre-terminal certificate evidence."""
+    before = StateSnapshot(event.get("before") or {})
+    enriched: dict[str, Any] = {}
+    known_values = {normalize_value(value) for value in params.values()}
+    for terminal in event.get("terminal_verified_effects") or []:
+        certificate = dict(terminal.get("certificate") or {})
+        if bool(certificate.get("standalone_action_effect", True)):
+            continue
+        for fact in certificate.get("evidence_facts") or []:
+            predicate = _fact_to_predicate(str(fact))
+            if predicate is None or not evaluate_predicate(before, predicate):
+                continue
+            for role, value in (predicate.get("args") or {}).items():
+                normalized = normalize_value(value)
+                if normalized and normalized not in known_values:
+                    enriched.setdefault(str(role), value)
+                    known_values.add(normalized)
+    return enriched
+
+
+def _terminal_certificate_preconditions(
+        event: dict[str, Any], params: dict[str, Any]) -> list[dict[str, Any]]:
+    """Compile a terminal certificate's witnessed reads into Preconditions."""
+    before = StateSnapshot(event.get("before") or {})
+    grounded: list[dict[str, Any]] = []
+    for terminal in event.get("terminal_verified_effects") or []:
+        certificate = dict(terminal.get("certificate") or {})
+        if bool(certificate.get("standalone_action_effect", True)):
+            continue
+        for fact in certificate.get("evidence_facts") or []:
+            predicate = _fact_to_predicate(str(fact))
+            # Facts established only by the terminal event (for example the
+            # destination agent location) are post-state evidence, not reads.
+            if (predicate is not None
+                    and evaluate_predicate(before, predicate)):
+                grounded.append(predicate)
+    parameterized = parameterize_predicates(grounded, params)
+    unique: list[dict[str, Any]] = []
+    seen: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
+    for predicate in parameterized:
+        # Every reusable certificate precondition must be fully bindable.
+        values = list((predicate.get("args") or {}).values())
+        if any(isinstance(value, str) and not value.startswith("$inputs.")
+               for value in values):
+            continue
+        key = _predicate_key(predicate)
+        if key not in seen:
+            seen.add(key)
+            unique.append(predicate)
+    return unique
 
 
 def _canonical_phase_params(params: dict[str, Any], family: str) -> dict[str, Any]:

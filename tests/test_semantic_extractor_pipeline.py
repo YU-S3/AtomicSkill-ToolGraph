@@ -678,6 +678,13 @@ def test_terminal_certificate_survives_extraction_but_is_not_single_action_tool(
                            for effect in segment["effect"]))
     assert terminal["terminal_effect_origin"] is True
     assert terminal["replay_safe"] is True
+    assert terminal["params"] == {
+        "object": "bowl_2", "associated_entity": "desklamp_1",
+        "location": "desk_1"}
+    assert {item["predicate"] for item in terminal["preconditions"]} == {
+        "agent.holds", "object.toggled", "object.at_location"}
+    assert any(candidate.skill.effects[0]["predicate"] == "object.toggled"
+               for candidate in result.candidates)
     node = next(candidate.skill for candidate in result.candidates
                 if candidate.skill.effects[0]["predicate"]
                 == "object.observed_with")
@@ -1061,6 +1068,11 @@ def test_composite_role_mapping_uses_semantic_task_params():
                            "target_location": "cabinet_5"}, trace)
     assert mapped == {"object": "$task.object",
                       "target_location": "$task.target_location"}
+    # A neutral occurrence role can bind the task role when grounded evidence
+    # proves they are the same participant; the stored Atomic role stays
+    # ``container`` while the Composite call uses the task input.
+    assert _role_params({"container": "cabinet_5"}, trace) == {
+        "container": "$task.target_location"}
     # target 的 semantic family 不能被借给 source role。
     assert _role_params({"object_location": "cabinet_5"}, trace) == {}
 

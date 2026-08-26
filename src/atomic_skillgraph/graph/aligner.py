@@ -191,10 +191,24 @@ def _composite_occurrence_signature(
     """
     step_objects = composite.step_instances()
     labels = {
-        str(step["step_id"]): _atomic_occurrence_label(step, registry)
+        str(step["step_id"]): _atomic_contract_label(step, registry)
         for step in step_objects
     }
     steps = tuple(sorted(labels.values()))
+    # Parameter identity is represented as a co-reference hypergraph instead
+    # of literal storage paths. Thus ``$flow.container`` and
+    # ``$task.target_location`` are equivalent when both connect the same
+    # Atomic Effect roles, while opening a source and opening a destination
+    # remain distinct when their sharing topology differs.
+    binding_members: dict[str, list[tuple[Any, ...]]] = {}
+    for step in step_objects:
+        step_id = str(step["step_id"])
+        relevant = _effect_role_bindings(step, registry)
+        for role, value in relevant.items():
+            binding_members.setdefault(str(value), []).append(
+                (labels[step_id], str(role)))
+    bindings = tuple(sorted(
+        tuple(sorted(members)) for members in binding_members.values()))
     data = tuple(sorted(
         (labels.get(str(edge.source_step), ("missing",)),
          labels.get(str(edge.target_step), ("missing",)),
@@ -217,11 +231,11 @@ def _composite_occurrence_signature(
         for item in (composite.validator.get("target_effects") or [])
         if isinstance(item, dict) and item.get("predicate")
     ))
-    return steps, data, dependencies, targets
+    return steps, bindings, data, dependencies, targets
 
 
-def _atomic_occurrence_label(step: dict[str, Any],
-                             registry: SkillGraphRegistry) -> tuple[Any, ...]:
+def _atomic_contract_label(step: dict[str, Any],
+                           registry: SkillGraphRegistry) -> tuple[Any, ...]:
     node_ref = str(step.get("node_ref") or "")
     atomic = None
     try:
@@ -231,24 +245,30 @@ def _atomic_occurrence_label(step: dict[str, Any],
         parsed = None
     if atomic is None:
         fallback = node_ref.rsplit("@", 1)[0]
-        return ("logical", fallback,
-                tuple(sorted((str(key), str(value))
-                             for key, value in (step.get("params") or {}).items())))
+        return ("logical", fallback)
     effects = tuple(sorted(_predicate_contract(item)
                            for item in (getattr(atomic, "effects", None) or [])
                            if isinstance(item, dict)))
+    return ("effect_contract", effects)
+
+
+def _effect_role_bindings(step: dict[str, Any],
+                          registry: SkillGraphRegistry) -> dict[str, Any]:
+    try:
+        parsed = SkillRef.parse(str(step.get("node_ref") or ""))
+        atomic = registry.get(parsed) or registry.get_recommended(parsed.logical_id)
+    except ValueError:
+        atomic = None
+    if atomic is None:
+        return dict(step.get("params") or {})
     relevant_roles = {
         value[len("$inputs."):]
         for effect in (getattr(atomic, "effects", None) or [])
         for value in (effect.get("args") or {}).values()
         if isinstance(value, str) and value.startswith("$inputs.")
     }
-    params = tuple(sorted(
-        (str(role), str(value))
-        for role, value in (step.get("params") or {}).items()
-        if str(role) in relevant_roles
-    ))
-    return ("effect_contract", effects, params)
+    return {str(role): value for role, value in (step.get("params") or {}).items()
+            if str(role) in relevant_roles}
 
 
 def _predicate_contract(predicate: dict[str, Any]) -> str:

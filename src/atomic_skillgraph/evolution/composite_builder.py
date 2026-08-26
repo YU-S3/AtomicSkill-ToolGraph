@@ -395,6 +395,20 @@ def _role_params(params: dict[str, Any], trace: TraceRecord) -> dict[str, Any]:
     known = dict(trace.provenance.get("params") or {})
     semantic = dict(trace.provenance.get("semantic_params") or {})
     result: dict[str, Any] = {}
+
+    def role_kind(role: str) -> str:
+        lowered = str(role).lower()
+        if (lowered == "object_location"
+                or any(token in lowered for token in ("source", "origin"))):
+            return "source_location"
+        if any(token in lowered for token in ("target", "destination")):
+            return "target_location"
+        if any(token in lowered for token in (
+                "location", "container",
+                "receptacle", "station", "position", "place")):
+            return "location"
+        return "entity"
+
     for key, value in params.items():
         value_norm = normalize_value(value)
         matched_role = ""
@@ -412,6 +426,28 @@ def _role_params(params: dict[str, Any], trace: TraceRecord) -> dict[str, Any]:
             if same or generic_family:
                 matched_role = str(key)
                 break
+        if not matched_role:
+            candidates: list[str] = []
+            for source in (known, semantic):
+                for source_role, source_value in source.items():
+                    role_norm = normalize_value(source_value)
+                    same = value_norm == role_norm
+                    generic_family = (value_norm and role_norm
+                                      and not __import__("re").search(
+                                          r"_\d+$", role_norm)
+                                      and __import__("re").sub(
+                                          r"_\d+$", "", value_norm)
+                                      == role_norm)
+                    key_kind = role_kind(str(key))
+                    source_kind = role_kind(str(source_role))
+                    compatible_kind = (key_kind == source_kind
+                                       or key_kind == "location")
+                    if ((same or generic_family) and compatible_kind):
+                        candidates.append(str(source_role))
+            if candidates:
+                matched_role = sorted(set(candidates), key=lambda role: (
+                    0 if str(key) in role or role in str(key) else 1,
+                    len(role), role))[0]
         if matched_role:
             result[str(key)] = f"$task.{matched_role}"
     return result

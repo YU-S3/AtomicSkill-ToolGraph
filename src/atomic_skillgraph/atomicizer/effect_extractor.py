@@ -122,7 +122,9 @@ def extract_effect(before: dict[str, Any], after: dict[str, Any],
     parameterized = parameterize_predicates(raw_preconditions, bound_params)
     relevant = [p for p in parameterized if _relevant_precondition(
         p, result.primary_family, bound_params)]
-    # 去重并限制为最小、与目标对象有关的前置条件。
+    # 去重并保留所有与已绑定参与者有关的前置条件。固定的 top-k 截断会让
+    # 字典序靠前的弱事实挤掉真正的执行依赖；最小化由 Extractor 声明、终局
+    # 证书以及跨轨迹交集共同完成，而不是依赖任意数量上限。
     seen: set[str] = set()
     result.preconditions = []
     for predicate in relevant:
@@ -131,8 +133,6 @@ def extract_effect(before: dict[str, Any], after: dict[str, Any],
             continue
         seen.add(key)
         result.preconditions.append(predicate)
-        if len(result.preconditions) >= 3:
-            break
 
     # 节点验证器：pre_checks（前置） + post_checks（效果）
     result.validator = {
