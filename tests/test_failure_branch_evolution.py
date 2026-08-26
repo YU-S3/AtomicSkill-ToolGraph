@@ -280,6 +280,57 @@ def test_seeded_failure_dynamic_rescue_evolves_atomic_in_isolated_branch(workspa
         "trace_atomic_repair", "trace_atomic_repair_second_evidence"]
 
 
+def test_atomic_repair_guard_excludes_partially_bound_bystanders(workspace_tmp):
+    """Run the formal repair pipeline, not only the guard helper in isolation."""
+    root = workspace_tmp / "repair_guard_grounding"
+    registry, tools, atomic, _tool = _bank(root)
+    before = {"facts": [
+        "object_at(apple_1, workbench_1)",
+        "object_at(cup_2, workbench_1)",
+        "object_exists(apple_1)",
+        "object_exists(cup_2)",
+    ]}
+    trace = TraceRecord(
+        trace_id="trace_grounded_guard", task_id="task_grounded_guard",
+        task_type="toy", task_goal="repair apple", benchmark="toy_env",
+        success=True,
+        actions=[ActionRecord(step=0, name="repair apple 1",
+                              mode=ExecutionMode.DYNAMIC,
+                              node_ref=str(atomic.ref))],
+        realized_atomic_nodes=[{
+            "ref": str(atomic.ref),
+            "params": {"object": "apple 1", "work_location": "workbench 1"},
+            "passed": True,
+            "attempts": [
+                {"mode": "seeded", "passed": False,
+                 "failure_type": "effect_not_met", "action_start": 0,
+                 "action_end": 0, "before": before, "after": before},
+                {"mode": "dynamic", "passed": True, "failure_type": "",
+                 "action_start": 0, "action_end": 1, "before": before,
+                 "after": {"facts": ["object.done(apple_1)"]}},
+            ],
+        }],
+    )
+    task = Task(task_id="task_grounded_guard", benchmark="toy_env",
+                task_type="toy", goal="repair apple")
+    manager = FailureBranchManager(root, registry, tools, _ReplayAdapter(),
+                                   SystemConfig(data_dir=root), llm=object())
+
+    event = manager.process(trace, task)[0]
+
+    assert event["status"] == "merged"
+    evolved = registry.get_recommended(atomic.ref.logical_id)
+    guard = evolved.metadata["repair_guard"]["preconditions"]
+    assert guard == [
+        {"predicate": "object.at_location",
+         "args": {"object": "$inputs.object",
+                  "location": "$inputs.work_location"}},
+        {"predicate": "object.exists",
+         "args": {"object": "$inputs.object"}},
+    ]
+    assert "cup_2" not in str(guard)
+
+
 def test_atomic_repair_parameterizes_entities_and_removes_state_cycles_from_evidence(
         workspace_tmp):
     root = workspace_tmp / "generalized_repair"

@@ -32,7 +32,10 @@ from ..graph.registry import SkillGraphRegistry
 from ..graph.validator import validate_graph
 from ..tools.admission_adapter import AdmissionEngine
 from ..tools.registry import ToolRegistry
-from ..atomicizer.effect_extractor import parameterize_predicates
+from ..atomicizer.effect_extractor import (
+    is_fully_parameterized_predicate,
+    parameterize_predicates,
+)
 from ..atomicizer.semantic_extractor import (
     build_structured_events,
     slice_event_occurrence,
@@ -1198,9 +1201,7 @@ def _repair_guard(before: dict[str, Any],
         if not isinstance(predicate, dict):
             continue
         parameterized = parameterize_predicates([predicate], bindings)
-        if parameterized and any(
-                isinstance(value, str) and value.startswith("$inputs.")
-                for value in (parameterized[0].get("args") or {}).values()):
+        if parameterized and is_fully_parameterized_predicate(parameterized[0]):
             predicates.extend(parameterized)
     return {
         "trigger": "primary_execution_failed_and_atomic_effect_unmet",

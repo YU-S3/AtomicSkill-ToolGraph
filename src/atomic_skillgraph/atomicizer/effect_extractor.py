@@ -151,6 +151,19 @@ def _has_input_reference(predicate: dict[str, Any]) -> bool:
 def _relevant_precondition(predicate: dict[str, Any], primary_family: str,
                            bound_params: dict[str, Any]) -> bool:
     """Retain only grounded input-dependent reads, independent of operation name."""
+    return is_fully_parameterized_predicate(predicate)
+
+
+def is_fully_parameterized_predicate(predicate: dict[str, Any]) -> bool:
+    """Whether a reusable predicate is completely grounded by input slots.
+
+    A relational fact is not reusable merely because one of its arguments was
+    parameterized.  For example, parameterizing the shared location in
+    ``object.at_location(cup_2, $inputs.station)`` must not pull the unrelated
+    ``cup_2`` into an Atomic contract or repair guard.  Every string-valued
+    entity/location argument must be an input reference; scalar constants are
+    safe to retain.
+    """
     if not _has_input_reference(predicate):
         return False
     # Replacing one shared argument is not enough to make the whole fact part
