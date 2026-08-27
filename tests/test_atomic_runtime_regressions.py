@@ -1,18 +1,28 @@
 from atomic_skillgraph.adapters.benchmark import parse_goal_params
+from atomic_skillgraph.adapters.benchmark import EnvRunResult, Task
+from atomic_skillgraph.adapters.mock_llm import MockLLM
 from atomic_skillgraph.atomicizer.effect_extractor import (
     extract_effect,
     parameterize_predicates,
 )
 from atomic_skillgraph.core.predicates import StateSnapshot, check_effects
 from atomic_skillgraph.core.refs import SkillRef
+from atomic_skillgraph.core.config import SystemConfig
 from atomic_skillgraph.core.skill_ir import AbstractAtomicSkill
 from atomic_skillgraph.core.status import SkillStatus
 from atomic_skillgraph.runtime.atomic_planner import _canonical_predicate
+from atomic_skillgraph.runtime.runtime_graph import (
+    PlannedNode,
+    RuntimeGraph,
+    RuntimePlan,
+)
 from atomic_skillgraph.system import (
+    AtomicSkillGraphSystem,
     _ground_env_runtime_params,
     _realized_task_bindings,
     _refine_env_object_binding,
 )
+from atomic_skillgraph.core.trace_ir import TraceRecord
 from atomic_skillgraph.validation.node_validator import NodeValidator
 
 
@@ -93,6 +103,86 @@ def test_runtime_carries_acquired_instance_to_downstream_nodes():
         {"inventory": ["mug_1"], "facts": ["agent_holds(mug_1)"]},
     )
     assert params["object"] == "mug_1"
+
+
+def test_atomic_only_runs_controlled_location_discovery(workspace_tmp):
+    class _Adapter:
+        supports_in_place_resume = True
+
+        def __init__(self):
+            self.discovery_calls = 0
+
+        def discover_object_location(self, task, object_name, **kwargs):
+            self.discovery_calls += 1
+            state = {
+                "facts": ["object_exists(mug_1)",
+                          "object_at(mug_1, countertop_1)"],
+                "inventory": [], "meta": {},
+            }
+            result = EnvRunResult(
+                actions=[{"step": 0, "name": "go to countertop 1",
+                          "params": {"location": "countertop 1"},
+                          "accepted": True,
+                          "node_ref": kwargs.get("node_ref", ""),
+                          "origin": "framework_discovery"}],
+                states=[{"step": 0, "state": state}],
+                current_observation="a mug is on countertop 1",
+                current_admissible=["take mug 1 from countertop 1"],
+            )
+            return ({"object": "mug_1",
+                     "object_location": "countertop_1"}, result)
+
+        def run_env_episode(self, task, llm, **kwargs):
+            state = {
+                "facts": ["object_exists(mug_1)",
+                          "agent_holds(mug_1)"],
+                "inventory": ["mug_1"], "meta": {},
+            }
+            return EnvRunResult(
+                success=True, atomic_complete=True,
+                actions=[{"step": 0, "name": "go to countertop 1",
+                          "params": {"location": "countertop 1"},
+                          "accepted": True, "origin": "framework_discovery"},
+                         {"step": 1,
+                          "name": "take mug 1 from countertop 1",
+                          "params": {"object": "mug 1",
+                                     "object_location": "countertop 1"},
+                          "accepted": True,
+                          "node_ref": kwargs.get("node_ref", "")}],
+                states=[{"step": 0, "state": state}],
+                current_observation="you take the mug",
+                current_admissible=[], final_observation="you take the mug")
+
+    config = SystemConfig(data_dir=workspace_tmp / "atomic_only")
+    config.llm.mock = True
+    config.features.enable_tool_evolution = False
+    adapter = _Adapter()
+    system = AtomicSkillGraphSystem(config, adapter, MockLLM(script={}))
+    acquire = AbstractAtomicSkill(
+        ref=SkillRef("env.acquire", "1.0.0"), summary="acquire object",
+        inputs=[{"name": "object"}, {"name": "object_location"}],
+        outputs=[], preconditions=[],
+        effects=[{"predicate": "agent.holds",
+                  "args": {"object": "$inputs.object"}}],
+        guideline={"rules": ["obtain the requested object"]},
+        status=SkillStatus.ACTIVE)
+    system.registry.register(acquire)
+    task = Task(
+        task_id="atomic_only_discovery", benchmark="alfworld",
+        goal="obtain a mug", context={"params": {"object": "mug"}},
+        state={"facts": [], "inventory": [], "meta": {}},
+        target_effects=list(acquire.effects))
+    plan = RuntimePlan(nodes=[PlannedNode(
+        ref=acquire.ref, step_id="step_000", params={"object": "mug"},
+        target_effects=list(acquire.effects))])
+    trace = TraceRecord(task_id=task.task_id, benchmark="alfworld")
+    runtime = RuntimeGraph(task.task_id, plan)
+
+    system._run_env_nodes(task, plan, trace, runtime)
+
+    assert adapter.discovery_calls == 1
+    assert runtime.nodes[0].params["object_location"] == "countertop_1"
+    assert trace.metrics["controlled_location_discovery"][0]["found"] is True
 
 
 def test_effect_extractor_keeps_only_target_object_preconditions():

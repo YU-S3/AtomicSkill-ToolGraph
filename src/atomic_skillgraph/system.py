@@ -629,64 +629,71 @@ class AtomicSkillGraphSystem:
                     and str(item.get("name") or "").endswith("_location")
                     and not planned.params.get(str(item.get("name")))
                 }
-                if (self.config.features.enable_tool_evolution
-                        and callable(discover) and location_slots):
-                    partial = self.selector.select_allowing_missing(
-                        atomic.ref, {"inputs": planned.params, "harness": "env"},
-                        set(location_slots))
-                    if partial.implementation is not None:
-                        partial_resolved = self.resolver.resolve(
-                            partial.implementation, {"inputs": planned.params})
-                        discovery_tool_refs = [str(item.binding.tool_ref)
-                                               for item in partial_resolved]
-                        for location_slot in sorted(location_slots):
-                            if planned.params.get(location_slot):
-                                continue
-                            entity_role = location_slot[:-len("_location")]
-                            entity_value = planned.params.get(entity_role)
-                            if entity_value in (None, ""):
-                                continue
-                            excluded_objects = (
-                                _completed_distinct_effect_instances(
-                                    task, before, planned.params)
-                                if entity_role == "object" else set())
-                            binding, discovery_result = discover(
-                                task, str(entity_value), resume=resume,
-                                max_locations=self.config.thresholds.acquire_discovery_max_locations,
-                                node_ref=str(planned.ref),
-                                tool_ref=discovery_tool_refs[0]
-                                if discovery_tool_refs else "",
-                                excluded_objects=excluded_objects,
-                                allow_passive_navigable=not produces_possession)
-                            resume = _env_resume_payload(discovery_result)
-                            before = dict(resume.get("state") or before)
-                            remapped = _remap_location_binding(
-                                binding, entity_role, location_slot)
-                            metric = {
-                                "node_ref": str(planned.ref),
-                                "entity_role": entity_role,
-                                "location_role": location_slot,
-                                "found": bool(remapped),
-                                "binding": dict(remapped),
-                                "excluded_objects": sorted(excluded_objects),
-                                "checked_locations": list(
-                                    (before.get("meta") or {}).get(
-                                        "checked_locations") or []),
-                                "search_actions": len(discovery_result.actions),
-                            }
+                if callable(discover) and location_slots:
+                    # Parameter discovery belongs to execution of the learned
+                    # Atomic contract, not to Tool evolution.  Atomic-only must
+                    # therefore receive the same bounded binding opportunity.
+                    # A Tool ref is optional audit context when a usable
+                    # implementation happens to exist.
+                    discovery_tool_refs: list[str] = []
+                    if self.config.features.enable_tool_evolution:
+                        partial = self.selector.select_allowing_missing(
+                            atomic.ref,
+                            {"inputs": planned.params, "harness": "env"},
+                            set(location_slots))
+                        if partial.implementation is not None:
+                            partial_resolved = self.resolver.resolve(
+                                partial.implementation, {"inputs": planned.params})
+                            discovery_tool_refs = [str(item.binding.tool_ref)
+                                                   for item in partial_resolved]
+                    for location_slot in sorted(location_slots):
+                        if planned.params.get(location_slot):
+                            continue
+                        entity_role = location_slot[:-len("_location")]
+                        entity_value = planned.params.get(entity_role)
+                        if entity_value in (None, ""):
+                            continue
+                        excluded_objects = (
+                            _completed_distinct_effect_instances(
+                                task, before, planned.params)
+                            if entity_role == "object" else set())
+                        binding, discovery_result = discover(
+                            task, str(entity_value), resume=resume,
+                            max_locations=self.config.thresholds.acquire_discovery_max_locations,
+                            node_ref=str(planned.ref),
+                            tool_ref=discovery_tool_refs[0]
+                            if discovery_tool_refs else "",
+                            excluded_objects=excluded_objects,
+                            allow_passive_navigable=not produces_possession)
+                        resume = _env_resume_payload(discovery_result)
+                        before = dict(resume.get("state") or before)
+                        remapped = _remap_location_binding(
+                            binding, entity_role, location_slot)
+                        metric = {
+                            "node_ref": str(planned.ref),
+                            "entity_role": entity_role,
+                            "location_role": location_slot,
+                            "found": bool(remapped),
+                            "binding": dict(remapped),
+                            "excluded_objects": sorted(excluded_objects),
+                            "checked_locations": list(
+                                (before.get("meta") or {}).get(
+                                    "checked_locations") or []),
+                            "search_actions": len(discovery_result.actions),
+                        }
+                        trace.metrics.setdefault(
+                            "controlled_location_discovery", []).append(metric)
+                        if produces_possession and entity_role == "object":
                             trace.metrics.setdefault(
-                                "controlled_location_discovery", []).append(metric)
-                            if produces_possession and entity_role == "object":
-                                trace.metrics.setdefault(
-                                    "acquire_location_discovery", []).append(metric)
-                            if remapped:
-                                planned.params.update(remapped)
-                                node.params = dict(planned.params)
-                                location_discovered = True
-                            else:
-                                node.fallback_reason = (
-                                    f"location_discovery_failed:{location_slot}")
-                                break
+                                "acquire_location_discovery", []).append(metric)
+                        if remapped:
+                            planned.params.update(remapped)
+                            node.params = dict(planned.params)
+                            location_discovered = True
+                        else:
+                            node.fallback_reason = (
+                                f"location_discovery_failed:{location_slot}")
+                            break
                 selection_context = {
                     "inputs": planned.params, "harness": "env",
                     "prefer_minimal_after_preparation": location_discovered,

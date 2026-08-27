@@ -43,6 +43,7 @@ import hashlib
 import json
 import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -59,6 +60,7 @@ from experiments.common import (  # noqa: E402
     load_conda_config,
     make_adapter,
     make_llm,
+    run_balanced_baseline_condition,
     run_baseline_condition,
 )
 from experiments.report import (  # noqa: E402
@@ -87,13 +89,46 @@ def _infer_online_limit(run_dir: Path, condition: str) -> int | None:
     return None
 
 
-def _snapshot_frozen_bank(src_data: Path, dst_data: Path) -> None:
-    """把在线进化后的技能库快照复制到评估目录（冻结副本）。"""
-    dst_data.mkdir(parents=True, exist_ok=True)
-    for sub in ("skill_graph", "tools"):
-        src = src_data / sub
-        if src.exists():
-            shutil.copytree(src, dst_data / sub, dirs_exist_ok=True)
+def _snapshot_frozen_bank(src_data: Path, dst_data: Path) -> str:
+    """原子地建立不可变里程碑快照，拒绝混用不同在线 bank。"""
+    source_digest = _bank_digest(src_data)
+    marker_path = dst_data.parent / "frozen_snapshot.json"
+    if marker_path.exists():
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        recorded = str(marker.get("source_bank_sha256") or "")
+        if recorded != source_digest:
+            raise RuntimeError(
+                f"eval-dir 已冻结另一在线里程碑：recorded={recorded[:12]}, "
+                f"current={source_digest[:12]}；请为新里程碑使用新的 --eval-dir")
+        if not dst_data.exists():
+            raise RuntimeError("冻结快照标记存在但 data 目录缺失，拒绝继续")
+        return source_digest
+    if dst_data.exists() and any(dst_data.iterdir()):
+        raise RuntimeError(
+            f"冻结 data 已存在但缺少快照标记：{dst_data}；请使用新的 --eval-dir")
+
+    dst_data.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+            prefix="frozen_snapshot_", dir=str(dst_data.parent)) as temp_name:
+        temporary = Path(temp_name) / "data"
+        temporary.mkdir()
+        for sub in ("skill_graph", "tools"):
+            src = src_data / sub
+            if src.exists():
+                shutil.copytree(src, temporary / sub)
+        if dst_data.exists():
+            # Only an empty directory is accepted above. rmdir is recoverable
+            # in the sense that it cannot remove user data or non-empty trees.
+            dst_data.rmdir()
+        temporary.replace(dst_data)
+    marker_tmp = marker_path.with_suffix(".json.tmp")
+    marker_tmp.write_text(json.dumps({
+        "source_data": str(src_data.resolve()),
+        "source_bank_sha256": source_digest,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    marker_tmp.replace(marker_path)
+    return source_digest
 
 
 def _bank_digest(data_dir: Path) -> str:
@@ -119,7 +154,7 @@ def run_frozen_condition(condition: str, run_dir: Path, eval_dir: Path,
     if not (src_data / "skill_graph").exists() and not (src_data / "tools").exists():
         raise FileNotFoundError(f"未找到在线进化产物：{src_data}（请先运行在线实验）")
     dst_data = eval_dir / condition / "data"
-    _snapshot_frozen_bank(src_data, dst_data)
+    source_digest = _snapshot_frozen_bank(src_data, dst_data)
 
     # 冻结 replay 必须恢复该 condition 在线训练时的 feature flags，不能让所有
     # 条件都按 Full 配置运行。
@@ -134,6 +169,8 @@ def run_frozen_condition(condition: str, run_dir: Path, eval_dir: Path,
             f"冻结库未通过当前代码的 SkillGraph 校验，不能作为正式 replay："
             f"{condition}: {preview}")
     digest_before = _bank_digest(dst_data)
+    if digest_before != source_digest:
+        raise RuntimeError(f"冻结快照内容哈希与在线源不一致：{condition}")
     frozen_before = {
         "skills": system.registry.stats(),
         "tools": system.tool_registry.stats(),
@@ -398,9 +435,15 @@ def main() -> int:
             "frozen_ours_conditions": conditions,
             "heldout_baseline_conditions": list(args.baseline_conditions),
             "heldout_baseline_modes": {
-                "baseline_dynamic": "stateless_dynamic",
-                "flowevo": "original_online_full_library",
+                "baseline_dynamic": (
+                    "stateless_dynamic_balanced_per_task_type"
+                    if args.task_types else "stateless_dynamic"),
+                "flowevo": (
+                    "original_online_full_library_balanced_per_task_type"
+                    if args.task_types else "original_online_full_library"),
             },
+            "task_types": list(args.task_types or []),
+            "per_type_limit": args.per_type_limit,
         }, ensure_ascii=False, indent=2), encoding="utf-8")
 
     from atomic_skillgraph.adapters.toy_benchmarks import build_mock_script
@@ -423,14 +466,25 @@ def main() -> int:
     for condition in args.baseline_conditions:
         print(f"[heldout_baseline] condition={condition} split={args.alfworld_split} ...")
         monitor.condition_start(condition, task_total=len(tasks))
-        results[condition] = run_baseline_condition(
-            condition, args.benchmark,
-            config_path=str(PROJECT_ROOT / "configs" / "flowevo_default.yaml"),
-            output_dir=eval_dir / f"{condition}_flowevo",
-            limit=len(tasks), task_type=args.task_type,
-            alfworld_split=args.alfworld_split,
-            alfworld_data=args.alfworld_data,
-            max_steps=args.max_steps, monitor=monitor)
+        if args.task_types:
+            results[condition] = run_balanced_baseline_condition(
+                condition, args.benchmark,
+                config_path=str(PROJECT_ROOT / "configs" / "flowevo_default.yaml"),
+                output_dir=eval_dir / f"{condition}_flowevo",
+                task_types=list(args.task_types),
+                per_type_limit=int(args.per_type_limit),
+                alfworld_split=args.alfworld_split,
+                alfworld_data=args.alfworld_data,
+                max_steps=args.max_steps, monitor=monitor)
+        else:
+            results[condition] = run_baseline_condition(
+                condition, args.benchmark,
+                config_path=str(PROJECT_ROOT / "configs" / "flowevo_default.yaml"),
+                output_dir=eval_dir / f"{condition}_flowevo",
+                limit=len(tasks), task_type=args.task_type,
+                alfworld_split=args.alfworld_split,
+                alfworld_data=args.alfworld_data,
+                max_steps=args.max_steps, monitor=monitor)
         monitor.condition_finish()
 
     if args.eval_flowevo:

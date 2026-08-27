@@ -157,6 +157,19 @@ wsl -e bash -c "cd /mnt/d/T3S_exp/AtomicSkill-ToolGraph && ~/asg_alfworld_venv/b
 报告含 frozen vs 在线 Late-run 对照表；`bank_unchanged_after_eval` 字段校验评估
 期间技能库未被写入（冻结快照为在线产物的副本，原库零改动）。
 
+### 分阶段扩大在线进化（120 → 300）
+
+正式 ALFWorld 协议支持保存中间里程碑。先在 train 六类各 20 题完成 120
+题在线进化，再冻结评估 valid_unseen 六类各 10 题。继续扩大时使用
+`--extend-online --extend-from-run <120目录>`：程序把 120 目录完整克隆到新的
+300 目录，校验三个 condition bank 的 SHA-256，并只在新副本中追加后 180 题。
+原 120 目录保持不变；新副本的 `freeze_skills=False`，Skill、Tool、utility 和
+生命周期统计都可像直接在线运行 300 题一样继续更新。`online_lineage.json`
+保存来源目录与 bank 哈希。扩展命令中断后可原命令续跑，不会重新覆盖副本。
+
+每个冻结评估目录也绑定来源 bank 哈希。同一个评估目录不能混用 120 与 300
+里程碑；为每个里程碑指定不同的 `--eval-dir`，即可永久保留中间测试结果。
+
 或在 WSL 终端内 `cd /mnt/d/T3S_exp/AtomicSkill-ToolGraph` 后
 `source ~/asg_alfworld_venv/bin/activate`，直接运行 `experiments/run_small.py` /
 `run_full.py`（加 `--alfworld-data ~/.cache/alfworld`）。API 配置沿用

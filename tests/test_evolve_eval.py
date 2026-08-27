@@ -1,6 +1,7 @@
 """冻结 Skill 进化效果评估测试（toy，无 API）。"""
 
 import dataclasses
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,7 +18,17 @@ from atomic_skillgraph.adapters.toy_benchmarks import (  # noqa: E402
 from atomic_skillgraph.core.config import SystemConfig  # noqa: E402
 from atomic_skillgraph.system import AtomicSkillGraphSystem  # noqa: E402
 from atomic_skillgraph.tools.sandbox import Sandbox  # noqa: E402
-from experiments.common import balanced_task_subset  # noqa: E402
+from experiments import common as experiment_common  # noqa: E402
+from experiments.common import (  # noqa: E402
+    balanced_task_subset,
+    run_our_condition,
+    run_balanced_baseline_condition,
+)
+from experiments.run_evolve_eval import _snapshot_frozen_bank  # noqa: E402
+from experiments.run_small import (  # noqa: E402
+    _clone_online_run,
+    _condition_bank_digests,
+)
 
 TASK_ORDER = ["toy_code_double", "toy_code_triple", "toy_code_double_variant",
               "toy_code_square", "toy_math_add", "toy_math_mul", "toy_math_div",
@@ -30,6 +41,100 @@ def test_balanced_task_subset_is_equal_and_round_robin():
     tasks += [SimpleNamespace(task_id=f"b{i}", task_type="b") for i in range(3)]
     selected = balanced_task_subset(tasks, ["a", "b"], 2)
     assert [task.task_id for task in selected] == ["a0", "b0", "a1", "b1"]
+
+
+def test_balanced_baseline_runs_each_type_and_aggregates(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_run(condition, benchmark, **kwargs):
+        label = kwargs["task_type"]
+        calls.append((label, kwargs["limit"], Path(kwargs["output_dir"])))
+        passed = {"a": 1, "b": 2}[label]
+        return {
+            "subprocess": {"returncode": 0},
+            "episodes": [{
+                "num_tasks": 2,
+                "num_passed": passed,
+                "success_rate": passed / 2,
+                "avg_tokens": {"a": 10.0, "b": 30.0}[label],
+                "flowevo_summary": {"total": 2, "success": passed},
+            }],
+        }
+
+    monkeypatch.setattr(experiment_common, "run_baseline_condition", fake_run)
+    result = run_balanced_baseline_condition(
+        "baseline_dynamic", "alfworld", config_path="unused.yaml",
+        output_dir=tmp_path, task_types=["a", "b"], per_type_limit=2)
+    assert [(label, limit) for label, limit, _ in calls] == [("a", 2), ("b", 2)]
+    assert calls[0][2] != calls[1][2]
+    episode = result["episodes"][0]
+    assert episode["num_tasks"] == 4
+    assert episode["num_passed"] == 3
+    assert episode["success_rate"] == 0.75
+    assert episode["avg_tokens"] == 20.0
+
+
+def test_online_progress_can_extend_only_by_exact_prefix(workspace_tmp):
+    tasks = toy_tasks(("code", "math", "env"))
+    config = SystemConfig(data_dir=workspace_tmp / "unused", seed=42)
+    config = dataclasses.replace(
+        config, llm=dataclasses.replace(config.llm, mock=True))
+    adapter = ToyAdapter(kinds=("code", "math", "env"),
+                         sandbox=Sandbox(tmp_root=str(workspace_tmp / "sandbox")))
+    output = workspace_tmp / "online_extension"
+    first = run_our_condition(
+        "atomic_graph_only", adapter, config, tasks[:2],
+        mock_script=build_mock_script(), output_dir=output)
+    assert len(first["episodes"]) == 2
+    extended = run_our_condition(
+        "atomic_graph_only", adapter, config, tasks[:3],
+        mock_script=build_mock_script(), output_dir=output,
+        allow_task_extension=True)
+    assert len(extended["episodes"]) == 3
+    progress = json.loads((output / "atomic_graph_only" /
+                           "online_progress.json").read_text(encoding="utf-8"))
+    assert progress["completed"] == 3
+    assert len(progress["task_signature"]) == 3
+
+
+def test_frozen_snapshot_rejects_later_online_milestone(workspace_tmp):
+    source = workspace_tmp / "source"
+    (source / "skill_graph").mkdir(parents=True)
+    (source / "skill_graph" / "node.json").write_text(
+        '{"version": 1}', encoding="utf-8")
+    target = workspace_tmp / "eval" / "condition" / "data"
+    first_digest = _snapshot_frozen_bank(source, target)
+    assert first_digest
+    assert (target / "skill_graph" / "node.json").exists()
+    (source / "skill_graph" / "node.json").write_text(
+        '{"version": 2}', encoding="utf-8")
+    import pytest
+    with pytest.raises(RuntimeError, match="另一在线里程碑"):
+        _snapshot_frozen_bank(source, target)
+
+
+def test_online_milestone_clone_is_independent_and_writable(workspace_tmp):
+    source = workspace_tmp / "online_120"
+    condition = "atomic_graph_only"
+    data = source / condition / "data" / "skill_graph"
+    data.mkdir(parents=True)
+    (data / "node.json").write_text('{"utility": 0.5}', encoding="utf-8")
+    (source / condition / "online_progress.json").write_text(
+        '{"completed": 120}', encoding="utf-8")
+    (source / "task_manifest.json").write_text(
+        '{"selection": {"task_count": 120}}', encoding="utf-8")
+    before = _condition_bank_digests(source, [condition])
+
+    destination = workspace_tmp / "online_300"
+    recorded = _clone_online_run(source, destination, [condition])
+    assert recorded == before
+    (destination / condition / "data" / "skill_graph" /
+     "node.json").write_text('{"utility": 0.9}', encoding="utf-8")
+    assert _condition_bank_digests(source, [condition]) == before
+    assert _condition_bank_digests(destination, [condition]) != before
+    lineage = json.loads((destination / "online_lineage.json").read_text(
+        encoding="utf-8"))
+    assert lineage["destination_freeze_skills"] is False
 
 
 def _build_system(data_dir: Path, freeze: bool) -> AtomicSkillGraphSystem:

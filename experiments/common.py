@@ -141,7 +141,8 @@ def balanced_task_subset(tasks: list, task_types: list[str],
 def run_our_condition(condition: str, adapter, config: SystemConfig,
                       tasks: list, mock_script: dict[str, Any] | None = None,
                       output_dir: str | Path | None = None,
-                      monitor=None) -> dict[str, Any]:
+                      monitor=None, allow_task_extension: bool = False,
+                      ) -> dict[str, Any]:
     """运行我方条件（v2.0 runtime 条件/消融）。
 
     每个条件使用独立 data 目录（条件间知识不互相污染）。
@@ -161,11 +162,22 @@ def run_our_condition(condition: str, adapter, config: SystemConfig,
         progress_path = condition_dir / "online_progress.json"
         if progress_path.exists():
             progress = json.loads(progress_path.read_text(encoding="utf-8"))
-            if progress.get("task_signature") != task_signature:
+            prior_signature = list(progress.get("task_signature") or [])
+            same_signature = prior_signature == task_signature
+            valid_extension = (
+                allow_task_extension
+                and len(prior_signature) < len(task_signature)
+                and prior_signature == task_signature[:len(prior_signature)]
+            )
+            if not (same_signature or valid_extension):
                 raise RuntimeError(
                     f"{condition} 已有进度的任务清单与本次不一致；"
-                    "请使用新 run-dir 或 --fresh-conditions")
+                    "请使用新 run-dir、--fresh-conditions，或仅以前缀追加方式"
+                    "使用 --extend-online")
             episodes = list(progress.get("episodes") or [])
+            if len(episodes) > len(prior_signature):
+                raise RuntimeError(
+                    f"{condition} online_progress 损坏：episode 数超过任务签名")
     llm = make_llm(config, mock_script=mock_script)
     system = AtomicSkillGraphSystem(config, adapter, llm)
     completed = len(episodes)
@@ -241,6 +253,84 @@ def run_baseline_condition(condition: str, benchmark: str, *, config_path: str,
     }
 
 
+def run_balanced_baseline_condition(
+        condition: str, benchmark: str, *, config_path: str,
+        output_dir: str | Path, task_types: list[str], per_type_limit: int,
+        alfworld_split: str = "eval_out_of_distribution",
+        alfworld_data: str | None = None, max_steps: int | None = None,
+        monitor=None) -> dict[str, Any]:
+    """按 task type 分别运行原版 baseline，再汇总为一个均衡结果。
+
+    FlowEvo 的 ALFWorld 入口一次只接受一个 ``task_type``。如果直接给它
+    ``limit = 类型数 * 每类数量``，它会取 split 的前 N 题，不能保证与 ours
+    的均衡清单具有相同的任务类型分布。因此这里为每种类型建立独立输出目录，
+    各取前 ``per_type_limit`` 题，最后按真实任务数加权汇总。
+    """
+    if benchmark != "alfworld":
+        raise ValueError("均衡 task-type baseline 目前只适用于 ALFWorld")
+    labels = [str(label) for label in task_types if str(label).strip()]
+    if not labels or per_type_limit <= 0:
+        raise ValueError("task_types 不能为空且 per_type_limit 必须为正整数")
+
+    output_root = Path(output_dir)
+    by_type: dict[str, dict[str, Any]] = {}
+    subprocesses: dict[str, Any] = {}
+    total = passed = 0
+    weighted_tokens = 0.0
+    completed = 0
+    flowevo_condition = BASELINE_FLOWEVO_CONDITIONS[condition]["alfworld"]
+    for label in labels:
+        result = run_baseline_condition(
+            condition, benchmark, config_path=config_path,
+            output_dir=output_root / "by_task_type" / label,
+            limit=per_type_limit, task_type=label,
+            alfworld_split=alfworld_split, alfworld_data=alfworld_data,
+            max_steps=max_steps, monitor=None)
+        episode = (result.get("episodes") or [{}])[0]
+        count = int(episode.get("num_tasks", 0) or 0)
+        if count != per_type_limit:
+            raise RuntimeError(
+                f"{condition}/{label} 应评估 {per_type_limit} 题，实际为 {count}")
+        success_count = int(episode.get("num_passed", 0) or 0)
+        avg_tokens = float(episode.get("avg_tokens", 0.0) or 0.0)
+        total += count
+        passed += success_count
+        weighted_tokens += avg_tokens * count
+        completed += count
+        by_type[label] = {
+            "num_tasks": count,
+            "num_passed": success_count,
+            "success_rate": float(episode.get("success_rate", 0.0) or 0.0),
+            "avg_tokens": avg_tokens,
+            "flowevo_summary": episode.get("flowevo_summary") or {},
+        }
+        subprocesses[label] = result.get("subprocess") or {}
+        if monitor is not None:
+            monitor.task_update(
+                completed, note=f"{label}: {success_count}/{count}")
+
+    summary = {
+        "total": total,
+        "success": passed,
+        "pass_rate": passed / total if total else 0.0,
+        "avg_tokens": weighted_tokens / total if total else 0.0,
+        "sampling": "balanced_first_n_per_task_type",
+        "per_type_limit": per_type_limit,
+        "per_task_type": by_type,
+    }
+    return {
+        "condition": condition,
+        "kind": "flowevo_baseline",
+        "flowevo_condition": flowevo_condition,
+        "benchmark": benchmark,
+        "subprocess_by_task_type": subprocesses,
+        "episodes": [_flowevo_summary_episode(
+            summary, benchmark, flowevo_condition)],
+        "balanced_task_types": labels,
+        "per_type_limit": per_type_limit,
+    }
+
+
 # ---------------------------------------------------------------------------
 # FlowEvo 输出解析
 # ---------------------------------------------------------------------------
@@ -302,7 +392,8 @@ def run_conditions(*, conditions: list[str], benchmark: str, config: SystemConfi
                    alfworld_data: str | None = None,
                    max_steps: int | None = None,
                    mock_script: dict[str, Any] | None = None,
-                   initial_results: dict[str, Any] | None = None) -> dict[str, Any]:
+                   initial_results: dict[str, Any] | None = None,
+                   allow_task_extension: bool = False) -> dict[str, Any]:
     """按条件列表运行实验（baseline 走 FlowEvo 子进程，ours 走 v2.0 runtime）。"""
     from experiments.progress import ProgressMonitor
     output_dir = Path(output_dir)
@@ -328,7 +419,8 @@ def run_conditions(*, conditions: list[str], benchmark: str, config: SystemConfi
             monitor.condition_start(condition, task_total=len(tasks))
             result = run_our_condition(condition, adapter, config, tasks,
                                        mock_script=mock_script,
-                                       output_dir=output_dir, monitor=monitor)
+                                       output_dir=output_dir, monitor=monitor,
+                                       allow_task_extension=allow_task_extension)
         monitor.condition_finish()
         results[condition] = result
         # 每次条件写一次汇总（支持中断后查看已完成条件）

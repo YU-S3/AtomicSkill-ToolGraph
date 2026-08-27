@@ -117,6 +117,8 @@ ALFWorld 冷启动时，LLM 根据 Observation 逐步给出动作，环境执行
 
 Planner 选择 Composite 时先计算其子 Atomic Effect 的闭包，再用任务目标 Effect 做充分性硬过滤。完整覆盖目标的 Composite 优先，summary 文本相似度和历史 utility 只能在同样充分的候选之间排序。没有完整 Composite 时才允许补 dynamic gap；gap 从任务规范参数中绑定对象、目标位置和处理设备，仍有占位符无法绑定时放弃该 partial Composite，回到 Atomic greedy plan。
 
+完整 Composite 中经过验证的因果节点不会因为输入暂时未绑定而被删除。某节点的 Effect 如果是后续节点的 Precondition，说明它是必须保留的生产者。Runtime 依次尝试从任务语义参数、当前状态、DATA_FLOW 和受控环境发现中绑定缺失参数；仍无法执行时让该节点失败并阻断依赖它的后续节点，不允许后续节点越过 Atomic 边界把前置能力吞并到自己名下。冻结与非冻结、Atomic-only 与 Full 都遵守同一条因果规则。
+
 Seeded 或 Dynamic 执行某个节点时，框架给 LLM 的目标是该节点绑定后的 Effect，例如“只完成拿取 apple 这一步”，而不是再次给它整题目标。因此 LLM 不会在 Acquire 节点中顺手完成 Heat 和 Place。框架在动作后只用当前节点的 Effect 判定该节点是否完成；环境整题 `won` 只负责最终任务成功，不能反过来把尚未验证的节点标成成功。
 
 Contract 提取也按动作因果范围收紧：Acquire 只保留目标对象及其来源位置，Heat、Clean、Cool 和 Place 只保留手中目标对象这类必要条件，不把同一房间里偶然出现的碗、杯子等物体写成前置条件。`apple` 与环境实例名 `apple_1` 按同一对象类匹配；`object.in_receptacle` 在规划覆盖判断中归一为 `object.at_location`。Validator 的前置条件用于判断节点执行前是否可进入，节点执行后的成功只由目标 Effect 和后置条件决定，不能因为 Effect 已完成但旧 Observation 没显式重述前置事实而误判失败。

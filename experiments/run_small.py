@@ -22,7 +22,9 @@ ours 条件走 v2.0 runtime；--mock 时用 MockLLM 走完整链路（验证管�
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -47,6 +49,73 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CORE_CONDITIONS = ["baseline_dynamic", "flowevo", "atomic_graph_only",
                    "tool_repo_only", "atomic_skillgraph_full"]
 DEFAULT_LIMITS = {"alfworld": 10, "humaneval": 10, "gsm8k": 50, "toy": 12}
+
+
+def _tree_digest(root: Path) -> str:
+    digest = hashlib.sha256()
+    if not root.exists():
+        return ""
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _condition_bank_digests(run_dir: Path,
+                            conditions: list[str]) -> dict[str, str]:
+    """Hash only mutable knowledge banks, excluding reports/progress files."""
+    return {
+        condition: _tree_digest(run_dir / condition / "data")
+        for condition in conditions
+        if (run_dir / condition / "data").exists()
+    }
+
+
+def _clone_online_run(source_run: Path, destination_run: Path,
+                      conditions: list[str]) -> dict[str, str]:
+    """Clone an immutable milestone into an independently writable branch."""
+    if not source_run.is_dir():
+        raise ValueError(f"在线来源不存在或不是目录：{source_run}")
+    if source_run.resolve() == destination_run.resolve():
+        raise ValueError("扩展目标必须是新目录，不能原地修改来源里程碑")
+    missing = [condition for condition in conditions
+               if not (source_run / condition / "data").is_dir()
+               or not (source_run / condition / "online_progress.json").is_file()]
+    if missing:
+        raise ValueError(f"来源里程碑缺少完整 condition bank/progress：{missing}")
+    if not (source_run / "task_manifest.json").is_file():
+        raise ValueError("来源里程碑缺少 task_manifest.json")
+
+    source_digests = _condition_bank_digests(source_run, conditions)
+    lineage_path = destination_run / "online_lineage.json"
+    if destination_run.exists():
+        if not lineage_path.is_file():
+            raise ValueError(f"扩展目标已存在且不是可续跑分支：{destination_run}")
+        lineage = json.loads(lineage_path.read_text(encoding="utf-8"))
+        if (str(lineage.get("source_run_dir") or "")
+                != str(source_run.resolve())):
+            raise ValueError("扩展目标的来源里程碑与本次 --extend-from-run 不一致")
+        recorded = dict(lineage.get("source_condition_bank_sha256") or {})
+        if recorded != source_digests:
+            raise ValueError("来源 120 里程碑在分支建立后发生变化，拒绝混合续跑")
+        return source_digests
+
+    destination_run.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source_run, destination_run)
+    copied_digests = _condition_bank_digests(destination_run, conditions)
+    if source_digests != copied_digests:
+        raise RuntimeError("在线里程碑克隆后 bank 哈希不一致，拒绝继续")
+    lineage_path.write_text(json.dumps({
+        "mode": "writable_online_fork",
+        "source_run_dir": str(source_run.resolve()),
+        "source_condition_bank_sha256": source_digests,
+        "source_remains_unchanged": True,
+        "destination_freeze_skills": False,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    return source_digests
 
 
 def main() -> int:
@@ -82,6 +151,15 @@ def main() -> int:
                         help="精确复用指定运行目录（不新建时间戳目录）")
     parser.add_argument("--fresh-conditions", action="store_true",
                         help="重跑所选条件前将旧 condition data 移入可恢复备份")
+    parser.add_argument(
+        "--extend-online", action="store_true",
+        help=("从 --extend-from-run 克隆一个在线里程碑到新的 --run-dir，"
+              "再以前缀追加任务继续进化"),
+    )
+    parser.add_argument(
+        "--extend-from-run", default=None,
+        help="在线扩展的只读来源里程碑；来源保持不变，新的 run-dir 可正常写入",
+    )
     args = parser.parse_args()
 
     if args.task_type and args.task_types:
@@ -90,6 +168,20 @@ def main() -> int:
         parser.error("--task-types 目前只用于 ALFWorld label 均衡取样")
     if args.task_types and (args.per_type_limit is None or args.per_type_limit <= 0):
         parser.error("--task-types 需要正整数 --per-type-limit")
+    if args.extend_online:
+        if args.benchmark != "alfworld" or args.alfworld_split != "train":
+            parser.error("--extend-online 只支持 ALFWorld train 在线进化")
+        if not args.run_dir:
+            parser.error("--extend-online 必须显式指定新的 --run-dir")
+        if not args.extend_from_run:
+            parser.error("--extend-online 必须指定 --extend-from-run 来源里程碑")
+        if args.fresh_conditions:
+            parser.error("--extend-online 不能与 --fresh-conditions 同用")
+        invalid = [name for name in args.conditions
+                   if name in ("baseline_dynamic", "flowevo")]
+        if invalid:
+            parser.error("--extend-online 只追加 ours 条件，不追加 baseline："
+                         f"{invalid}")
     limit = args.limit if args.limit is not None else DEFAULT_LIMITS[args.benchmark]
     if args.task_types:
         limit = int(args.per_type_limit) * len(args.task_types)
@@ -106,7 +198,10 @@ def main() -> int:
     timestamp = time.strftime("%Y%m%dT%H%M%S")
     if args.run_dir:
         run_dir = Path(args.run_dir).resolve()
-        print(f"[rerun] 精确复用运行目录：{run_dir}")
+        if args.extend_online:
+            print(f"[extend-online] 新的可写运行目录：{run_dir}")
+        else:
+            print(f"[rerun] 精确复用运行目录：{run_dir}")
     elif args.resume:
         existing = sorted(output_dir.glob(f"{args.benchmark}_*"), reverse=True)
         if existing:
@@ -116,7 +211,16 @@ def main() -> int:
             run_dir = output_dir / f"{args.benchmark}_{timestamp}"
     else:
         run_dir = output_dir / f"{args.benchmark}_{timestamp}"
-    run_dir.mkdir(parents=True, exist_ok=True)
+    if args.extend_online:
+        source_run = Path(args.extend_from_run).resolve()
+        try:
+            _clone_online_run(source_run, run_dir, list(args.conditions))
+        except ValueError as exc:
+            parser.error(str(exc))
+        print(f"[extend-online] 已克隆只读来源：{source_run}")
+        print("[extend-online] 新副本 freeze_skills=False，可正常更新 Skill/Tool/utility")
+    else:
+        run_dir.mkdir(parents=True, exist_ok=True)
 
     if args.fresh_conditions:
         invalid_fresh = [name for name in args.conditions
@@ -181,10 +285,46 @@ def main() -> int:
         manifest_path = run_dir / "task_manifest.json"
         if manifest_path.exists():
             previous = json.loads(manifest_path.read_text(encoding="utf-8"))
-            if previous != manifest:
+            prior_core = {key: value for key, value in previous.items()
+                          if key != "extension_history"}
+            if prior_core == manifest:
+                manifest["extension_history"] = list(
+                    previous.get("extension_history") or [])
+            elif args.extend_online:
+                prior_tasks = list(previous.get("tasks") or [])
+                prior_selection = dict(previous.get("selection") or {})
+                same_protocol = (
+                    previous.get("benchmark") == manifest.get("benchmark")
+                    and previous.get("split") == manifest.get("split")
+                    and list(prior_selection.get("task_types") or [])
+                    == list(manifest["selection"].get("task_types") or [])
+                )
+                strict_prefix = (
+                    len(prior_tasks) < len(manifest["tasks"])
+                    and prior_tasks == manifest["tasks"][:len(prior_tasks)]
+                )
+                prior_per_type = int(prior_selection.get("per_type_limit") or 0)
+                next_per_type = int(manifest["selection"].get(
+                    "per_type_limit") or 0)
+                if not (same_protocol and strict_prefix
+                        and next_per_type > prior_per_type):
+                    raise RuntimeError(
+                        "--extend-online 只允许同一 train split、相同 task types、"
+                        "严格前缀且 per-type-limit 增大的任务清单")
+                history = list(previous.get("extension_history") or [])
+                history.append({
+                    "task_count": len(prior_tasks),
+                    "per_type_limit": prior_per_type,
+                    "last_task_id": (prior_tasks[-1].get("task_id")
+                                     if prior_tasks else ""),
+                })
+                manifest["extension_history"] = history
+                print(f"[extend-online] {len(prior_tasks)} -> {len(manifest['tasks'])} "
+                      "tasks；保留三个 ours bank 并继续进化")
+            else:
                 raise RuntimeError(
-                    "run-dir 已绑定另一组 ALFWorld 任务；请使用新目录，"
-                    "不能跨 split 复用进化 bank")
+                    "run-dir 已绑定另一组 ALFWorld 任务；扩展同一 train bank "
+                    "必须显式使用 --extend-online")
         manifest_path.write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -198,7 +338,7 @@ def main() -> int:
 
     # --resume：跳过该运行目录中已完成的条件
     results_path = run_dir / "results.json"
-    if args.resume and results_path.exists():
+    if args.resume and not args.extend_online and results_path.exists():
         done = set(json.loads(results_path.read_text(encoding="utf-8")).keys())
         skipped = [c for c in conditions if c in done]
         conditions = [c for c in conditions if c not in done]
@@ -231,6 +371,7 @@ def main() -> int:
         max_steps=config.max_steps if args.benchmark == "alfworld" else None,
         mock_script=mock_script,
         initial_results=prior_results,
+        allow_task_extension=args.extend_online,
     )
     # --resume：合并历史结果（report 覆盖全部条件，而非仅本次新跑的）
     if prior_results:

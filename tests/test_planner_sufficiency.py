@@ -93,6 +93,35 @@ def test_complete_composite_beats_higher_scoring_partial(workspace_tmp):
     assert "composite_effect_complete" in plan.notes
 
 
+def test_complete_composite_retains_unbound_causal_producer(workspace_tmp):
+    """未知来源位置必须留给 Runtime 发现，不能删除 Acquire 生产者。"""
+    registry = SkillGraphRegistry(workspace_tmp / "causal_unbound_graph")
+    acquire = _atomic(
+        "alfworld.acquire_object", "agent.holds",
+        ["object", "object_location"])
+    heat = _atomic("alfworld.heat_object", "object.heated", ["object"])
+    place = _atomic("alfworld.place_object", "object.at_location",
+                    ["object", "target_location"])
+    heat.preconditions = [{
+        "predicate": "agent.holds",
+        "args": {"object": "$inputs.object"},
+    }]
+    for atomic in (acquire, heat, place):
+        registry.register(atomic)
+    registry.register(_composite(
+        "composite.alfworld.causal-unbound",
+        [str(acquire.ref), str(heat.ref), str(place.ref)],
+        "acquire, heat, place", 1.0,
+        target_effects=_task().target_effects))
+
+    plan = AtomicPlanner(registry, SystemConfig()).compile_runtime_graph(
+        _task(params={"object": "mug", "target_location": "cabinet 1"}))
+    assert [node.ref.logical_id for node in plan.nodes] == [
+        "alfworld.acquire_object", "alfworld.heat_object",
+        "alfworld.place_object"]
+    assert "object_location" not in plan.nodes[0].params
+
+
 def test_partial_composite_dynamic_gap_binds_task_params(workspace_tmp):
     registry = _registry(workspace_tmp, include_complete=False)
     planner = AtomicPlanner(registry, SystemConfig())

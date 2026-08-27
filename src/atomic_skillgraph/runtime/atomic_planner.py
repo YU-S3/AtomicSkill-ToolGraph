@@ -197,8 +197,12 @@ class AtomicPlanner:
             nodes.append(PlannedNode(ref=obj.ref, step_id=f"step_{index:03d}",
                                      params=params, source="composite",
                                      target_effects=list(getattr(obj, "effects", []))))
-        nodes = self._prune_unbound_support_nodes(
-            task, self._append_dynamic_gaps(task, nodes))
+        # A Composite is a validated causal workflow.  In particular, an
+        # intermediate Effect consumed as a later Precondition identifies a
+        # required producer; it is the strongest reason to retain the node,
+        # never a reason to drop it.  Unbound occurrence parameters are
+        # resolved from state/data-flow or bounded runtime discovery.
+        nodes = self._append_dynamic_gaps(task, nodes)
         return RuntimePlan(
             start_mode="warm",
             composite_ref=str(composite.ref),
@@ -207,51 +211,6 @@ class AtomicPlanner:
             retrieved=[h.to_dict() for h in retrieved],
             notes=[f"composite_plan:{composite.ref.logical_id}"],
         )
-
-    def _prune_unbound_support_nodes(self, task,
-                                     nodes: list[PlannedNode]) -> list[PlannedNode]:
-        """Drop only unexecutable helper occurrences subsumed downstream.
-
-        A hidden source/resource location can make a standalone helper
-        occurrence unbound, while the later state-changing capability can
-        discover that location itself.  The decision is contract-driven: the
-        node must have missing declared inputs, produce no requested goal, and
-        all of its Effects must be consumed as later Preconditions.
-        """
-        target_keys = self._target_effect_keys(task.target_effects)
-        kept: list[PlannedNode] = []
-        for index, node in enumerate(nodes):
-            atomic = None if node.dynamic else self.registry.get_recommended(
-                node.ref.logical_id)
-            if atomic is None:
-                kept.append(node)
-                continue
-            required_inputs = {str(item.get("name") or "")
-                               for item in (atomic.inputs or [])
-                               if isinstance(item, dict) and item.get("name")}
-            missing = {name for name in required_inputs
-                       if node.params.get(name) in (None, "")}
-            effects = {
-                _canonical_predicate(str(item.get("predicate") or ""))
-                for item in (atomic.effects or []) if isinstance(item, dict)
-            }
-            later_preconditions = {
-                _canonical_predicate(str(item.get("predicate") or ""))
-                for later in nodes[index + 1:]
-                for later_obj in ([self.registry.get_recommended(
-                    later.ref.logical_id)] if not later.dynamic else [])
-                if later_obj is not None
-                for item in (later_obj.preconditions or [])
-                if isinstance(item, dict)
-            }
-            removable = (bool(missing) and bool(effects)
-                         and not (effects & target_keys)
-                         and effects.issubset(later_preconditions))
-            if not removable:
-                kept.append(node)
-        for index, node in enumerate(kept):
-            node.step_id = f"step_{index:03d}"
-        return kept
 
     @staticmethod
     def _resolve_composite_params(stored: dict[str, Any], task) -> dict[str, Any]:
