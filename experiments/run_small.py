@@ -87,6 +87,23 @@ def _clone_online_run(source_run: Path, destination_run: Path,
         raise ValueError(f"来源里程碑缺少完整 condition bank/progress：{missing}")
     if not (source_run / "task_manifest.json").is_file():
         raise ValueError("来源里程碑缺少 task_manifest.json")
+    source_manifest = json.loads(
+        (source_run / "task_manifest.json").read_text(encoding="utf-8"))
+    source_tasks = list(source_manifest.get("tasks") or [])
+    source_signature = [{
+        "task_id": str(item.get("task_id") or ""),
+        "task_type": str(item.get("task_type") or ""),
+        "game_file": str(item.get("game_file") or ""),
+    } for item in source_tasks]
+    for condition in conditions:
+        progress = json.loads((source_run / condition /
+                               "online_progress.json").read_text(encoding="utf-8"))
+        if (int(progress.get("completed", -1)) != len(source_tasks)
+                or list(progress.get("task_signature") or []) != source_signature
+                or len(progress.get("episodes") or []) != len(source_tasks)):
+            raise ValueError(
+                f"来源里程碑尚未完整完成：{condition}，"
+                f"要求 {len(source_tasks)} 个已记录 episode")
 
     source_digests = _condition_bank_digests(source_run, conditions)
     lineage_path = destination_run / "online_lineage.json"

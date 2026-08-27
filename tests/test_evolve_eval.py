@@ -119,10 +119,14 @@ def test_online_milestone_clone_is_independent_and_writable(workspace_tmp):
     data = source / condition / "data" / "skill_graph"
     data.mkdir(parents=True)
     (data / "node.json").write_text('{"utility": 0.5}', encoding="utf-8")
-    (source / condition / "online_progress.json").write_text(
-        '{"completed": 120}', encoding="utf-8")
-    (source / "task_manifest.json").write_text(
-        '{"selection": {"task_count": 120}}', encoding="utf-8")
+    signature = [{"task_id": "task_1", "task_type": "type_a",
+                  "game_file": "game_1"}]
+    (source / condition / "online_progress.json").write_text(json.dumps({
+        "completed": 1, "task_signature": signature, "episodes": [{}],
+    }), encoding="utf-8")
+    (source / "task_manifest.json").write_text(json.dumps({
+        "selection": {"task_count": 1}, "tasks": signature,
+    }), encoding="utf-8")
     before = _condition_bank_digests(source, [condition])
 
     destination = workspace_tmp / "online_300"
