@@ -222,6 +222,27 @@ def test_post_effect_can_pass_when_precondition_was_unobserved():
     assert result.passed is True
 
 
+def test_post_effect_cannot_hide_known_false_possession_precondition():
+    atomic = AbstractAtomicSkill(
+        ref=SkillRef("env.heat", "1.0.0"), summary="heat",
+        inputs=[{"name": "object"}], outputs=[],
+        preconditions=[{"predicate": "agent.holds",
+                        "args": {"object": "$inputs.object"}}],
+        effects=[{"predicate": "object.heated",
+                  "args": {"object": "$inputs.object"}}],
+        status=SkillStatus.ACTIVE,
+    )
+    result = NodeValidator().validate_atomic(
+        atomic,
+        {"facts": [], "inventory": []},
+        {"facts": ["object_heated(apple_1)"], "inventory": []},
+        inputs={"object": "apple"})
+    assert result.checks["preconditions"] is False
+    assert result.checks["preconditions_not_known_false"] is False
+    assert result.checks["effects"] is True
+    assert result.passed is False
+
+
 def test_receptacle_and_location_effects_share_coverage_key():
     assert _canonical_predicate("object.in_receptacle") == "object.at_location"
 

@@ -13,6 +13,7 @@ from ..core.predicates import (
     StateSnapshot,
     bind_args,
     check_effects,
+    evaluate_predicate,
     evaluate_preconditions,
 )
 from ..core.skill_ir import AbstractAtomicSkill
@@ -49,6 +50,11 @@ class NodeValidator:
         result.checks["preconditions"] = pre_ok
         if not pre_ok:
             result.messages.append(f"前置条件未满足：{missing_pre}")
+        known_false = _known_false_preconditions(
+            before, before_snapshot, inputs, atomic.preconditions, context)
+        result.checks["preconditions_not_known_false"] = not known_false
+        if known_false:
+            result.messages.append(f"前置条件有明确反证：{known_false}")
 
         # 核心 Effect
         effect_ok, missing_effect = check_effects(after_snapshot, inputs,
@@ -81,3 +87,31 @@ class NodeValidator:
                           if name != "preconditions" and not name.startswith("pre_check:")]
         result.passed = all(outcome_checks) if outcome_checks else effect_ok
         return result
+
+
+def _known_false_preconditions(
+        raw_before: dict[str, Any], snapshot: StateSnapshot,
+        inputs: dict[str, Any], preconditions: list[dict[str, Any]],
+        context: dict[str, Any]) -> list[str]:
+    """Return only preconditions contradicted by a closed-world state field.
+
+    Most environment facts are partially observable, so absence is unknown.
+    Agent inventory is different: when the adapter supplies the ``inventory``
+    field it is the complete held-object set.  An absent ``agent.holds`` fact
+    is therefore known false and must prevent cross-boundary attribution.
+    """
+    if "inventory" not in raw_before:
+        return []
+    contradicted: list[str] = []
+    for precondition in preconditions:
+        if not isinstance(precondition, dict):
+            continue
+        name = str(precondition.get("predicate") or "").replace("_", ".")
+        if name != "agent.holds":
+            continue
+        bound = dict(precondition)
+        bound["args"] = bind_args(
+            dict(precondition.get("args") or {}), inputs, context)
+        if not evaluate_predicate(snapshot, bound):
+            contradicted.append(str(bound))
+    return contradicted
