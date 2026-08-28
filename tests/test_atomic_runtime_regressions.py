@@ -174,7 +174,11 @@ def test_atomic_only_runs_controlled_location_discovery(workspace_tmp):
         state={"facts": [], "inventory": [], "meta": {}},
         target_effects=list(acquire.effects))
     plan = RuntimePlan(nodes=[PlannedNode(
-        ref=acquire.ref, step_id="step_000", params={"object": "mug"},
+        ref=acquire.ref, step_id="step_000",
+        # A symbolic source is unresolved even though the string is non-empty.
+        # It must trigger bounded discovery instead of being sent to a Tool.
+        params={"object": "mug",
+                "object_location": "$flow.object_location"},
         target_effects=list(acquire.effects))])
     trace = TraceRecord(task_id=task.task_id, benchmark="alfworld")
     runtime = RuntimeGraph(task.task_id, plan)

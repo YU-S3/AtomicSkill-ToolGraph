@@ -4,7 +4,7 @@ set -euo pipefail
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$project_root"
 
-run_dir="${ASG_RUN_DIR:-runs/formal_alfworld_train120_binding_v1}"
+run_dir="${ASG_RUN_DIR:-runs/formal_alfworld_train120_runtime_ir_v1}"
 python_bin="${ASG_PYTHON:-$HOME/asg_alfworld_venv/bin/python}"
 alfworld_data="${ALFWORLD_DATA:-$HOME/.cache/alfworld}"
 config_path="${ASG_CONFIG:-configs/default.yaml}"

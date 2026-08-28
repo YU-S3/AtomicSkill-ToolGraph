@@ -296,6 +296,7 @@ class AtomicPlanner:
             branch_id="task", binding_specs=binding_specs,
             params=params, source="task_dynamic", target_effects=effects,
             dynamic=True,
+            budget_scope="task",
         )
         return RuntimePlan(
             start_mode="cold", nodes=[node], edges=[],

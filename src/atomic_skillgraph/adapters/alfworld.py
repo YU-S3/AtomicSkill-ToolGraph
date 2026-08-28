@@ -526,6 +526,7 @@ class AlfWorldAdapter:
                         node_ref: str = "",
                         phase_goal: str = "") -> EnvRunResult:
         result = EnvRunResult()
+        realized_effect_inputs = dict(effect_inputs or {})
         if resume:
             # 原地降级：从上一阶段失败点继续同一 episode（不 reset 环境）。
             # 环境对象 self._current_env 仍停在该 episode 的中间态。
@@ -541,7 +542,8 @@ class AlfWorldAdapter:
             result.states.append({"step": 0, "state": tracker.state()})
         result.current_observation = obs
         result.current_admissible = list(admissible)
-        if _effects_met(tracker.state(), stop_effects, effect_inputs):
+        if _effects_met(tracker.state(), stop_effects,
+                        realized_effect_inputs):
             result.atomic_complete = True
             result.final_observation = obs
             return result
@@ -576,6 +578,7 @@ class AlfWorldAdapter:
                     env_result = self._current_env.step(filled)
                     obs = env_result.observation
                     admissible = env_result.admissible_commands
+                    accepted = _env_step_accepted(env_result)
                     result.current_observation = obs
                     result.current_admissible = list(admissible)
                     result.actions.append({
@@ -583,13 +586,16 @@ class AlfWorldAdapter:
                         "name": filled,
                         "params": params,
                         "observation": env_result.observation,
-                        "accepted": _env_step_accepted(env_result),
+                        "accepted": accepted,
                         "mode": "direct",
                         "node_ref": step_spec.get("node_ref", ""),
                         "tool_ref": step_spec.get("tool_ref", ""),
                     })
                     tracker.update(env_result.observation, action=filled,
-                                   accepted=_env_step_accepted(env_result))
+                                   accepted=accepted)
+                    if accepted:
+                        realized_effect_inputs = _ground_effect_inputs_from_action(
+                            realized_effect_inputs, params)
                     result.states.append({"step": len(result.actions),
                                           "state": tracker.state()})
                     # The action that establishes the final atomic Effect may
@@ -599,10 +605,12 @@ class AlfWorldAdapter:
                     if env_result.won:
                         result.success = True
                         _record_terminal_effect_certificates(
-                            result, tracker.state(), stop_effects, effect_inputs,
+                            result, tracker.state(), stop_effects,
+                            realized_effect_inputs,
                             action_index=len(result.actions) - 1)
                         result.atomic_complete = _effects_met(
-                            tracker.state(), stop_effects, effect_inputs)
+                            tracker.state(), stop_effects,
+                            realized_effect_inputs)
                         result.steps = len(result.actions)
                         result.final_observation = env_result.observation
                         result.node_spans.append({
@@ -613,7 +621,8 @@ class AlfWorldAdapter:
                             "skipped_template_steps": skipped,
                         })
                         return result
-                    if _effects_met(tracker.state(), stop_effects, effect_inputs):
+                    if _effects_met(tracker.state(), stop_effects,
+                                    realized_effect_inputs):
                         result.atomic_complete = True
                         result.steps = len(result.actions)
                         result.final_observation = obs
@@ -670,6 +679,8 @@ class AlfWorldAdapter:
         cycle_recoveries = 0
         max_cycle_recoveries = max(0, int(getattr(
             self, "max_action_cycle_recoveries", 2)))
+        hard_block_streak = 0
+        location_action_counts: dict[str, int] = {}
         # 原地降级：步数预算扣除上一阶段已消耗的步数
         remaining_steps = max(0, int(max_steps) - result.steps)
         local_env_steps = 0
@@ -683,6 +694,45 @@ class AlfWorldAdapter:
                        for effect in (stop_effects or []) if isinstance(effect, dict)):
                     action = _avoid_checked_location(action, admissible,
                                                      _checked_locations(tracker))
+                block_reason = _hard_cycle_block_reason(
+                    action_history, action, _checked_locations(tracker),
+                    location_action_counts=location_action_counts)
+                if block_reason:
+                    hard_block_streak += 1
+                    result.diagnostics.setdefault(
+                        "hard_cycle_blocks", []).append({
+                            "action_count": len(result.actions),
+                            "rejected_action": action,
+                            "reason": block_reason,
+                            "blocked_attempt": hard_block_streak,
+                        })
+                    result.diagnostics.setdefault(
+                        "action_cycle_events", []).append({
+                            "action_count": len(result.actions),
+                            "cycle_actions": list(action_history[-4:]) + [action],
+                            "cycle_kind": block_reason,
+                            "hard_blocked": True,
+                            "recovery_index": hard_block_streak,
+                            "recovery_allowed": hard_block_streak < 2,
+                        })
+                    if hard_block_streak >= 2:
+                        result.failure_type = "action_cycle"
+                        result.steps = len(result.actions)
+                        result.final_observation = obs
+                        return result
+                    prompt = _build_step_user(
+                        active_goal, obs, admissible,
+                        action_history=action_history,
+                        observation_history=observation_history,
+                        skill_context=_compact_seed_context(seed_context),
+                        checked_locations=_checked_locations(tracker),
+                    ) + (
+                        "\n\nRuntime cycle recovery (hard guard) rejected action "
+                        f"'{action}' ({block_reason}). Choose a different valid "
+                        "action; repeating it will terminate this attempt."
+                    )
+                    continue
+                hard_block_streak = 0
                 llm_error_streak = 0
             except Exception as exc:  # noqa: BLE001
                 llm_error_streak += 1
@@ -700,13 +750,15 @@ class AlfWorldAdapter:
                 # API 错误不是环境动作：保持同一 observation 原地重试，不能用
                 # admissible[0] 污染轨迹或让任务在“重试”期间悄悄前进。
                 continue
+            state_before_action = tracker.state()
             env_result = self._current_env.step(action)
             local_env_steps += 1
             accepted = _env_step_accepted(env_result)
+            action_params = _parse_action_params(action)
             result.actions.append({
                 "step": len(result.actions),
                 "name": action,
-                "params": _parse_action_params(action),
+                "params": action_params,
                 "observation": env_result.observation,
                 "accepted": accepted,
                 "mode": "seeded" if seed_context else "dynamic",
@@ -715,10 +767,21 @@ class AlfWorldAdapter:
             })
             tracker.update(env_result.observation, action=action,
                            accepted=accepted)
+            if accepted:
+                realized_effect_inputs = _ground_effect_inputs_from_action(
+                    realized_effect_inputs, action_params)
             _record_location_inspection(
                 tracker, action, env_result.observation, accepted=accepted)
+            state_after_action = tracker.state()
+            if _meaningful_env_state_changed(
+                    state_before_action, state_after_action):
+                location_action_counts.clear()
+            if accepted and _action_location(action):
+                key = str(action or "").strip().lower()
+                location_action_counts[key] = (
+                    int(location_action_counts.get(key, 0)) + 1)
             result.states.append({"step": len(result.actions),
-                                  "state": tracker.state()})
+                                  "state": state_after_action})
             action_history.append(action)
             observation_history.append(env_result.observation)
             obs = env_result.observation
@@ -731,14 +794,16 @@ class AlfWorldAdapter:
             if env_result.won:
                 result.success = True
                 _record_terminal_effect_certificates(
-                    result, tracker.state(), stop_effects, effect_inputs,
+                    result, tracker.state(), stop_effects,
+                    realized_effect_inputs,
                     action_index=len(result.actions) - 1)
                 result.atomic_complete = _effects_met(
-                    tracker.state(), stop_effects, effect_inputs)
+                    tracker.state(), stop_effects, realized_effect_inputs)
                 result.steps = len(result.actions)
                 result.final_observation = obs
                 return result
-            if _effects_met(tracker.state(), stop_effects, effect_inputs):
+            if _effects_met(tracker.state(), stop_effects,
+                            realized_effect_inputs):
                 result.atomic_complete = True
                 result.steps = len(result.actions)
                 result.final_observation = obs
@@ -812,6 +877,35 @@ def _effects_met(state: dict[str, Any], effects: list[dict[str, Any]] | None,
     passed, _missing = check_effects(StateSnapshot(state), inputs or {}, effects,
                                      {"harness": "env"})
     return passed
+
+
+def _ground_effect_inputs_from_action(inputs: dict[str, Any],
+                                      action_params: dict[str, Any]
+                                      ) -> dict[str, Any]:
+    """Bind a shared class-valued Effect role to the executed instance.
+
+    Without this, a conjunction can be satisfied by different instances (for
+    example ``egg_1`` supplies ``heated`` while ``egg_2`` supplies
+    ``at_location``).  Accepted action parameters are direct execution
+    evidence and keep every Effect in the occurrence on one identity.  Already
+    concrete task roles, especially destinations, are never overwritten.
+    """
+    grounded = dict(inputs or {})
+    for role, observed in dict(action_params or {}).items():
+        observed_norm = _norm(observed)
+        if not observed_norm:
+            continue
+        current = grounded.get(role)
+        current_norm = _norm(current) if current not in (None, "") else ""
+        if not current_norm or current_norm.startswith("$"):
+            grounded[role] = observed_norm
+            continue
+        if re.search(r"_\d+$", current_norm):
+            continue
+        if (re.search(r"_\d+$", observed_norm)
+                and _same_object_family(current_norm, observed_norm)):
+            grounded[role] = observed_norm
+    return grounded
 
 
 # ---------------------------------------------------------------------------
@@ -1586,6 +1680,70 @@ def _has_cycle(history: list[str], cycle_len: int = 3, repeats: int = 2) -> bool
         if window[i * cycle_len:(i + 1) * cycle_len] != first:
             return False
     return True
+
+
+def _hard_cycle_block_reason(history: list[str], candidate: str,
+                             checked_locations: list[str] | None = None, *,
+                             location_action_counts: dict[str, int] | None = None
+                             ) -> str:
+    """Reject an action before it creates a tight, evidence-free loop.
+
+    This guard is deliberately action-structural: it has no task-type or
+    capability-name table.  It catches AAA, ABABA (the start of a third AB
+    round), and a third recent repetition of the same location action.  The
+    caller re-prompts once and then terminates with ``action_cycle``; rejected
+    choices never enter the environment trace or consume action budget.
+    """
+    normalized = [str(item or "").strip().lower() for item in history]
+    action = str(candidate or "").strip().lower()
+    if not action:
+        return "empty_action"
+    if len(normalized) >= 2 and normalized[-2:] == [action, action]:
+        return "single_action_repeat"
+    if (len(normalized) >= 4
+            and normalized[-4] == normalized[-2] == action
+            and normalized[-3] == normalized[-1]
+            and normalized[-1] != action):
+        return "two_action_cycle"
+
+    location = _action_location(action)
+    if location:
+        # Location identity alone is not enough: ``go to X -> examine X`` and
+        # ``close X -> open X`` are valid state-changing sequences.  Reject
+        # only a third recent occurrence of the *same operation at the same
+        # location*.  Tight alternating forms are already caught above.
+        same_operation = max(
+            int((location_action_counts or {}).get(action, 0)),
+            sum(1 for item in normalized[-8:]
+                if item == action and _action_location(item) == location),
+        )
+        if same_operation >= 2:
+            return "repeated_location_action"
+    return ""
+
+
+def _action_location(action: str) -> str:
+    match = re.fullmatch(r"(?:go to|examine|open)\s+(.+)",
+                         str(action or "").strip(), flags=re.IGNORECASE)
+    return _norm(match.group(1)) if match else ""
+
+
+def _meaningful_env_state_changed(before: dict[str, Any],
+                                  after: dict[str, Any]) -> bool:
+    """Whether an action produced world/knowledge progress beyond navigation.
+
+    Merely changing ``agent_at`` does not reset the repeated-location guard.
+    New object knowledge, container state, inventory, or any other predicate
+    does.  This keeps the rule benchmark-agnostic while allowing legitimate
+    close/open and acquire/return workflows.
+    """
+    def stable_facts(state: dict[str, Any]) -> set[str]:
+        return {str(item) for item in (state.get("facts") or [])
+                if not str(item).startswith("agent_at(")}
+
+    return (stable_facts(before) != stable_facts(after)
+            or list(before.get("inventory") or [])
+            != list(after.get("inventory") or []))
 
 
 def _parse_action_params(action: str) -> dict[str, Any]:

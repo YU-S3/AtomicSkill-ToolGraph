@@ -157,6 +157,13 @@ def test_missing_target_creates_explicit_task_gap_and_pre_gap_validation(
             for span in trace.runtime_spans] == [
                 ("planned_node", 0, 1), ("task_gap", 1, 2)]
     assert trace.actions[1].origin == "task_gap_agent"
+    # The first Atomic used one action; the explicit gap owns 20 more, not the
+    # whole remaining episode.
+    assert adapter.calls[1]["max_steps"] == 21
+    gap_audit = trace.metrics["execution_routing"][-1]
+    assert gap_audit["budget_scope"] == "gap"
+    assert gap_audit["node_limit"] == 20
+    assert gap_audit["absolute_deadline"] == 21
     assert trace.validation_layers["selected_composite_self"]["passed"] is False
     assert trace.validation_layers["full_runtime_graph"]["passed"] is True, (
         trace.validation_layers["full_runtime_graph"])

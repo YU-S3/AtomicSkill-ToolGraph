@@ -26,6 +26,10 @@ class PlannedNode:
     source: str = "retrieval"       # composite | retrieval | planner_llm
     target_effects: list[dict[str, Any]] = field(default_factory=list)
     dynamic: bool = False
+    # Budget is part of the executable Runtime Graph semantics.  ``dynamic``
+    # describes the execution route; it must not be used to guess whether this
+    # occurrence is a whole-task fallback or a bounded local gap.
+    budget_scope: str = "atomic"     # task | atomic | gap
     occurrence_id: str = ""
     origin_step_id: str = ""
     binding_specs: dict[str, BindingSpec] = field(default_factory=dict)
@@ -39,7 +43,8 @@ class PlannedNode:
                                   for key, value in self.binding_specs.items()},
                 "branch_id": self.branch_id,
                 "params": self.params, "source": self.source,
-                "target_effects": self.target_effects, "dynamic": self.dynamic}
+                "target_effects": self.target_effects, "dynamic": self.dynamic,
+                "budget_scope": self.budget_scope}
 
 
 @dataclass
@@ -91,6 +96,7 @@ class RuntimeNodeState:
     execution_status: NodeExecutionStatus = NodeExecutionStatus.NOT_STARTED
     satisfied_without_execution: bool = False
     binding_provenance: dict[str, Any] = field(default_factory=dict)
+    budget_scope: str = "atomic"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -115,6 +121,7 @@ class RuntimeNodeState:
             "execution_status": self.execution_status.value,
             "satisfied_without_execution": self.satisfied_without_execution,
             "binding_provenance": self.binding_provenance,
+            "budget_scope": self.budget_scope,
         }
 
 
@@ -130,7 +137,8 @@ class RuntimeGraph:
                              node.step_id or f"step_{index:03d}",
                              origin_step_id=node.origin_step_id,
                              params=dict(node.params),
-                             target_effects=list(node.target_effects))
+                             target_effects=list(node.target_effects),
+                             budget_scope=node.budget_scope)
             for index, node in enumerate(plan.nodes)
         ]
         self.edges: list[GraphEdge] = list(plan.edges) or self._sequential_edges()
@@ -157,6 +165,7 @@ class RuntimeGraph:
             params=dict(params), source="task_gap",
             target_effects=[dict(item) for item in missing_effects],
             dynamic=True,
+            budget_scope="gap",
         )
         previous = self.plan.nodes[-1] if self.plan.nodes else None
         self.plan.nodes.append(planned)
@@ -164,6 +173,7 @@ class RuntimeGraph:
             ref=str(planned.ref), step_id=step_id,
             occurrence_id=occurrence_id, params=dict(params),
             target_effects=list(planned.target_effects),
+            budget_scope=planned.budget_scope,
         )
         self.nodes.append(state)
         if previous is not None:

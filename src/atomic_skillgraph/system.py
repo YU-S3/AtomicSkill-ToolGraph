@@ -728,23 +728,41 @@ class AtomicSkillGraphSystem:
         shared_bindings = dict(task.context.get("params") or {})
         for index, planned in enumerate(plan.nodes):
             node = runtime_graph.nodes[index]
+            node_start_actions = len((resume or {}).get("actions") or [])
+            global_limit = int(self.config.max_steps)
+            budget_scope = str(getattr(planned, "budget_scope", "atomic")
+                               or "atomic")
+            if budget_scope not in {"task", "atomic", "gap"}:
+                raise ValueError(f"invalid_planned_node_budget_scope:{budget_scope}")
+            if budget_scope == "task":
+                node_budget = max(0, global_limit - node_start_actions)
+                configured_attempt_limit = node_budget
+            elif budget_scope == "gap":
+                node_budget = int(
+                    self.config.thresholds.env_dynamic_node_max_steps)
+                configured_attempt_limit = node_budget
+            else:
+                node_budget = int(self.config.thresholds.env_node_max_steps)
+                configured_attempt_limit = int(
+                    self.config.thresholds.env_attempt_max_steps)
+            node_deadline = min(global_limit,
+                                node_start_actions + max(0, node_budget))
             routing_audit: dict[str, Any] = {
                 "step_id": planned.step_id,
                 "node_ref": str(planned.ref),
                 "source": planned.source,
                 "dynamic": bool(planned.dynamic),
+                "budget_scope": budget_scope,
+                "global_limit": global_limit,
+                "node_limit": node_budget,
+                "attempt_limit": configured_attempt_limit,
+                "absolute_deadline": node_deadline,
                 "initial_params": dict(planned.params),
                 "target_effects": list(planned.target_effects or []),
                 "implementation_candidates": [],
             }
             trace.metrics.setdefault("execution_routing", []).append(
                 routing_audit)
-            node_start_actions = len((resume or {}).get("actions") or [])
-            node_budget = (int(self.config.thresholds.env_dynamic_node_max_steps)
-                           if planned.dynamic else
-                           int(self.config.thresholds.env_node_max_steps))
-            node_deadline = min(int(self.config.max_steps),
-                                node_start_actions + max(0, node_budget))
             before = dict((resume or {}).get("state") or task.state or {})
             planned.params = _apply_runtime_data_bindings(
                 planned.params, planned.step_id, runtime_graph, shared_bindings)
@@ -814,7 +832,8 @@ class AtomicSkillGraphSystem:
                     str(item.get("name")) for item in (atomic.inputs or [])
                     if isinstance(item, dict)
                     and str(item.get("name") or "").endswith("_location")
-                    and not planned.params.get(str(item.get("name")))
+                    and not is_concrete_binding(
+                        planned.params.get(str(item.get("name"))))
                 }
                 if (self.config.features.enable_framework_discovery
                         and callable(discover) and location_slots):
@@ -835,7 +854,7 @@ class AtomicSkillGraphSystem:
                             discovery_tool_refs = [str(item.binding.tool_ref)
                                                    for item in partial_resolved]
                     for location_slot in sorted(location_slots):
-                        if planned.params.get(location_slot):
+                        if is_concrete_binding(planned.params.get(location_slot)):
                             continue
                         entity_role = location_slot[:-len("_location")]
                         entity_value = planned.params.get(entity_role)
@@ -1028,8 +1047,7 @@ class AtomicSkillGraphSystem:
             for attempt_index, (mode, seed_context, steps) in enumerate(candidates):
                 attempt_before = dict((resume or {}).get("state") or before)
                 action_start = len((resume or {}).get("actions") or [])
-                attempt_limit = (node_budget if planned.dynamic else
-                                 int(self.config.thresholds.env_attempt_max_steps))
+                attempt_limit = configured_attempt_limit
                 ledger = BudgetLedger(
                     global_limit=int(self.config.max_steps),
                     node_limit=max(0, node_budget),
@@ -1143,6 +1161,19 @@ class AtomicSkillGraphSystem:
                     trace.node_validators.append(validation)
                 action_end = len(after_payload.get("actions") or [])
                 action_count = max(0, action_end - action_start)
+                if result.success and not passed and not result.failure_type:
+                    # A benchmark terminal signal cannot substitute for the
+                    # selected Runtime Graph contract.  Preserve this as an
+                    # explicit semantic mismatch instead of an empty failure.
+                    result.failure_type = "benchmark_goal_contract_mismatch"
+                result.failure_type = _attribute_env_budget_failure(
+                    str(result.failure_type or ""),
+                    action_end=action_end,
+                    global_limit=global_limit,
+                    node_deadline=node_deadline,
+                    attempt_deadline=attempt_deadline,
+                    budget_scope=budget_scope,
+                )
                 node.executed_action_count += action_count
                 node.attempts.append({"mode": mode.value, "started": True,
                                       "passed": passed,
@@ -1224,9 +1255,32 @@ class AtomicSkillGraphSystem:
                         gap_analysis.missing_effects, shared_bindings)
                     gap_node = runtime_graph.nodes[gap_index]
                     gap_plan = runtime_graph.plan.nodes[gap_index]
+                    gap_budget = int(
+                        self.config.thresholds.env_dynamic_node_max_steps)
+                    gap_deadline = min(
+                        int(self.config.max_steps),
+                        final_actions + max(0, gap_budget))
+                    gap_routing_audit = {
+                        "step_id": gap_plan.step_id,
+                        "node_ref": str(gap_plan.ref),
+                        "source": gap_plan.source,
+                        "dynamic": True,
+                        "budget_scope": gap_plan.budget_scope,
+                        "global_limit": int(self.config.max_steps),
+                        "node_limit": gap_budget,
+                        "attempt_limit": gap_budget,
+                        "absolute_deadline": gap_deadline,
+                        "initial_params": dict(shared_bindings),
+                        "target_effects": list(
+                            gap_analysis.missing_effects),
+                        "candidate_modes": [ExecutionMode.DYNAMIC.value],
+                        "implementation_candidates": [],
+                    }
+                    trace.metrics.setdefault("execution_routing", []).append(
+                        gap_routing_audit)
                     gap_result = self.adapter.run_env_episode(
                         task, self.llm, seed_context="",
-                        max_steps=self.config.max_steps, resume=resume,
+                        max_steps=gap_deadline, resume=resume,
                         stop_effects=gap_analysis.missing_effects,
                         effect_inputs=dict(shared_bindings),
                         node_ref=str(gap_plan.ref),
@@ -1235,6 +1289,14 @@ class AtomicSkillGraphSystem:
                             shared_bindings),
                     )
                     gap_end = len(gap_result.actions or [])
+                    gap_result.failure_type = _attribute_env_budget_failure(
+                        str(gap_result.failure_type or ""),
+                        action_end=gap_end,
+                        global_limit=int(self.config.max_steps),
+                        node_deadline=gap_deadline,
+                        attempt_deadline=gap_deadline,
+                        budget_scope="gap",
+                    )
                     _mark_result_action_origin(
                         gap_result, final_actions, gap_end,
                         origin="task_gap_agent", node_ref=str(gap_plan.ref))
@@ -1264,6 +1326,9 @@ class AtomicSkillGraphSystem:
                     gap_node.execution_status = (
                         NodeExecutionStatus.EXECUTED_SUCCESS if gap_passed
                         else NodeExecutionStatus.EXECUTED_FAILURE)
+                    gap_node.fallback_reason = (
+                        "" if gap_passed else
+                        str(gap_result.failure_type or "effect_not_met"))
                     gap_node.attempts.append({
                         "mode": ExecutionMode.DYNAMIC.value,
                         "started": gap_node.attempt_started,
@@ -1278,6 +1343,11 @@ class AtomicSkillGraphSystem:
                         "occurrence_id": gap_node.occurrence_id,
                         "before": pre_gap_state, "after": gap_after,
                     })
+                    gap_routing_audit["attempts"] = [
+                        dict(item) for item in gap_node.attempts]
+                    gap_routing_audit["final_passed"] = bool(gap_passed)
+                    gap_routing_audit["fallback_reason"] = str(
+                        gap_node.fallback_reason or "")
                     trace.node_validators.append(gap_validation)
                     trace.runtime_spans.append(RuntimeSpan(
                         kind="task_gap", occurrence_id=gap_node.occurrence_id,
@@ -2592,6 +2662,32 @@ def _normalize_runtime_binding(value: Any) -> Any:
         return value
     from .core.predicates import normalize_value
     return normalize_value(value)
+
+
+def _attribute_env_budget_failure(
+        failure_type: str, *, action_end: int, global_limit: int,
+        node_deadline: int, attempt_deadline: int,
+        budget_scope: str) -> str:
+    """Replace the adapter's ambiguous ``max_steps`` with its real owner.
+
+    Adapter deadlines are absolute episode action indices.  Attribution must
+    therefore use the same absolute indices; comparing a local action count to
+    a global deadline silently mislabels resumed attempts.
+    """
+    if str(failure_type or "") != "max_steps":
+        return str(failure_type or "")
+    used = int(action_end)
+    if used >= int(global_limit):
+        return "episode_budget_exhausted"
+    # A full-task node owns the rest of the episode, so reaching its deadline
+    # is necessarily an episode exhaustion even when invoked after a resume.
+    if budget_scope == "task" and used >= int(node_deadline):
+        return "episode_budget_exhausted"
+    if used >= int(node_deadline):
+        return "node_budget_exhausted"
+    if used >= int(attempt_deadline):
+        return "attempt_budget_exhausted"
+    return str(failure_type or "")
 
 
 def _runtime_values_compatible(left: Any, right: Any) -> bool:
