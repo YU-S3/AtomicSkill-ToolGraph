@@ -14,6 +14,16 @@ from ..core.config import SystemConfig
 from ..core.edge_ir import GraphEdge
 from ..core.binding_ir import binding_slot_name
 from ..core.refs import SkillRef, bump_version, content_hash
+from ..core.semantic_roles import (
+    ENTITY,
+    EXECUTION_RESOURCE,
+    GENERIC_LOCATION,
+    SOURCE_LOCATION,
+    TARGET_LOCATION,
+    normalize_semantic_role,
+    semantic_role_family,
+    task_role_binding_compatible,
+)
 from ..core.skill_ir import CompositeSkill
 from ..core.status import EdgeType, SkillStatus
 from ..core.trace_ir import TraceRecord
@@ -616,65 +626,50 @@ def _optional_int(value: Any) -> int | None:
         return None
 
 
+def _task_role_for_grounded_value(
+        value: Any, occurrence_role: str,
+        known: dict[str, Any], semantic: dict[str, Any]) -> str:
+    """Resolve one task role only when grounding and role semantics agree."""
+
+    from ..core.predicates import normalize_value
+
+    value_norm = normalize_value(value)
+    if not value_norm:
+        return ""
+    candidates: list[tuple[int, int, int, str]] = []
+    preferred = normalize_semantic_role(occurrence_role)
+    for source_rank, source in enumerate((known, semantic)):
+        for raw_role, task_value in source.items():
+            task_role = str(raw_role)
+            if not task_role_binding_compatible(occurrence_role, task_role):
+                continue
+            task_norm = normalize_value(task_value)
+            if not task_norm:
+                continue
+            same = value_norm == task_norm
+            family = (not re.search(r"_\d+$", task_norm)
+                      and re.sub(r"_\d+$", "", value_norm) == task_norm)
+            if not (same or family):
+                continue
+            normalized_task_role = normalize_semantic_role(task_role)
+            candidates.append((
+                source_rank,
+                0 if normalized_task_role == preferred else 1,
+                0 if same else 1,
+                task_role,
+            ))
+    return min(candidates)[-1] if candidates else ""
+
+
 def _role_params(params: dict[str, Any], trace: TraceRecord) -> dict[str, Any]:
     """Persist semantic task roles, never source-instance literals."""
-    from ..core.predicates import normalize_value
+
     known = dict(trace.provenance.get("params") or {})
     semantic = dict(trace.provenance.get("semantic_params") or {})
     result: dict[str, Any] = {}
-
-    def role_kind(role: str) -> str:
-        lowered = str(role).lower()
-        if (lowered == "object_location"
-                or any(token in lowered for token in ("source", "origin"))):
-            return "source_location"
-        if any(token in lowered for token in ("target", "destination")):
-            return "target_location"
-        if any(token in lowered for token in (
-                "location", "container",
-                "receptacle", "station", "position", "place")):
-            return "location"
-        return "entity"
-
     for key, value in params.items():
-        value_norm = normalize_value(value)
-        matched_role = ""
-        # Role identity comes from the validated occurrence/goal data flow.
-        # Never translate through a benchmark-specific compatibility table.
-        for source in (known, semantic):
-            if str(key) not in source:
-                continue
-            role_norm = normalize_value(source[str(key)])
-            same = value_norm == role_norm
-            generic_family = (value_norm and role_norm
-                              and not __import__("re").search(r"_\d+$", role_norm)
-                              and __import__("re").sub(r"_\d+$", "", value_norm)
-                              == role_norm)
-            if same or generic_family:
-                matched_role = str(key)
-                break
-        if not matched_role:
-            candidates: list[str] = []
-            for source in (known, semantic):
-                for source_role, source_value in source.items():
-                    role_norm = normalize_value(source_value)
-                    same = value_norm == role_norm
-                    generic_family = (value_norm and role_norm
-                                      and not __import__("re").search(
-                                          r"_\d+$", role_norm)
-                                      and __import__("re").sub(
-                                          r"_\d+$", "", value_norm)
-                                      == role_norm)
-                    key_kind = role_kind(str(key))
-                    source_kind = role_kind(str(source_role))
-                    compatible_kind = (key_kind == source_kind
-                                       or key_kind == "location")
-                    if ((same or generic_family) and compatible_kind):
-                        candidates.append(str(source_role))
-            if candidates:
-                matched_role = sorted(set(candidates), key=lambda role: (
-                    0 if str(key) in role or role in str(key) else 1,
-                    len(role), role))[0]
+        matched_role = _task_role_for_grounded_value(
+            value, str(key), known, semantic)
         if matched_role:
             result[str(key)] = f"$task.{matched_role}"
     return result
@@ -695,40 +690,6 @@ def _role_params_for_segments(segments: list[dict[str, Any]],
 
     known = dict(trace.provenance.get("params") or {})
     semantic = dict(trace.provenance.get("semantic_params") or {})
-    def task_role(value: Any, preferred_role: str) -> str:
-        value_norm = normalize_value(value)
-        # A grounded executable parameter is unambiguous and wins first.
-        # Example: the final cabinet_1 can safely bind target_location even
-        # when the semantic goal merely says "cabinet".
-        for role, task_value in known.items():
-            role_norm = normalize_value(task_value)
-            if not value_norm or not role_norm:
-                continue
-            same = value_norm == role_norm
-            family = (str(role) == str(preferred_role)
-                      and not re.search(r"_\d+$", role_norm)
-                      and re.sub(r"_\d+$", "", value_norm) == role_norm)
-            if same or family:
-                return str(role)
-
-        # A generic semantic value (for example "cabinet") may match several
-        # concrete instances.  Only accept that family match when the role
-        # discovered from this occurrence chain agrees with the task role;
-        # otherwise an object source cabinet could be mistaken for the final
-        # destination cabinet.
-        for role, task_value in semantic.items():
-            if str(role) != str(preferred_role):
-                continue
-            role_norm = normalize_value(task_value)
-            if not value_norm or not role_norm:
-                continue
-            same = value_norm == role_norm
-            family = (not re.search(r"_\d+$", role_norm)
-                      and re.sub(r"_\d+$", "", value_norm) == role_norm)
-            if same or family:
-                return str(role)
-        return ""
-
     roles_by_value: dict[str, set[str]] = {}
     for segment in segments:
         for raw_role, value in dict(segment.get("params") or {}).items():
@@ -739,25 +700,57 @@ def _role_params_for_segments(segments: list[dict[str, Any]],
     def preferred_flow_role(value: Any, local_role: str) -> str:
         normalized = normalize_value(value)
         candidates = roles_by_value.get(normalized) or {str(local_role)}
-        # A specific occurrence role carries more information than the generic
-        # role used by a navigation node.  This is a naming preference only;
-        # no operation, entity, or benchmark taxonomy is encoded.
-        def rank(role: str) -> tuple[int, int, str]:
-            generic = role in {"target_location", "execution_location", "location"}
-            relational = role.endswith("_location") or role.endswith("_resource") \
-                or role.endswith("_station")
-            return (1 if generic else 0, 0 if relational else 1, role)
-        return sorted(candidates, key=rank)[0]
+        local_family = semantic_role_family(local_role)
+        # Source and station roles are authoritative.  Equal grounded values
+        # must never rename either one to a destination or to each other.
+        if local_family in {SOURCE_LOCATION, EXECUTION_RESOURCE, ENTITY}:
+            return str(local_role)
+
+        # A target-shaped slot is often used by a navigation/opening Atomic.
+        # If it is not the task destination (checked by the caller), it may be
+        # refined to one unique source/station role observed elsewhere in the
+        # same occurrence chain.  Generic location roles can likewise be
+        # refined, but ambiguity stays local and runtime-resolvable.
+        allowed = ({SOURCE_LOCATION, EXECUTION_RESOURCE}
+                   if local_family == TARGET_LOCATION else
+                   {SOURCE_LOCATION, TARGET_LOCATION, EXECUTION_RESOURCE}
+                   if local_family == GENERIC_LOCATION else set())
+        specific = [
+            role for role in candidates
+            if role != str(local_role)
+            and semantic_role_family(role) in allowed
+        ]
+        families = {semantic_role_family(role) for role in specific}
+        if len(families) != 1:
+            return str(local_role)
+        # Multiple aliases from one directional family are equivalent here;
+        # prefer the shortest stable role spelling.
+        return sorted(set(specific), key=lambda role: (
+            len(normalize_semantic_role(role)), normalize_semantic_role(role))
+        )[0]
 
     result: list[dict[str, Any]] = []
     for segment in segments:
         mapped: dict[str, Any] = {}
         for key, value in dict(segment.get("params") or {}).items():
-            flow_role = preferred_flow_role(value, str(key))
-            role = task_role(value, flow_role)
+            # First honor the occurrence's own semantic role.  In particular,
+            # Acquire.object_location cannot consume a same-valued task
+            # destination.  Only if that role is not task-grounded do we use a
+            # unique whole-chain role refinement for navigation/setup slots.
+            role = _task_role_for_grounded_value(
+                value, str(key), known, semantic)
             if role:
                 mapped[str(key)] = f"$task.{role}"
             elif value not in (None, ""):
-                mapped[str(key)] = f"$flow.{flow_role}"
+                flow_role = preferred_flow_role(value, str(key))
+                inferred_task_role = (
+                    _task_role_for_grounded_value(
+                        value, flow_role, known, semantic)
+                    if flow_role != str(key) else ""
+                )
+                mapped[str(key)] = (
+                    f"$task.{inferred_task_role}"
+                    if inferred_task_role else f"$flow.{flow_role}"
+                )
         result.append(mapped)
     return result

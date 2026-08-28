@@ -54,6 +54,30 @@ def test_flow_binding_requires_exact_existing_output(workspace_tmp):
     assert not validate_composite_binding_closure(valid, registry).passed
 
 
+def test_persisted_acquire_source_cannot_bind_task_destination(workspace_tmp):
+    registry = SkillGraphRegistry(workspace_tmp / "unsafe_source_binding")
+    acquire = _atomic(
+        "generic.acquire", "agent.holds",
+        inputs=["object", "object_location"], outputs=["held_object"])
+    place = _atomic(
+        "generic.place", "object.at_location",
+        inputs=["object"], outputs=[])
+    registry.register(acquire)
+    registry.register(place)
+    candidate = _composite(acquire, place)
+    candidate.graph["steps"][0]["params"][
+        "object_location"] = "$task.target_location"
+
+    report = validate_composite_binding_closure(candidate, registry)
+
+    assert not report.passed
+    assert report.errors == [
+        "unsafe_composite_task_role_binding:step=acquire_1:"
+        "slot=object_location:binding=$task.target_location"]
+    assert evaluate_composite(
+        candidate, registry, min_support=2).status == SkillStatus.SHADOW
+
+
 def test_draft_promotes_only_after_closure_and_active_children(workspace_tmp):
     registry = SkillGraphRegistry(workspace_tmp / "lifecycle")
     acquire = _atomic("generic.acquire", "agent.holds",

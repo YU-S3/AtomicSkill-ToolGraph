@@ -232,6 +232,7 @@ class BenchmarkAdapter(Protocol):
                         resume: dict[str, Any] | None = None,
                         stop_effects: list[dict[str, Any]] | None = None,
                         effect_inputs: dict[str, Any] | None = None,
+                        excluded_effect_bindings: dict[str, set[Any]] | None = None,
                         node_ref: str = "",
                         phase_goal: str = "") -> EnvRunResult: ...
 

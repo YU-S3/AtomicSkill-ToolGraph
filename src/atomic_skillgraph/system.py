@@ -12,7 +12,8 @@ from typing import Any
 
 from .adapters.benchmark import BenchmarkAdapter, EnvRunResult, Task
 from .core.binding_ir import (BindingKind, BindingProvenance,
-                              BindingResolutionState, is_concrete_binding)
+                              BindingResolutionState, binding_slot_name,
+                              is_concrete_binding)
 from .atomicizer.trace_atomicizer import TraceAtomicizer
 from .core.config import SystemConfig
 from .core.llm import (LLM, LLM_USAGE_FIELDS, diff_llm_usage,
@@ -39,7 +40,7 @@ from .persistence import MetricsStore, RunStore, TraceStore
 from .runtime.atomic_planner import AtomicPlanner
 from .runtime.execution_bridge import ExecutionBridge
 from .runtime.implementation_selector import ImplementationSelector
-from .runtime.runtime_graph import RuntimeGraph
+from .runtime.runtime_graph import RuntimeGraph, distinct_values_conflict
 from .runtime.budget import BudgetLedger
 from .runtime.plan_validator import (semantic_required_slots,
                                      slot_requirements_for)
@@ -111,6 +112,7 @@ class AtomicSkillGraphSystem:
         runtime_usage_before = planner_usage_after
 
         is_env = _is_env_task(task)
+        pending_feedback: list[tuple[str, list[str], bool, str]] = []
         if is_env:
             infrastructure_attempts: list[dict[str, Any]] = []
             retry_limit = max(0, int(self.config.thresholds.infrastructure_episode_retries))
@@ -138,11 +140,7 @@ class AtomicSkillGraphSystem:
                     # 重试耗尽仍是基础设施失败，不提交该尝试产生的能力统计。
                     final_feedback = []
             self._feedback_buffer = None
-            for kind, refs, passed, mode in final_feedback:
-                if kind == "tool":
-                    self._record_tool_feedback(refs, passed, mode)
-                else:
-                    self._record_impl_feedback(refs, passed)
+            pending_feedback = final_feedback
             assert trace is not None
             trace.metrics["infrastructure_episode_retries"] = max(
                 0, len(infrastructure_attempts) - int(trace.failure_type == "llm_error"))
@@ -172,6 +170,21 @@ class AtomicSkillGraphSystem:
             copy.deepcopy(task.context.get("semantic_params")
                           or task.context.get("params") or {}))
         self._finalize_validation(trace, task)
+        runtime_contract_valid = _runtime_learning_eligible(trace, task)
+        learning_eligible = bool(
+            not trace.success or runtime_contract_valid)
+        trace.metrics["benchmark_won"] = bool(trace.success)
+        trace.metrics["runtime_contract_valid"] = runtime_contract_valid
+        trace.metrics["learning_eligible"] = learning_eligible
+        if learning_eligible:
+            for kind, refs, passed, mode in pending_feedback:
+                if kind == "tool":
+                    self._record_tool_feedback(refs, passed, mode)
+                else:
+                    self._record_impl_feedback(refs, passed)
+        elif pending_feedback:
+            trace.metrics["feedback_discarded_for_contract_mismatch"] = len(
+                pending_feedback)
         # 保存 trace（成功与失败都保存）
         self.trace_store.save(trace)
         evolution_runtime_usage_before = snapshot_llm_usage(self.llm)
@@ -276,6 +289,12 @@ class AtomicSkillGraphSystem:
             "benchmark": task.benchmark,
             "task_type": task.task_type,
             "success": trace.success,
+            "benchmark_won": bool(trace.metrics.get(
+                "benchmark_won", trace.success)),
+            "runtime_contract_valid": bool(trace.metrics.get(
+                "runtime_contract_valid", True)),
+            "learning_eligible": bool(trace.metrics.get(
+                "learning_eligible", True)),
             "start_mode": trace.start_mode,
             "planning_mode": trace.planning_mode,
             "failure_type": trace.failure_type,
@@ -764,12 +783,33 @@ class AtomicSkillGraphSystem:
             trace.metrics.setdefault("execution_routing", []).append(
                 routing_audit)
             before = dict((resume or {}).get("state") or task.state or {})
+            distinct_allocations, distinct_allocation_groups = (
+                _runtime_distinct_allocations(
+                task, planned, runtime_graph, index, before)
+            )
+            distinct_exclusions = _runtime_distinct_exclusions(
+                task, planned, runtime_graph, index, before,
+                distinct_allocations, distinct_allocation_groups)
+            routing_audit["distinct_binding_allocations"] = dict(
+                distinct_allocations)
+            routing_audit["distinct_group_allocations"] = copy.deepcopy(
+                distinct_allocation_groups)
+            routing_audit["distinct_binding_exclusions"] = {
+                role: sorted(str(value) for value in values)
+                for role, values in distinct_exclusions.items()
+            }
             planned.params = _apply_runtime_data_bindings(
-                planned.params, planned.step_id, runtime_graph, shared_bindings)
+                planned.params, planned.step_id, runtime_graph, shared_bindings,
+                distinct_exclusions)
             # A plan may initially contain a class-valued entity slot because a
             # concrete instance is still hidden. Once execution establishes an
             # instance identity, carry it through later DATA_FLOW edges.
-            planned.params = _refine_env_object_binding(planned.params, before)
+            planned.params = _refine_env_object_binding(
+                planned.params, before, distinct_exclusions)
+            # Existing cardinality witnesses own the first K stable
+            # occurrences. Apply that concrete allocation after shared/state
+            # refinement so a class-level task binding cannot overwrite it.
+            planned.params.update(distinct_allocations)
             # RuntimeNodeState is created before execution.  Keep its persisted
             # view synchronized with parameters refined by prior-node data flow
             # or by framework discovery; otherwise node_results records the
@@ -786,15 +826,30 @@ class AtomicSkillGraphSystem:
             # advances control flow without pretending that a Tool/LLM ran.
             # Cardinality branches require a concrete unused instance; a
             # class-valued slot may not let occurrence two reuse occurrence one.
-            if (effects and _can_mark_already_satisfied(
-                    task, planned, effects, before, runtime_graph, index)):
+            allocated_cardinality_occurrence = (
+                _cardinality_allocation_covers_node(
+                    planned, distinct_allocations,
+                    distinct_allocation_groups))
+            if (effects and (
+                    allocated_cardinality_occurrence
+                    or _can_mark_already_satisfied(
+                        task, planned, effects, before, runtime_graph, index,
+                        distinct_exclusions))):
+                already_check = (
+                    "cardinality_occurrence_already_satisfied"
+                    if allocated_cardinality_occurrence
+                    else "effects_already_satisfied")
                 validation = NodeValidationResult(
                     node_ref=str(planned.ref), level="atomic", passed=True,
                     step_id=node.step_id, occurrence_id=node.occurrence_id,
                     attempt_index=-1, mode=NodeExecutionStatus.ALREADY_SATISFIED.value,
-                    checks={"effects_already_satisfied": True},
+                    checks={already_check: True},
                     before=before, after=before,
-                    messages=["occurrence effect already satisfied before execution"],
+                    messages=[
+                        "cardinality occurrence allocated to an existing "
+                        "distinct goal witness"
+                        if allocated_cardinality_occurrence else
+                        "occurrence effect already satisfied before execution"],
                 )
                 node.validation = validation
                 node.before = dict(before)
@@ -822,21 +877,40 @@ class AtomicSkillGraphSystem:
                 # never from task_type or a fixed operation list. Bind anything
                 # already witnessed in state before opening the bounded search.
                 planned.params = _bind_known_location_slots(
-                    planned.params, atomic, before)
+                    planned.params, atomic, before, distinct_exclusions)
                 node.params = dict(planned.params)
                 node.binding_provenance = _runtime_binding_provenance(
                     task, planned, runtime_graph, before)
-                location_slots = self.selector.discoverable_location_slots(
+                tool_location_slots = self.selector.discoverable_location_slots(
                     atomic.ref, {"inputs": planned.params, "harness": "env"})
-                location_slots |= {
+                contract_location_slots = {
                     str(item.get("name")) for item in (atomic.inputs or [])
                     if isinstance(item, dict)
                     and str(item.get("name") or "").endswith("_location")
                     and not is_concrete_binding(
                         planned.params.get(str(item.get("name"))))
                 }
-                if (self.config.features.enable_framework_discovery
-                        and callable(discover) and location_slots):
+                # Resolving a declared Atomic source slot is part of executing
+                # that contract, not an optional framework-search ablation.
+                # The feature flag only opts additional Tool-only parameters
+                # into discovery; it may never let an unresolved Atomic input
+                # fall through to Seeded/Dynamic execution.
+                mandatory_location_roles = {
+                    slot: _source_location_entity_role(
+                        atomic, slot, planned.params)
+                    for slot in contract_location_slots
+                }
+                mandatory_location_roles = {
+                    slot: role for slot, role in mandatory_location_roles.items()
+                    if role and is_concrete_binding(planned.params.get(role))
+                }
+                location_slots = set(contract_location_slots)
+                if self.config.features.enable_framework_discovery:
+                    location_slots |= set(tool_location_slots)
+                routing_audit["mandatory_location_slots"] = sorted(
+                    mandatory_location_roles)
+                discovery_result = None
+                if callable(discover) and location_slots:
                     # Parameter discovery belongs to execution of the learned
                     # Atomic contract, not to Tool evolution.  Atomic-only must
                     # therefore receive the same bounded binding opportunity.
@@ -856,14 +930,14 @@ class AtomicSkillGraphSystem:
                     for location_slot in sorted(location_slots):
                         if is_concrete_binding(planned.params.get(location_slot)):
                             continue
-                        entity_role = location_slot[:-len("_location")]
+                        entity_role = (_source_location_entity_role(
+                            atomic, location_slot, planned.params)
+                            or location_slot[:-len("_location")])
                         entity_value = planned.params.get(entity_role)
                         if entity_value in (None, ""):
                             continue
-                        excluded_objects = (
-                            _completed_distinct_effect_instances(
-                                task, before, planned.params)
-                            if entity_role == "object" else set())
+                        excluded_objects = set(
+                            distinct_exclusions.get(entity_role) or set())
                         binding, discovery_result = discover(
                             task, str(entity_value), resume=resume,
                             max_locations=self.config.thresholds.acquire_discovery_max_locations,
@@ -877,6 +951,15 @@ class AtomicSkillGraphSystem:
                         before = dict(resume.get("state") or before)
                         remapped = _remap_location_binding(
                             binding, entity_role, location_slot)
+                        reused_discovery = _reused_distinct_bindings(
+                            remapped, distinct_exclusions) if remapped else {}
+                        if reused_discovery:
+                            trace.metrics.setdefault(
+                                "distinct_discovery_rejections", []).append({
+                                    "node_ref": str(planned.ref),
+                                    "bindings": dict(reused_discovery),
+                                })
+                            remapped = {}
                         discovery_start = node_start_actions
                         discovery_end = len(discovery_result.actions)
                         metric = {
@@ -916,6 +999,69 @@ class AtomicSkillGraphSystem:
                             node.fallback_reason = (
                                 f"location_discovery_failed:{location_slot}")
                             break
+                discovery_action_end = len(
+                    (resume or {}).get("actions") or [])
+                discovery_action_count = max(
+                    0, discovery_action_end - node_start_actions)
+                node.executed_action_count += discovery_action_count
+                routing_audit["preparation_action_count"] = (
+                    discovery_action_count)
+                unresolved_mandatory_locations = sorted(
+                    slot for slot in mandatory_location_roles
+                    if not is_concrete_binding(planned.params.get(slot)))
+                if unresolved_mandatory_locations:
+                    # Do not hand an unresolved relational source to a Seeded
+                    # agent.  Besides duplicating bounded search, that permits
+                    # an unrelated accepted action to manufacture a seemingly
+                    # concrete source and poison failure/evolution statistics.
+                    slot = unresolved_mandatory_locations[0]
+                    cause = (str(getattr(discovery_result, "failure_type", "") or "")
+                             if callable(discover)
+                             else "location_discovery_unavailable")
+                    cause = _attribute_env_budget_failure(
+                        cause, action_end=discovery_action_end,
+                        global_limit=global_limit,
+                        node_deadline=node_deadline,
+                        attempt_deadline=node_deadline,
+                        budget_scope=budget_scope)
+                    cause = cause or f"location_discovery_failed:{slot}"
+                    if discovery_result is not None:
+                        discovery_result.failure_type = cause
+                    failure_stage = (
+                        "budget" if cause in {
+                            "episode_budget_exhausted",
+                            "node_budget_exhausted",
+                            "attempt_budget_exhausted",
+                        } else "preparation")
+                    node.fallback_reason = cause
+                    node.before = dict(before)
+                    node.after = dict(before)
+                    node.execution_status = NodeExecutionStatus.NOT_STARTED
+                    node.attempts.append({
+                        "mode": "", "started": False, "passed": False,
+                        "failure_type": cause,
+                        "failure_stage": failure_stage,
+                        "failure_cause": cause, "params": dict(planned.params),
+                        "tool_refs": [], "action_start": node_start_actions,
+                        "action_end": discovery_action_end,
+                        "action_count": discovery_action_count,
+                        "step_id": node.step_id,
+                        "occurrence_id": node.occurrence_id,
+                    })
+                    routing_audit["candidate_modes"] = []
+                    routing_audit["params_after_discovery"] = dict(planned.params)
+                    routing_audit["location_discovered"] = False
+                    routing_audit["unresolved_location_slots"] = (
+                        unresolved_mandatory_locations)
+                    routing_audit["attempts"] = [dict(item)
+                                                 for item in node.attempts]
+                    routing_audit["final_passed"] = False
+                    routing_audit["fallback_reason"] = cause
+                    trace.failure_stage = failure_stage
+                    trace.failure_cause = cause
+                    last_result = (discovery_result if discovery_result is not None
+                                   else _not_started_env_result(resume, cause))
+                    break
                 selection_context = {
                     "inputs": planned.params, "harness": "env",
                     "prefer_minimal_after_preparation": location_discovered,
@@ -1089,12 +1235,17 @@ class AtomicSkillGraphSystem:
                         if node.tool_refs else "", "step_id": node.step_id,
                         "steps": steps,
                     }]
-                result = self.adapter.run_env_episode(
+                result = _run_env_episode_with_optional_exclusions(
+                    self.adapter,
                     task, self.llm, seed_context=seed_context,
                     direct_steps=direct_steps, max_steps=attempt_deadline,
                     resume=resume, stop_effects=effects,
-                    effect_inputs=dict(planned.params), node_ref=str(planned.ref),
-                    phase_goal=_phase_goal_of(atomic, effects, planned.params),
+                    effect_inputs=dict(planned.params),
+                    excluded_effect_bindings=distinct_exclusions,
+                    node_ref=str(planned.ref),
+                    phase_goal=_phase_goal_of(
+                        atomic, effects, planned.params,
+                        distinct_exclusions),
                 )
                 last_result = result
                 if getattr(result, "diagnostics", None):
@@ -1159,13 +1310,42 @@ class AtomicSkillGraphSystem:
                         messages=[] if passed else [f"动态节点效果未发生：{missing}"],
                     )
                     trace.node_validators.append(validation)
+                reused_distinct = _reused_distinct_bindings(
+                    planned.params, distinct_exclusions)
+                if reused_distinct:
+                    passed = False
+                    if validation is not None:
+                        validation.passed = False
+                        validation.checks["distinct_bindings"] = False
+                        validation.messages.append(
+                            "cross-branch distinct binding reused: "
+                            f"{reused_distinct}")
+                        if "distinct_binding_reused" not in validation.failure_codes:
+                            validation.failure_codes.append(
+                                "distinct_binding_reused")
+                    if not result.failure_type:
+                        result.failure_type = "distinct_binding_reused"
+                    routing_audit.setdefault(
+                        "distinct_binding_rejections", []).append({
+                            "mode": mode.value,
+                            "bindings": reused_distinct,
+                        })
                 action_end = len(after_payload.get("actions") or [])
                 action_count = max(0, action_end - action_start)
-                if result.success and not passed and not result.failure_type:
-                    # A benchmark terminal signal cannot substitute for the
-                    # selected Runtime Graph contract.  Preserve this as an
-                    # explicit semantic mismatch instead of an empty failure.
-                    result.failure_type = "benchmark_goal_contract_mismatch"
+                if result.success and not passed:
+                    # Preserve benchmark-authoritative won for metrics, while
+                    # the independent runtime-contract gate prevents this
+                    # mismatch from writing positive or negative evolution
+                    # evidence.
+                    result.diagnostics.setdefault(
+                        "contract_mismatch", []).append({
+                            "node_ref": str(planned.ref),
+                            "benchmark_reported_success": True,
+                            "formal_node_validation_passed": False,
+                        })
+                    if not result.failure_type:
+                        result.failure_type = (
+                            "benchmark_goal_contract_mismatch")
                 result.failure_type = _attribute_env_budget_failure(
                     str(result.failure_type or ""),
                     action_end=action_end,
@@ -1252,9 +1432,17 @@ class AtomicSkillGraphSystem:
                 if final_actions < int(self.config.max_steps):
                     runtime_graph.record_usage(ExecutionMode.DYNAMIC)
                     gap_index = runtime_graph.append_dynamic_gap(
-                        gap_analysis.missing_effects, shared_bindings)
+                        gap_analysis.missing_effects, shared_bindings,
+                        task_target_effects=list(task.target_effects or []))
                     gap_node = runtime_graph.nodes[gap_index]
                     gap_plan = runtime_graph.plan.nodes[gap_index]
+                    gap_exclusions = _runtime_distinct_exclusions(
+                        task, gap_plan, runtime_graph, gap_index,
+                        pre_gap_state)
+                    gap_params = _constrain_task_gap_params(
+                        shared_bindings, gap_exclusions)
+                    gap_plan.params = dict(gap_params)
+                    gap_node.params = dict(gap_params)
                     gap_budget = int(
                         self.config.thresholds.env_dynamic_node_max_steps)
                     gap_deadline = min(
@@ -1270,7 +1458,11 @@ class AtomicSkillGraphSystem:
                         "node_limit": gap_budget,
                         "attempt_limit": gap_budget,
                         "absolute_deadline": gap_deadline,
-                        "initial_params": dict(shared_bindings),
+                        "initial_params": dict(gap_params),
+                        "distinct_binding_exclusions": {
+                            role: sorted(str(value) for value in values)
+                            for role, values in gap_exclusions.items()
+                        },
                         "target_effects": list(
                             gap_analysis.missing_effects),
                         "candidate_modes": [ExecutionMode.DYNAMIC.value],
@@ -1278,15 +1470,17 @@ class AtomicSkillGraphSystem:
                     }
                     trace.metrics.setdefault("execution_routing", []).append(
                         gap_routing_audit)
-                    gap_result = self.adapter.run_env_episode(
+                    gap_result = _run_env_episode_with_optional_exclusions(
+                        self.adapter,
                         task, self.llm, seed_context="",
                         max_steps=gap_deadline, resume=resume,
                         stop_effects=gap_analysis.missing_effects,
-                        effect_inputs=dict(shared_bindings),
+                        effect_inputs=dict(gap_params),
+                        excluded_effect_bindings=gap_exclusions,
                         node_ref=str(gap_plan.ref),
                         phase_goal=_phase_goal_of(
                             None, gap_analysis.missing_effects,
-                            shared_bindings),
+                            gap_params, gap_exclusions),
                     )
                     gap_end = len(gap_result.actions or [])
                     gap_result.failure_type = _attribute_env_budget_failure(
@@ -1304,22 +1498,56 @@ class AtomicSkillGraphSystem:
                     gap_after = dict(gap_after_payload.get("state") or pre_gap_state)
                     from .core.predicates import StateSnapshot, check_effects
                     gap_passed, gap_missing = check_effects(
-                        StateSnapshot(gap_after), shared_bindings,
+                        StateSnapshot(gap_after), gap_params,
                         gap_analysis.missing_effects, {"harness": "env"})
+                    distinct_gap_passed, distinct_gap_details = (
+                        _validate_task_gap_distinct_progress(
+                            task, gap_analysis.missing_effects,
+                            pre_gap_state, gap_after, gap_params,
+                            gap_exclusions))
+                    gap_passed = bool(gap_passed and distinct_gap_passed)
+                    gap_failure_codes: list[str] = []
+                    gap_messages = ([] if not gap_missing else [
+                        f"task gap effects not satisfied: {gap_missing}"])
+                    if not distinct_gap_passed:
+                        gap_result.failure_type = "distinct_binding_reused"
+                        gap_failure_codes.append("distinct_binding_reused")
+                        gap_messages.append(
+                            "task gap did not add the required new distinct "
+                            "target witness")
+                    if not gap_passed:
+                        # Preserve benchmark/harness won, but mark the formal
+                        # mismatch so the runtime learning gate stays neutral.
+                        if not str(gap_result.failure_type or ""):
+                            gap_result.failure_type = (
+                                "benchmark_goal_contract_mismatch"
+                                if not gap_missing else "effect_not_met")
+                        if (gap_missing
+                                and "task_gap_effect_not_met"
+                                not in gap_failure_codes):
+                            gap_failure_codes.append(
+                                "task_gap_effect_not_met")
                     gap_validation = NodeValidationResult(
                         node_ref=str(gap_plan.ref), level="task_gap",
                         passed=gap_passed, step_id=gap_node.step_id,
                         occurrence_id=gap_node.occurrence_id,
                         attempt_index=0, mode=ExecutionMode.DYNAMIC.value,
                         failure_stage="validation",
-                        checks={"missing_target_effects": gap_passed},
+                        checks={
+                            "missing_target_effects": not bool(gap_missing),
+                            "distinct_target_progress": distinct_gap_passed,
+                        },
                         before=pre_gap_state, after=gap_after,
-                        messages=[] if gap_passed else [
-                            f"task gap effects not satisfied: {gap_missing}"],
+                        messages=gap_messages,
+                        failure_codes=gap_failure_codes,
                     )
                     gap_node.validation = gap_validation
                     gap_node.before, gap_node.after = pre_gap_state, gap_after
                     gap_node.passed = gap_passed
+                    gap_node.distinct_witness_outputs = (
+                        _materialize_task_gap_distinct_witness_outputs(
+                            distinct_gap_details)
+                        if gap_passed else {})
                     gap_node.attempt_started = gap_end > final_actions
                     gap_node.executed_action_count = max(
                         0, gap_end - final_actions)
@@ -1336,13 +1564,17 @@ class AtomicSkillGraphSystem:
                         "failure_type": str(gap_result.failure_type or ""),
                         "failure_stage": "execution",
                         "failure_cause": str(gap_result.failure_type or ""),
-                        "params": dict(shared_bindings), "tool_refs": [],
+                        "params": dict(gap_params), "tool_refs": [],
                         "action_start": final_actions, "action_end": gap_end,
                         "action_count": gap_node.executed_action_count,
                         "step_id": gap_node.step_id,
                         "occurrence_id": gap_node.occurrence_id,
                         "before": pre_gap_state, "after": gap_after,
+                        "distinct_progress": copy.deepcopy(
+                            distinct_gap_details),
                     })
+                    gap_routing_audit["distinct_progress"] = copy.deepcopy(
+                        distinct_gap_details)
                     gap_routing_audit["attempts"] = [
                         dict(item) for item in gap_node.attempts]
                     gap_routing_audit["final_passed"] = bool(gap_passed)
@@ -1634,6 +1866,13 @@ class AtomicSkillGraphSystem:
             return {"infrastructure_failure": True,
                     "learning_skipped": True,
                     "errors": list(trace.metrics.get("infrastructure_errors") or [])}
+        if not bool(trace.metrics.get("learning_eligible", True)):
+            return {
+                "learning_skipped": True,
+                "neutral_contract_mismatch": True,
+                "benchmark_won": bool(trace.success),
+                "runtime_contract_valid": False,
+            }
         if trace.success:
             run_maintenance = (
                 self.config.features.enable_tool_evolution
@@ -1971,6 +2210,113 @@ def analyze_task_gap(task: Task, state: dict[str, Any],
     )
 
 
+def _runtime_learning_eligible(
+        trace: TraceRecord, task: Task | None = None) -> bool:
+    """Validate runtime evidence independently from benchmark-authoritative won."""
+    realized = list(trace.realized_atomic_nodes or [])
+    selected = [
+        node for node in realized
+        if (bool(node.get("attempt_started"))
+            or str(node.get("execution_status") or "")
+            == NodeExecutionStatus.ALREADY_SATISFIED.value)
+    ]
+    selected_valid = all(bool(node.get("passed")) for node in selected)
+    validators = [
+        item for item in trace.node_validators
+        if item.level in {"atomic", "task_gap"}
+    ]
+    validators_valid = all(bool(item.passed) for item in validators)
+    gap_required = bool(
+        trace.task_gap_analysis is not None
+        and trace.task_gap_analysis.missing_effects)
+    gap_validators = [item for item in validators if item.level == "task_gap"]
+    gap_valid = (not gap_required) or (
+        bool(gap_validators) and all(item.passed for item in gap_validators))
+    # Legacy/non-resume whole-plan Seeded execution cannot be credited when it
+    # produced actions but no formal per-node boundary/validator at all.
+    segmented_evidence = not (
+        realized and trace.actions and not validators)
+    final_target_valid = True
+    if task is not None and _is_env_task(task) and task.target_effects:
+        final_target_valid = _final_target_contract_valid(trace, task)
+    return bool(selected_valid and validators_valid and gap_valid
+                and segmented_evidence and final_target_valid)
+
+
+def _final_target_contract_valid(trace: TraceRecord, task: Task) -> bool:
+    """Recheck formal targets after benchmark finalization/protocol actions."""
+    from .core.predicates import StateSnapshot, check_effects
+
+    bindings = _realized_task_bindings(
+        dict(task.context.get("params") or {}),
+        list(trace.realized_atomic_nodes or []))
+    snapshot = StateSnapshot(trace.final_state())
+    certificates = list(
+        (trace.metrics.get("runtime_diagnostics") or {}).get(
+            "terminal_verified_effects") or [])
+    for target in task.target_effects or []:
+        if not isinstance(target, dict):
+            return False
+        passed, _missing = check_effects(
+            snapshot, bindings, [target], {"harness": "env"})
+        if passed:
+            continue
+        cardinality = max(1, int(target.get("cardinality", 1) or 1))
+        if cardinality != 1:
+            return False
+        single = {**target, "cardinality": 1, "distinct_by": ""}
+        certified = any(
+            isinstance(item, dict)
+            and bool(item.get("benchmark_won"))
+            and str(item.get("source") or "")
+            == "benchmark_terminal_certificate_v1"
+            and isinstance(item.get("effect"), dict)
+            and _terminal_certificate_matches_target(
+                dict(item["effect"]), single, bindings)
+            for item in certificates)
+        if not certified:
+            return False
+    return True
+
+
+def _terminal_certificate_matches_target(
+        certificate_effect: dict[str, Any], target_effect: dict[str, Any],
+        bindings: dict[str, Any]) -> bool:
+    """Match a concrete terminal certificate to a bound target contract.
+
+    Task goals commonly retain a class binding (``bowl``), while terminal
+    evidence necessarily names the concrete instance (``bowl_2``). Matching is
+    directional: a class may accept one of its instances, but a concrete task
+    identity never accepts a different instance.
+    """
+    from .core.predicates import (
+        ordered_predicate_args, predicate_fact_signature)
+
+    certificate_name = str(certificate_effect.get("predicate") or "")
+    target_name = str(target_effect.get("predicate") or "")
+    certificate_fact, _certificate_schema = predicate_fact_signature(
+        certificate_name)
+    target_fact, _target_schema = predicate_fact_signature(target_name)
+    if not certificate_fact or certificate_fact != target_fact:
+        return False
+
+    certificate_args = ordered_predicate_args(
+        certificate_name, dict(certificate_effect.get("args") or {}))
+    target_args = ordered_predicate_args(
+        target_name, dict(target_effect.get("args") or {}))
+    if len(certificate_args) != len(target_args):
+        return False
+    for (_certificate_arg, actual), (_target_arg, raw_expected) in zip(
+            certificate_args, target_args):
+        slot = binding_slot_name(raw_expected)
+        expected = bindings.get(slot, raw_expected) if slot else raw_expected
+        if (not is_concrete_binding(actual)
+                or not is_concrete_binding(expected)
+                or not _runtime_values_compatible(expected, actual)):
+            return False
+    return True
+
+
 def _task_gap_is_strong_proof(trace: TraceRecord) -> bool:
     """Require executed, code-validated gap evidence before suppression."""
     analysis = trace.task_gap_analysis
@@ -2131,7 +2477,8 @@ def _append_planned_runtime_spans(trace: TraceRecord,
 
 def _can_mark_already_satisfied(
         task: Task, planned: Any, effects: list[dict[str, Any]],
-        state: dict[str, Any], runtime_graph: RuntimeGraph, index: int) -> bool:
+        state: dict[str, Any], runtime_graph: RuntimeGraph, index: int,
+        distinct_exclusions: dict[str, set[Any]] | None = None) -> bool:
     from .core.predicates import StateSnapshot, check_effects
 
     required = semantic_required_slots(effects)
@@ -2142,6 +2489,12 @@ def _can_mark_already_satisfied(
         StateSnapshot(state or {}), planned.params, effects,
         {"harness": "env"})
     if not passed:
+        return False
+
+    # A class-valued binding can existentially match an already consumed
+    # witness.  It is not evidence that this occurrence owns a fresh instance.
+    if _reused_distinct_bindings(
+            planned.params, distinct_exclusions or {}):
         return False
 
     max_cardinality = max(
@@ -2255,7 +2608,8 @@ def _guideline_of(atomic: Any) -> str:
 
 
 def _phase_goal_of(atomic: Any, effects: list[dict[str, Any]],
-                   params: dict[str, Any]) -> str:
+                   params: dict[str, Any],
+                   excluded_bindings: dict[str, set[Any]] | None = None) -> str:
     """构造只覆盖当前 Atomic Effect 的阶段目标，防止一个 Seeded 节点包办整题。"""
     summary = str(getattr(atomic, "summary", "") or "complete the current atomic step")
     bound: list[str] = []
@@ -2265,12 +2619,47 @@ def _phase_goal_of(atomic: Any, effects: list[dict[str, Any]],
         detail = ", ".join(f"{key}={value}" for key, value in args.items())
         bound.append(f"{effect.get('predicate')}({detail})")
     target = "; ".join(bound) or summary
-    return (f"Complete ONLY this atomic step: {summary}. Required state: {target}. "
-            "Do not continue to later task stages after this state is reached.")
+    exclusions = {
+        str(role): sorted(str(value) for value in values)
+        for role, values in (excluded_bindings or {}).items() if values
+    }
+    distinct_instruction = ""
+    if exclusions:
+        rendered = "; ".join(
+            f"{role} excludes {', '.join(values)}"
+            for role, values in exclusions.items())
+        distinct_instruction = (
+            " Cardinality constraint: select a DIFFERENT concrete instance; "
+            f"do not take, move, or reuse already claimed instances ({rendered})."
+        )
+    return (f"Complete ONLY this atomic step: {summary}. Required state: {target}."
+            f"{distinct_instruction} Do not continue to later task stages "
+            "after this state is reached.")
 
 
-def _refine_env_object_binding(params: dict[str, Any],
-                               state: dict[str, Any]) -> dict[str, Any]:
+def _run_env_episode_with_optional_exclusions(
+        adapter: Any, task: Task, llm: Any, **kwargs: Any) -> Any:
+    """Pass the new exclusion contract without breaking legacy adapters."""
+    import inspect
+
+    method = adapter.run_env_episode
+    try:
+        parameters = inspect.signature(method).parameters.values()
+        supports = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            or parameter.name == "excluded_effect_bindings"
+            for parameter in parameters)
+    except (TypeError, ValueError):
+        supports = False
+    if not supports:
+        kwargs.pop("excluded_effect_bindings", None)
+    return method(task, llm, **kwargs)
+
+
+def _refine_env_object_binding(
+        params: dict[str, Any], state: dict[str, Any],
+        excluded_bindings: dict[str, set[Any]] | None = None
+        ) -> dict[str, Any]:
     """Carry a discovered environment entity instance into downstream nodes.
 
     Planning correctly starts from a class-level goal slot (for example
@@ -2286,18 +2675,65 @@ def _refine_env_object_binding(params: dict[str, Any],
     if not wanted or re.search(r"_\d+$", wanted):
         return refined
     family = re.sub(r"_\d+$", "", wanted)
+    excluded = set((excluded_bindings or {}).get("object") or set())
     matches = []
     for item in state.get("inventory", []) or []:
         actual = normalize_value(item)
-        if re.sub(r"_\d+$", "", actual) == family:
+        if (re.sub(r"_\d+$", "", actual) == family
+                and not any(distinct_values_conflict(actual, claimed)
+                            for claimed in excluded)):
             matches.append(actual)
     if len(matches) == 1:
         refined["object"] = matches[0]
     return refined
 
 
-def _bind_known_location_slots(params: dict[str, Any], atomic: Any,
-                               state: dict[str, Any]) -> dict[str, Any]:
+def _source_location_entity_role(
+        atomic: Any, location_slot: str,
+        params: dict[str, Any]) -> str:
+    """Return the entity input anchored by a learned source-location slot.
+
+    The relation is inferred from the Atomic contract rather than an operation
+    or task label.  A conventional ``object_location`` maps directly to
+    ``object``.  A generic ``source_location`` is supported when a precondition
+    relates it to exactly one other input (for example ``object.at_location``).
+    Destination-only slots that occur solely in Effects are intentionally not
+    treated as sources to discover.
+    """
+    slot = str(location_slot or "")
+    if not slot.endswith("_location"):
+        return ""
+    declared = {
+        str(item.get("name")) for item in (getattr(atomic, "inputs", []) or [])
+        if isinstance(item, dict) and item.get("name")
+    }
+    prefix = slot[:-len("_location")]
+    if prefix in declared and prefix in params:
+        return prefix
+
+    candidates: set[str] = set()
+    for condition in (getattr(atomic, "preconditions", []) or []):
+        if not isinstance(condition, dict):
+            continue
+        relation_slots: set[str] = set()
+        _collect_input_slots(dict(condition.get("args") or {}), relation_slots)
+        if slot not in relation_slots:
+            continue
+        candidates.update(
+            role for role in relation_slots
+            if role != slot and role in declared and not role.endswith("_location"))
+    concrete = sorted(
+        role for role in candidates
+        if is_concrete_binding(dict(params or {}).get(role)))
+    if len(concrete) == 1:
+        return concrete[0]
+    return ""
+
+
+def _bind_known_location_slots(
+        params: dict[str, Any], atomic: Any, state: dict[str, Any],
+        excluded_bindings: dict[str, set[Any]] | None = None
+        ) -> dict[str, Any]:
     """Fill learned ``<entity_role>_location`` slots from state evidence."""
     import re
     from .core.predicates import normalize_value
@@ -2309,20 +2745,29 @@ def _bind_known_location_slots(params: dict[str, Any], atomic: Any,
         and str(item.get("name") or "").endswith("_location")
     }
     facts = list((state or {}).get("facts") or [])
+    excluded_by_role = {
+        str(role): {normalize_value(value) for value in values
+                    if value not in (None, "")}
+        for role, values in (excluded_bindings or {}).items()
+    }
     for slot in slots:
-        if refined.get(slot) not in (None, ""):
+        if is_concrete_binding(refined.get(slot)):
             continue
-        entity_role = slot[:-len("_location")]
+        entity_role = (_source_location_entity_role(
+            atomic, slot, refined) or slot[:-len("_location")])
         wanted = normalize_value(refined.get(entity_role, ""))
         if not wanted:
             continue
+        excluded = excluded_by_role.get(entity_role, set())
         candidates: list[tuple[str, str]] = []
         for fact in facts:
             match = re.fullmatch(r"object_at\((.+?),\s*(.+?)\)", str(fact))
             if not match:
                 continue
             actual, location = normalize_value(match.group(1)), normalize_value(match.group(2))
-            if _runtime_values_compatible(wanted, actual):
+            if (not any(distinct_values_conflict(actual, claimed)
+                        for claimed in excluded)
+                    and _runtime_values_compatible(wanted, actual)):
                 candidates.append((actual, location))
         if len(set(candidates)) != 1:
             continue
@@ -2347,7 +2792,9 @@ def _remap_location_binding(binding: dict[str, Any], entity_role: str,
 
 def _apply_runtime_data_bindings(params: dict[str, Any], step_id: str,
                                  runtime_graph: RuntimeGraph,
-                                 shared: dict[str, Any]) -> dict[str, Any]:
+                                 shared: dict[str, Any],
+                                 excluded_bindings: dict[str, set[Any]] | None = None
+                                 ) -> dict[str, Any]:
     """Ground a node from verified upstream occurrence data.
 
     Explicit DATA_FLOW mappings take precedence.  Shared same-role bindings are
@@ -2365,6 +2812,9 @@ def _apply_runtime_data_bindings(params: dict[str, Any], step_id: str,
         source_role = str((edge.mapping or {}).get("source_output") or "")
         target_role = str((edge.mapping or {}).get("target_input") or "")
         value = source.outputs.get(source_role)
+        if _binding_value_is_excluded(
+                target_role, value, excluded_bindings or {}):
+            continue
         if target_role and value not in (None, "") and (
                 refined.get(target_role) in (None, "")
                 or _runtime_binding_can_refine(refined.get(target_role), value)):
@@ -2372,9 +2822,254 @@ def _apply_runtime_data_bindings(params: dict[str, Any], step_id: str,
     for role, value in shared.items():
         if role not in refined or value in (None, ""):
             continue
+        if _binding_value_is_excluded(
+                role, value, excluded_bindings or {}):
+            continue
         if _runtime_binding_can_refine(refined.get(role), value):
             refined[role] = value
     return refined
+
+
+def _runtime_distinct_exclusions(
+        task: Task, planned: Any, runtime_graph: RuntimeGraph, index: int,
+        state: dict[str, Any],
+        assigned_bindings: dict[str, Any] | None = None,
+        assigned_groups: dict[str, dict[str, Any]] | None = None
+        ) -> dict[str, set[Any]]:
+    """Combine validated cross-branch claims with visible completed witnesses."""
+    exclusions = {
+        str(role): set(values)
+        for role, values in runtime_graph.distinct_exclusions(index).items()
+    }
+    constrained_roles = set(
+        dict(getattr(planned, "distinct_bindings", {}) or {}))
+    if constrained_roles:
+        for role, groups in dict(
+                getattr(planned, "distinct_bindings", {}) or {}).items():
+            for group in groups:
+                contract = _distinct_group_target_effect(task, str(group))
+                if contract is None:
+                    continue
+                completed = _completed_distinct_effect_instances(
+                    task, state,
+                    dict(getattr(planned, "params", {}) or {}),
+                    contract=contract)
+                group_assignment = dict(assigned_groups or {}).get(str(group), {})
+                assigned = (group_assignment.get("witness")
+                            if str(group_assignment.get("role") or "") == str(role)
+                            else dict(assigned_bindings or {}).get(str(role)))
+                if assigned not in (None, ""):
+                    completed = {
+                        witness for witness in completed
+                        if str(witness) != str(assigned)
+                    }
+                exclusions.setdefault(str(role), set()).update(completed)
+    return {role: values for role, values in exclusions.items() if values}
+
+
+def _runtime_distinct_allocations(
+        task: Task, planned: Any, runtime_graph: RuntimeGraph, index: int,
+        state: dict[str, Any]
+        ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    """Allocate existing concrete goal witnesses to early occurrences.
+
+    For a cardinality ``N`` target with ``K`` already-satisfied witnesses, the
+    first ``K`` stable occurrence branches own those witnesses. Later branches
+    exclude all of them and search only for the remaining instances. Task Gap
+    is always a remaining-work occurrence and therefore never receives an
+    already-satisfied allocation.
+    """
+    if str(getattr(planned, "source", "") or "") == "task_gap":
+        return {}, {}
+    group_assignments: dict[str, dict[str, Any]] = {}
+    for role, groups in dict(
+            getattr(planned, "distinct_bindings", {}) or {}).items():
+        for group in groups:
+            contract = _distinct_group_target_effect(task, str(group))
+            if contract is None:
+                continue
+            witnesses = sorted(_completed_distinct_effect_instances(
+                task, state, dict(getattr(planned, "params", {}) or {}),
+                contract=contract))
+            ordinal = runtime_graph.distinct_occurrence_ordinal(
+                index, str(group))
+            if ordinal < 0 or ordinal >= len(witnesses):
+                continue
+            witness = witnesses[ordinal]
+            current = dict(getattr(planned, "params", {}) or {}).get(str(role))
+            if (current not in (None, "")
+                    and not str(current).startswith("$")
+                    and not distinct_values_conflict(current, witness)):
+                continue
+            group_assignments[str(group)] = {
+                "role": str(role),
+                "witness": witness,
+                "occurrence_ordinal": ordinal,
+                "target_effect": copy.deepcopy(contract),
+            }
+
+    assignments: dict[str, Any] = {}
+    constrained = dict(getattr(planned, "distinct_bindings", {}) or {})
+    for role, groups in constrained.items():
+        records = [group_assignments.get(str(group)) for group in groups]
+        if not records or any(not isinstance(record, dict)
+                              for record in records):
+            continue
+        witnesses = {str(record.get("witness") or "") for record in records}
+        if len(witnesses) == 1 and "" not in witnesses:
+            assignments[str(role)] = next(iter(witnesses))
+    return assignments, group_assignments
+
+
+def _cardinality_allocation_covers_node(
+        planned: Any, assignments: dict[str, Any],
+        group_assignments: dict[str, dict[str, Any]]) -> bool:
+    constrained = dict(getattr(planned, "distinct_bindings", {}) or {})
+    if not constrained:
+        return False
+    for role, groups in constrained.items():
+        if str(role) not in assignments:
+            return False
+        for group in groups:
+            record = group_assignments.get(str(group))
+            if (not isinstance(record, dict)
+                    or str(record.get("role") or "") != str(role)
+                    or str(record.get("witness") or "")
+                    != str(assignments[str(role)])):
+                return False
+    return True
+
+
+def _constrain_task_gap_params(
+        params: dict[str, Any],
+        excluded_bindings: dict[str, set[Any]]) -> dict[str, Any]:
+    """Make Task Gap exclusions explicit without pinning it to an old instance."""
+    import re
+    from .core.predicates import normalize_value
+
+    constrained = dict(params or {})
+    metadata: dict[str, list[str]] = {}
+    for role, raw_values in (excluded_bindings or {}).items():
+        values = sorted({normalize_value(item) for item in raw_values if item})
+        if not values:
+            continue
+        metadata[str(role)] = values
+        current = constrained.get(str(role))
+        normalized = normalize_value(current) if current not in (None, "") else ""
+        if (normalized and re.search(r"_\d+$", normalized)
+                and any(distinct_values_conflict(normalized, value)
+                        for value in values)):
+            # Keep the semantic family available to the agent, but never pass
+            # the claimed concrete identity back as the requested input.
+            constrained[str(role)] = re.sub(r"_\d+$", "", normalized)
+    if metadata:
+        constrained["__distinct_exclusions__"] = metadata
+    return constrained
+
+
+def _validate_task_gap_distinct_progress(
+        task: Task, effects: list[dict[str, Any]],
+        before: dict[str, Any], after: dict[str, Any],
+        params: dict[str, Any],
+        excluded_bindings: dict[str, set[Any]]) -> tuple[bool, list[dict[str, Any]]]:
+    """Require new non-reserved witnesses for every cardinality Gap target."""
+    details: list[dict[str, Any]] = []
+    passed = True
+    for effect in effects or []:
+        if (not isinstance(effect, dict)
+                or int(effect.get("cardinality", 1) or 1) <= 1):
+            continue
+        distinct_arg = str(effect.get("distinct_by") or "")
+        if not distinct_arg:
+            continue
+        args = dict(effect.get("args") or {})
+        role = binding_slot_name(args.get(distinct_arg)) or distinct_arg
+        before_witnesses = _completed_distinct_effect_instances(
+            task, before, params, contract=effect)
+        after_witnesses = _completed_distinct_effect_instances(
+            task, after, params, contract=effect)
+        excluded = set(excluded_bindings.get(role) or set())
+        required_new = max(
+            1, int(effect.get("cardinality", 1) or 1)
+            - len(before_witnesses))
+        exact_new = {
+            witness for witness in after_witnesses
+            if witness not in before_witnesses
+        }
+        accepted_new = {
+            witness for witness in exact_new
+            if not any(distinct_values_conflict(witness, claimed)
+                       for claimed in excluded)
+        }
+        current_passed = len(accepted_new) >= required_new
+        passed &= current_passed
+        details.append({
+            "predicate": str(effect.get("predicate") or ""),
+            "distinct_by": distinct_arg,
+            "role": role,
+            "required_new_count": required_new,
+            "before_witnesses": sorted(before_witnesses),
+            "after_witnesses": sorted(after_witnesses),
+            "excluded_witnesses": sorted(str(item) for item in excluded),
+            "new_witnesses": sorted(exact_new),
+            "accepted_new_witnesses": sorted(accepted_new),
+            "passed": current_passed,
+        })
+    return passed, details
+
+
+def _materialize_task_gap_distinct_witness_outputs(
+        details: list[dict[str, Any]]) -> dict[str, list[Any]]:
+    """Materialize validated Gap witnesses without inventing a scalar output.
+
+    One Task Gap occurrence can satisfy multiple cardinality witnesses.  A
+    role therefore maps to a stable, de-duplicated list; callers that require a
+    scalar must continue using the ordinary ``outputs`` channel and an
+    explicit scalar materializer.
+    """
+    from .core.predicates import normalize_value
+
+    collected: dict[str, set[str]] = {}
+    for detail in details or []:
+        if not isinstance(detail, dict) or not detail.get("passed"):
+            continue
+        role = str(detail.get("role") or "")
+        if not role:
+            continue
+        values = {
+            normalize_value(value)
+            for value in (detail.get("accepted_new_witnesses") or [])
+            if value not in (None, "")
+        }
+        if values:
+            collected.setdefault(role, set()).update(values)
+    return {role: sorted(values) for role, values in sorted(collected.items())}
+
+
+def _binding_value_is_excluded(
+        role: str, value: Any,
+        excluded_bindings: dict[str, set[Any]]) -> bool:
+    if value in (None, ""):
+        return False
+    return any(
+        distinct_values_conflict(value, item)
+        for item in excluded_bindings.get(str(role), set())
+        if item not in (None, ""))
+
+
+def _reused_distinct_bindings(
+        params: dict[str, Any],
+        excluded_bindings: dict[str, set[Any]]) -> dict[str, Any]:
+    """Return roles that are exact or class-level aliases of claimed values."""
+    reused: dict[str, Any] = {}
+    for role, excluded_values in excluded_bindings.items():
+        value = dict(params or {}).get(role)
+        if value in (None, "") or str(value).startswith("$"):
+            continue
+        if any(distinct_values_conflict(value, excluded)
+               for excluded in excluded_values):
+            reused[str(role)] = value
+    return reused
 
 
 def _runtime_resolvable_semantic_slots(
@@ -2478,6 +3173,8 @@ def _update_verified_runtime_bindings(task: Task, planned: Any,
     cardinality = max(
         [max(1, int(effect.get("cardinality", 1) or 1))
          for effect in task.target_effects if isinstance(effect, dict)] or [1])
+    distinct_roles = set(
+        dict(getattr(planned, "distinct_bindings", {}) or {}))
     for role, value in dict(planned.params or {}).items():
         if value in (None, "") or str(value).startswith("$"):
             continue
@@ -2486,7 +3183,8 @@ def _update_verified_runtime_bindings(task: Task, planned: Any,
             # A cardinality workflow deliberately selects a new entity on each
             # branch.  Its identity is carried by DATA_FLOW edges, not a global
             # task binding that would force all branches to reuse object one.
-            if cardinality > 1 and role in {"object", "object_location"}:
+            if (role in distinct_roles
+                    or (cardinality > 1 and role == "object_location")):
                 continue
             shared[role] = value
 
@@ -2560,8 +3258,13 @@ def _ground_env_runtime_params(
         action_node = str(action.get("node_ref") or "")
         if node_ref and action_node and action_node != node_ref:
             continue
-        for slot, observed in dict(action.get("params") or {}).items():
+        action_params = dict(action.get("params") or {})
+        for slot, observed in action_params.items():
             if slot not in slots or observed in (None, ""):
+                continue
+            if (str(slot).endswith("_location")
+                    and not _accepted_location_binding_matches_entity(
+                        atomic, str(slot), refined, action_params)):
                 continue
             normalized = _normalize_runtime_binding(observed)
             old = refined.get(slot)
@@ -2635,6 +3338,38 @@ def _ground_env_runtime_params(
     return refined, evidence
 
 
+def _accepted_location_binding_matches_entity(
+        atomic: Any, location_slot: str, current: dict[str, Any],
+        action_params: dict[str, Any]) -> bool:
+    """Require one accepted action to ground an entity/location pair jointly.
+
+    A location parameter alone does not identify whose location it is.  When
+    the Atomic precondition names the source relation, the same action must
+    carry a compatible value for that entity role.  For destination-style
+    location slots, any shared entity parameters must still be compatible.
+    """
+    entity_role = _source_location_entity_role(
+        atomic, location_slot, current)
+    if entity_role:
+        observed_entity = dict(action_params or {}).get(entity_role)
+        if observed_entity in (None, ""):
+            return False
+        existing_entity = dict(current or {}).get(entity_role)
+        return (_runtime_values_compatible(existing_entity, observed_entity)
+                or _runtime_binding_can_refine(
+                    existing_entity, observed_entity))
+
+    shared_roles = [
+        role for role in action_params
+        if role in current and not str(role).endswith("_location")
+    ]
+    return all(
+        _runtime_values_compatible(current.get(role), action_params.get(role))
+        or _runtime_binding_can_refine(
+            current.get(role), action_params.get(role))
+        for role in shared_roles)
+
+
 def _collect_input_slots(value: Any, slots: set[str]) -> None:
     if isinstance(value, dict):
         for nested in value.values():
@@ -2674,7 +3409,8 @@ def _attribute_env_budget_failure(
     therefore use the same absolute indices; comparing a local action count to
     a global deadline silently mislabels resumed attempts.
     """
-    if str(failure_type or "") != "max_steps":
+    if str(failure_type or "") not in {
+            "max_steps", "discovery_budget_exhausted"}:
         return str(failure_type or "")
     used = int(action_end)
     if used >= int(global_limit):
@@ -2749,39 +3485,84 @@ def _realized_task_bindings(task_params: dict[str, Any],
     return realized
 
 
-def _completed_distinct_effect_instances(task: Task, state: dict[str, Any],
-                                         params: dict[str, Any]) -> set[str]:
-    """Exclude instances already satisfying a cardinality placement goal.
+def _distinct_group_target_effect(
+        task: Task, group_id: str) -> dict[str, Any] | None:
+    import re
+
+    matched = re.match(r"target_(\d+):", str(group_id or ""))
+    if matched is None:
+        return None
+    index = int(matched.group(1))
+    effects = list(task.target_effects or [])
+    if index >= len(effects) or not isinstance(effects[index], dict):
+        return None
+    return effects[index]
+
+
+def _completed_distinct_effect_instances(
+        task: Task, state: dict[str, Any], params: dict[str, Any], *,
+        contract: dict[str, Any] | None = None) -> set[str]:
+    """Return witnesses already satisfying any cardinality goal contract.
 
     This is execution state, not a persisted instance-specific Skill/Tool
     identity. The trigger is the goal contract itself, never a benchmark task
-    label. It prevents a repeated generic producer branch from selecting a
-    completed distinct instance back out of the destination.
+    label or operation name. It covers placement as well as arbitrary state
+    predicates such as toggled/heated/inspected.
     """
     import re
-    from .core.predicates import bind_args, normalize_value
+    from .core.predicates import (
+        bind_args, normalize_value, ordered_predicate_args,
+        predicate_fact_signature)
 
-    contract = next((effect for effect in (task.target_effects or [])
-                     if isinstance(effect, dict)
-                     and str(effect.get("predicate") or "") == "object.at_location"
-                     and int(effect.get("cardinality", 1) or 1) > 1
-                     and str(effect.get("distinct_by") or "") == "object"), None)
-    if contract is None:
-        return set()
+    contracts = ([contract] if isinstance(contract, dict) else [
+        effect for effect in (task.target_effects or [])
+        if isinstance(effect, dict)])
     context = dict(task.context.get("params") or {})
     bindings = {**context, **dict(params or {})}
-    args = bind_args(dict(contract.get("args") or {}), bindings, bindings)
-    wanted = normalize_value(args.get("object") or "")
-    target = normalize_value(args.get("location") or "")
-    if not wanted or not target:
-        return set()
-    family = re.sub(r"_\d+$", "", wanted)
     completed: set[str] = set()
-    for fact in state.get("facts", []) or []:
-        match = re.fullmatch(r"object_at\((.+?),\s*(.+?)\)", str(fact))
-        if not match:
+    for current in contracts:
+        if (int(current.get("cardinality", 1) or 1) <= 1
+                or not str(current.get("distinct_by") or "")):
             continue
-        obj, location = normalize_value(match.group(1)), normalize_value(match.group(2))
-        if re.sub(r"_\d+$", "", obj) == family and location == target:
-            completed.add(obj)
+        distinct_arg = str(current.get("distinct_by") or "")
+        predicate = str(current.get("predicate") or "")
+        bound_args = bind_args(
+            dict(current.get("args") or {}), bindings, bindings)
+        ordered_args = ordered_predicate_args(predicate, bound_args)
+        keys = [key for key, _value in ordered_args]
+        args = dict(ordered_args)
+        if distinct_arg not in keys:
+            continue
+        distinct_index = keys.index(distinct_arg)
+        fact_name, _argument_order = predicate_fact_signature(predicate)
+        expected_predicate = _runtime_state_predicate(fact_name)
+        for fact in state.get("facts", []) or []:
+            match = re.fullmatch(
+                r"\s*([a-zA-Z0-9_.]+)\((.*)\)\s*", str(fact))
+            if match is None or _runtime_state_predicate(
+                    match.group(1)) != expected_predicate:
+                continue
+            values = [normalize_value(item.strip())
+                      for item in match.group(2).split(",")]
+            if len(values) != len(keys):
+                continue
+            compatible = True
+            for index, key in enumerate(keys):
+                expected = args.get(key)
+                if expected in (None, "") or str(expected).startswith("$"):
+                    continue
+                if not distinct_values_conflict(expected, values[index]):
+                    compatible = False
+                    break
+            if compatible:
+                completed.add(values[distinct_index])
     return completed
+
+
+def _runtime_state_predicate(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace(".", "_")
+    return {
+        "object_at_location": "object_at",
+        "object_in_receptacle": "object_at",
+        "object_in_container": "object_at",
+    }.get(normalized, normalized)

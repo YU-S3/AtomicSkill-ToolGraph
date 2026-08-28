@@ -4,6 +4,7 @@ from atomic_skillgraph.adapters.alfworld import (
 from atomic_skillgraph.adapters.benchmark import EnvRunResult, Task
 from atomic_skillgraph.adapters.mock_llm import MockLLM
 from atomic_skillgraph.core.config import SystemConfig
+from atomic_skillgraph.core.predicates import StateSnapshot, check_effects
 from atomic_skillgraph.core.refs import SkillRef
 from atomic_skillgraph.core.refs import ToolRef
 from atomic_skillgraph.core.skill_ir import (
@@ -12,8 +13,13 @@ from atomic_skillgraph.core.status import (
     ArtifactKind, ExecutionMode, SkillStatus, ToolLifecycle)
 from atomic_skillgraph.core.tool_ir import ToolAsset
 from atomic_skillgraph.core.trace_ir import TraceRecord
-from atomic_skillgraph.runtime.runtime_graph import PlannedNode, RuntimeGraph, RuntimePlan
-from atomic_skillgraph.system import AtomicSkillGraphSystem
+from atomic_skillgraph.runtime.runtime_graph import (
+    PlannedNode, RuntimeGraph, RuntimePlan, distinct_values_conflict)
+from atomic_skillgraph.system import (
+    AtomicSkillGraphSystem, _bind_known_location_slots,
+    _cardinality_allocation_covers_node,
+    _refine_env_object_binding, _reused_distinct_bindings,
+    _runtime_distinct_allocations, _runtime_distinct_exclusions)
 from atomic_skillgraph.tools.admission_adapter import AdmissionEngine
 
 
@@ -158,6 +164,397 @@ def test_budget_scope_is_persisted_in_runtime_ir():
     assert runtime.nodes[0].budget_scope == "gap"
 
 
+def test_validated_distinct_instance_is_excluded_only_across_branches():
+    group = "target_000:object.at_location:object"
+    ref = SkillRef("generic.acquire", "1.0.0")
+    nodes = [
+        PlannedNode(ref=ref, step_id="a0", branch_id="branch_000",
+                    distinct_bindings={"object": [group]}),
+        PlannedNode(ref=ref, step_id="p0", branch_id="branch_000",
+                    distinct_bindings={"object": [group]}),
+        PlannedNode(ref=ref, step_id="a1", branch_id="branch_001",
+                    params={"object": "remotecontrol"},
+                    distinct_bindings={"object": [group]}),
+    ]
+    runtime = RuntimeGraph("two", RuntimePlan(nodes=nodes))
+    runtime.nodes[0].passed = True
+    runtime.nodes[0].params = {"object": "remotecontrol_4"}
+    runtime.nodes[0].outputs = {"object": "remotecontrol_4"}
+
+    # Acquire -> Place in one branch must keep sharing the same instance.
+    assert runtime.distinct_exclusions(1) == {}
+    # The next branch receives only validated claims from other branches.
+    assert runtime.distinct_exclusions(2) == {
+        "object": {"remotecontrol_4"}}
+
+    acquire = AbstractAtomicSkill(
+        ref=ref, summary="acquire an object",
+        inputs=[{"name": "object"}, {"name": "object_location"}],
+        effects=[{"predicate": "agent.holds",
+                  "args": {"object": "$inputs.object"}}],
+        status=SkillStatus.ACTIVE,
+    )
+    grounded = _bind_known_location_slots(
+        {"object": "remotecontrol"}, acquire,
+        {"facts": ["object_at(remotecontrol_4, armchair_1)"]},
+        runtime.distinct_exclusions(2))
+    assert grounded == {"object": "remotecontrol"}
+    assert _reused_distinct_bindings(
+        {"object": "remotecontrol"}, runtime.distinct_exclusions(2)) == {
+            "object": "remotecontrol"}
+
+
+def test_distinct_branch_identity_is_scoped_per_group():
+    first = "target_000:object.at_location:object"
+    second = "target_001:object.inspected:object"
+    ref = SkillRef("generic.inspect", "1.0.0")
+    shared = {"object": [first, second]}
+    plan = RuntimePlan(nodes=[
+        PlannedNode(
+            ref=ref, step_id="n0", branch_id="legacy_shared",
+            distinct_bindings=shared,
+            distinct_branch_ids={first: "occ_000", second: "occ_000"}),
+        PlannedNode(
+            ref=ref, step_id="n1", branch_id="legacy_shared",
+            distinct_bindings=shared,
+            # Still the first placement occurrence, but already the second
+            # inspection occurrence. A scalar branch_id cannot express this.
+            distinct_branch_ids={first: "occ_000", second: "occ_001"}),
+    ])
+    runtime = RuntimeGraph("overlap", plan)
+    runtime.nodes[0].passed = True
+    runtime.nodes[0].params = {"object": "mug_1"}
+    runtime.nodes[0].outputs = {"object": "mug_1"}
+
+    assert runtime.distinct_exclusions(1) == {"object": {"mug_1"}}
+    assert plan.to_dict()["nodes"][1]["distinct_branch_ids"] == {
+        first: "occ_000", second: "occ_001"}
+    assert runtime.nodes[1].to_dict()["distinct_branch_ids"] == {
+        first: "occ_000", second: "occ_001"}
+
+
+def test_distinct_exclusion_materializes_validated_state_witness():
+    group = "target_000:object.at_location:object"
+    ref = SkillRef("generic.place", "1.0.0")
+    plan = RuntimePlan(nodes=[
+        PlannedNode(
+            ref=ref, step_id="a0",
+            target_effects=[{
+                "predicate": "object.at_location",
+                # Deliberately reverse JSON field order. Facts always use the
+                # predicate schema order: object, location.
+                "args": {"location": "$inputs.target_location",
+                         "object": "$inputs.object"},
+            }],
+            distinct_bindings={"object": [group]},
+            distinct_branch_ids={group: "occ_000"}),
+        PlannedNode(
+            ref=ref, step_id="a1",
+            distinct_bindings={"object": [group]},
+            distinct_branch_ids={group: "occ_001"}),
+    ])
+    runtime = RuntimeGraph("materialized", plan)
+    runtime.nodes[0].passed = True
+    # The executor initially claimed only the class. The validated post-state
+    # supplies the concrete instance that must be reserved.
+    runtime.nodes[0].params = {
+        "object": "mug", "target_location": "cabinet"}
+    runtime.nodes[0].outputs = {"object": "mug"}
+    runtime.nodes[0].after = {
+        "facts": ["object_at(mug_1, cabinet_1)"]}
+
+    assert runtime.distinct_exclusions(1) == {"object": {"mug_1"}}
+
+
+def test_initial_distinct_witness_uses_schema_order_not_dict_order():
+    group = "target_000:object.at_location:object"
+    target = [{
+        "predicate": "object.at_location",
+        "args": {"location": "$target_location",
+                 "object": "$object_type"},
+        "cardinality": 2,
+        "distinct_by": "object",
+    }]
+    task = Task(
+        task_id="reverse_args", benchmark="generic_env",
+        context={"params": {
+            "object_type": "mug", "target_location": "cabinet"}},
+        state={"facts": ["object_at(mug_1, cabinet_1)"]},
+        target_effects=target,
+    )
+    planned = PlannedNode(
+        ref=SkillRef("generic.place", "1.0.0"), step_id="p1",
+        params={"object": "mug", "target_location": "cabinet"},
+        distinct_bindings={"object": [group]},
+        distinct_branch_ids={group: "occ_001"})
+    runtime = RuntimeGraph(task.task_id, RuntimePlan(nodes=[planned]))
+
+    assert _runtime_distinct_exclusions(
+        task, planned, runtime, 0, task.state) == {
+            "object": {"mug_1"}}
+
+
+def test_relation_alias_witnesses_use_schema_order_and_object_at_fact():
+    for predicate, location_arg in (
+            ("object.in.container", "container"),
+            ("object.in.receptacle", "receptacle")):
+        group = f"target_000:object.at_location:object"
+        target = [{
+            "predicate": predicate,
+            "args": {location_arg: "$target_location",
+                     "object": "$object_type"},
+            "cardinality": 2,
+            "distinct_by": "object",
+        }]
+        task = Task(
+            task_id=predicate, benchmark="generic_env",
+            context={"params": {
+                "object_type": "mug", "target_location": "cabinet"}},
+            state={"facts": ["object_at(mug_1, cabinet_1)"]},
+            target_effects=target,
+        )
+        planned = PlannedNode(
+            ref=SkillRef("generic.place", "1.0.0"), step_id="p1",
+            params={"object": "mug", "target_location": "cabinet"},
+            distinct_bindings={"object": [group]},
+            distinct_branch_ids={group: "occ_001"})
+        runtime = RuntimeGraph(task.task_id, RuntimePlan(nodes=[planned]))
+
+        single_alias_effect = [{
+            **target[0], "cardinality": 1, "distinct_by": ""}]
+        passed, missing = check_effects(
+            StateSnapshot(task.state), task.context["params"],
+            single_alias_effect)
+        assert passed is True
+        assert missing == []
+        assert _runtime_distinct_exclusions(
+            task, planned, runtime, 0, task.state) == {
+                "object": {"mug_1"}}
+
+
+def _cardinality_allocation_case(cardinality, witnesses):
+    group = "target_000:object.at_location:object"
+    target = [{
+        "predicate": "object.at_location",
+        "args": {"object": "$object", "location": "$target_location"},
+        "cardinality": cardinality,
+        "distinct_by": "object",
+    }]
+    task = Task(
+        task_id=f"allocation_{cardinality}_{len(witnesses)}",
+        benchmark="generic_env",
+        context={"params": {"object": "widget",
+                            "target_location": "bay"}},
+        state={"facts": [f"object_at({item}, bay_1)" for item in witnesses]},
+        target_effects=target,
+    )
+    nodes = [PlannedNode(
+        ref=SkillRef("generic.place", "1.0.0"), step_id=f"p{index}",
+        params={"object": "widget", "target_location": "bay"},
+        target_effects=[{
+            "predicate": "object.at_location",
+            "args": {"object": "$inputs.object",
+                     "location": "$inputs.target_location"},
+        }],
+        distinct_bindings={"object": [group]},
+        distinct_branch_ids={group: f"occ_{index:03d}"})
+        for index in range(cardinality)]
+    runtime = RuntimeGraph(task.task_id, RuntimePlan(nodes=nodes))
+    return task, runtime
+
+
+def test_initial_k_of_n_witnesses_allocate_before_searching_remaining():
+    task, runtime = _cardinality_allocation_case(2, ["widget_1"])
+    first, first_groups = _runtime_distinct_allocations(
+        task, runtime.plan.nodes[0], runtime, 0, task.state)
+    second, second_groups = _runtime_distinct_allocations(
+        task, runtime.plan.nodes[1], runtime, 1, task.state)
+
+    assert first == {"object": "widget_1"}
+    assert _cardinality_allocation_covers_node(
+        runtime.plan.nodes[0], first, first_groups)
+    assert second == {}
+    assert second_groups == {}
+    assert _runtime_distinct_exclusions(
+        task, runtime.plan.nodes[0], runtime, 0, task.state,
+        first, first_groups) == {}
+    assert _runtime_distinct_exclusions(
+        task, runtime.plan.nodes[1], runtime, 1, task.state,
+        second, second_groups) == {"object": {"widget_1"}}
+
+
+def test_initial_n_of_n_witnesses_allocate_every_occurrence():
+    task, runtime = _cardinality_allocation_case(
+        2, ["widget_2", "widget_1"])
+    allocations = [
+        _runtime_distinct_allocations(
+            task, node, runtime, index, task.state)[0]
+        for index, node in enumerate(runtime.plan.nodes)
+    ]
+    assert allocations == [
+        {"object": "widget_1"}, {"object": "widget_2"}]
+
+
+def test_multiple_initial_witnesses_allocate_stably_before_new_branch():
+    task, runtime = _cardinality_allocation_case(
+        3, ["widget_2", "widget_1"])
+    allocations = [
+        _runtime_distinct_allocations(
+            task, node, runtime, index, task.state)[0]
+        for index, node in enumerate(runtime.plan.nodes)
+    ]
+    assert allocations == [
+        {"object": "widget_1"}, {"object": "widget_2"}, {}]
+
+
+def test_same_role_multiple_groups_requires_every_group_allocation():
+    place_group = "target_000:object.at_location:object"
+    clean_group = "target_001:object.cleaned:object"
+    targets = [{
+        "predicate": "object.at_location",
+        "args": {"object": "$object", "location": "$target_location"},
+        "cardinality": 2, "distinct_by": "object",
+    }, {
+        "predicate": "object.cleaned",
+        "args": {"object": "$object"},
+        "cardinality": 2, "distinct_by": "object",
+    }]
+    task = Task(
+        task_id="two_groups", benchmark="generic_env",
+        context={"params": {"object": "mug",
+                            "target_location": "counter"}},
+        state={"facts": ["object_at(mug_1, counter_1)"]},
+        target_effects=targets,
+    )
+    planned = PlannedNode(
+        ref=SkillRef("generic.clean", "1.0.0"), step_id="c0",
+        params={"object": "mug"},
+        distinct_bindings={"object": [place_group, clean_group]},
+        distinct_branch_ids={place_group: "occ_000",
+                             clean_group: "occ_000"})
+    runtime = RuntimeGraph(task.task_id, RuntimePlan(nodes=[planned]))
+
+    bindings, groups = _runtime_distinct_allocations(
+        task, planned, runtime, 0, task.state)
+    assert set(groups) == {place_group}
+    assert bindings == {}
+    assert not _cardinality_allocation_covers_node(
+        planned, bindings, groups)
+
+
+def test_ambiguous_class_claim_is_not_erased_by_other_group_concrete():
+    ambiguous = "target_000:object.inspected:object"
+    concrete = "target_001:object.at_location:object"
+    ref = SkillRef("generic.batch", "1.0.0")
+    nodes = [
+        PlannedNode(
+            ref=ref, step_id="a0",
+            distinct_bindings={"object": [ambiguous]},
+            distinct_branch_ids={ambiguous: "occ_000"}),
+        PlannedNode(
+            ref=ref, step_id="b0",
+            target_effects=[{
+                "predicate": "object.at_location",
+                "args": {"object": "$inputs.object",
+                         "location": "$inputs.target_location"},
+            }],
+            distinct_bindings={"object": [concrete]},
+            distinct_branch_ids={concrete: "occ_000"}),
+        PlannedNode(
+            ref=ref, step_id="current",
+            distinct_bindings={"object": [ambiguous, concrete]},
+            distinct_branch_ids={ambiguous: "occ_001",
+                                 concrete: "occ_001"}),
+    ]
+    runtime = RuntimeGraph("ambiguous", RuntimePlan(nodes=nodes))
+    runtime.nodes[0].passed = True
+    runtime.nodes[0].params = {"object": "widget"}
+    runtime.nodes[1].passed = True
+    runtime.nodes[1].params = {
+        "object": "widget", "target_location": "bay"}
+    runtime.nodes[1].after = {
+        "facts": ["object_at(widget_1, bay_1)"]}
+
+    assert runtime.distinct_exclusions(2) == {
+        "object": {"widget", "widget_1"}}
+
+
+def test_distinct_class_and_instance_claims_conflict_symmetrically():
+    assert distinct_values_conflict("mug", "mug_1") is True
+    assert distinct_values_conflict("mug_1", "mug") is True
+    assert distinct_values_conflict("mug_1", "mug_2") is False
+    assert _reused_distinct_bindings(
+        {"object": "mug_1"}, {"object": {"mug"}}) == {
+            "object": "mug_1"}
+    assert _reused_distinct_bindings(
+        {"object": "mug"}, {"object": {"mug_1"}}) == {
+            "object": "mug"}
+
+
+def test_inventory_refinement_respects_distinct_exclusions():
+    state = {"inventory": ["mug_1", "mug_2"]}
+
+    assert _refine_env_object_binding(
+        {"object": "mug"}, state,
+        {"object": {"mug_1"}}) == {"object": "mug_2"}
+    # A class-valued validated claim is fail-closed: it may denote either
+    # instance, so refinement cannot silently select one of them.
+    assert _refine_env_object_binding(
+        {"object": "mug"}, state,
+        {"object": {"mug"}}) == {"object": "mug"}
+
+
+def test_non_placement_cardinality_uses_initial_state_witness():
+    group = "target_000:object.toggled:object"
+    target = [{
+        "predicate": "object.toggled",
+        "args": {"object": "$object_type"},
+        "cardinality": 2,
+        "distinct_by": "object",
+    }]
+    task = Task(
+        task_id="toggle_two", benchmark="generic_env",
+        goal="toggle two lamps",
+        context={"params": {"object_type": "desklamp"}},
+        state={"facts": ["object_toggled(desklamp_1)"]},
+        target_effects=target,
+    )
+    planned = PlannedNode(
+        ref=SkillRef("generic.toggle", "1.0.0"), step_id="t1",
+        params={"object": "desklamp"},
+        distinct_bindings={"object": [group]},
+        distinct_branch_ids={group: "occ_001"})
+    runtime = RuntimeGraph(task.task_id, RuntimePlan(nodes=[planned]))
+
+    assert _runtime_distinct_exclusions(
+        task, planned, runtime, 0, task.state) == {
+            "object": {"desklamp_1"}}
+
+
+def test_alfworld_stop_and_action_grounding_respect_toggle_exclusion():
+    effect = [{
+        "predicate": "object.toggled",
+        "args": {"object": "$inputs.object"},
+    }]
+    inputs = {"object": "desklamp"}
+    excluded = {"object": {"desklamp_1"}}
+
+    # Existing lamp_1 cannot existentially complete occurrence two at zero
+    # actions. A newly toggled lamp_2 can.
+    assert _effects_met(
+        {"facts": ["object_toggled(desklamp_1)"]},
+        effect, inputs, excluded) is False
+    assert _effects_met(
+        {"facts": ["object_toggled(desklamp_1)",
+                   "object_toggled(desklamp_2)"]},
+        effect, inputs, excluded) is True
+    assert _ground_effect_inputs_from_action(
+        inputs, {"object": "desklamp_1"}, excluded) == inputs
+    assert _ground_effect_inputs_from_action(
+        inputs, {"object": "desklamp_2"}, excluded) == {
+            "object": "desklamp_2"}
+
+
 def test_shared_effect_role_is_grounded_to_one_executed_instance():
     effects = [
         {"predicate": "object.heated", "args": {"object": "$object"}},
@@ -175,6 +572,26 @@ def test_shared_effect_role_is_grounded_to_one_executed_instance():
     assert grounded["object"] == "egg_1"
     assert grounded["target_location"] == "diningtable_1"
     assert _effects_met(state, effects, grounded) is False
+
+
+def test_action_grounding_keeps_entity_and_source_location_relational():
+    params = {"object": "newspaper",
+              "object_location": "$flow.object_location"}
+
+    wrong = _ground_effect_inputs_from_action(params, {
+        "object": "keychain 1", "object_location": "sofa 1"})
+    assert wrong == params
+
+    matching = _ground_effect_inputs_from_action(params, {
+        "object": "newspaper 2", "object_location": "drawer 7"})
+    assert matching == {
+        "object": "newspaper_2", "object_location": "drawer_7"}
+
+    aliased = _ground_effect_inputs_from_action(
+        {"object": "newspaper", "source_location": "$flow.source_location"},
+        {"object": "keychain 1", "source_location": "sofa 1"})
+    assert aliased == {
+        "object": "newspaper", "source_location": "$flow.source_location"}
 
 
 class _AcquireDirectAdapter:

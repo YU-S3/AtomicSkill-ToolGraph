@@ -143,6 +143,16 @@ def test_cardinality_branches_have_no_cross_branch_data_flow(workspace_tmp):
                       if edge.type == EdgeType.REQUIRES_SKILL]
     assert requires_pairs == [("step_000", "step_001"),
                               ("step_002", "step_003")]
+    distinct_groups = {
+        group
+        for node in plan.nodes
+        for group in node.distinct_bindings.get("object", [])
+    }
+    assert len(distinct_groups) == 1
+    assert all(node.distinct_bindings.get("object")
+               for node in plan.nodes)
+    assert plan.to_dict()["nodes"][2]["distinct_bindings"] == {
+        "object": list(distinct_groups)}
 
 
 def test_no_capability_or_incomplete_target_uses_one_task_dynamic_node(

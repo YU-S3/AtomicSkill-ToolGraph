@@ -15,6 +15,7 @@ from ..core.binding_ir import (
     is_concrete_binding,
     source_name_for_kind,
 )
+from ..core.semantic_roles import unsafe_composite_task_role_binding
 from ..core.status import EdgeType
 from .output_materializer import (
     get_output_declaration,
@@ -229,6 +230,11 @@ def validate_composite_binding_closure(composite: Any, registry: Any
                           for name, requirement in requirements.items()},
         )
         params = dict(step.get("params") or {})
+        for slot_role, binding in params.items():
+            if unsafe_composite_task_role_binding(str(slot_role), binding):
+                errors.append(
+                    "unsafe_composite_task_role_binding:"
+                    f"step={step_id}:slot={slot_role}:binding={binding}")
         specs = {name: incoming.get(
             (step_id, name), BindingSpec.from_value(params.get(name)))
                  for name in requirements}

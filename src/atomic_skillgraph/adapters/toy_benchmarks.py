@@ -13,7 +13,10 @@ import re
 from typing import Any
 
 from ..core.llm import LLM
-from ..core.predicates import StateSnapshot, _fact_to_predicate, check_effects
+from ..core.binding_ir import binding_slot_name
+from ..core.predicates import (
+    StateSnapshot, _fact_to_predicate, check_effects,
+    distinct_claims_conflict, matching_effect_witnesses)
 from ..tools.sandbox import Sandbox
 from .benchmark import (
     BenchmarkAdapter,
@@ -521,6 +524,7 @@ class ToyAdapter:
                         resume: dict[str, Any] | None = None,
                         stop_effects: list[dict[str, Any]] | None = None,
                         effect_inputs: dict[str, Any] | None = None,
+                        excluded_effect_bindings: dict[str, set[Any]] | None = None,
                         node_ref: str = "",
                         phase_goal: str = "") -> EnvRunResult:
         result = EnvRunResult()
@@ -534,7 +538,9 @@ class ToyAdapter:
             result.states.append({"step": 0, "state": world.state()})
         result.current_observation = world.observation()
         result.current_admissible = world.admissible()
-        if _toy_effects_met(world.state(), stop_effects, effect_inputs):
+        if _toy_effects_met(
+                world.state(), stop_effects, effect_inputs,
+                excluded_effect_bindings):
             result.atomic_complete = True
             result.final_observation = world.observation()
             result.steps = len(result.actions)
@@ -560,7 +566,9 @@ class ToyAdapter:
                     result.states.append({"step": world.steps, "state": world.state()})
                     result.current_observation = world.observation()
                     result.current_admissible = world.admissible()
-                    if _toy_effects_met(world.state(), stop_effects, effect_inputs):
+                    if _toy_effects_met(
+                            world.state(), stop_effects, effect_inputs,
+                            excluded_effect_bindings):
                         result.atomic_complete = True
                         result.steps = len(result.actions)
                         result.final_observation = env_result.observation
@@ -610,7 +618,9 @@ class ToyAdapter:
             result.states.append({"step": world.steps, "state": world.state()})
             result.current_observation = world.observation()
             result.current_admissible = world.admissible()
-            if _toy_effects_met(world.state(), stop_effects, effect_inputs):
+            if _toy_effects_met(
+                    world.state(), stop_effects, effect_inputs,
+                    excluded_effect_bindings):
                 result.atomic_complete = True
                 result.steps = len(result.actions)
                 result.final_observation = env_result.observation
@@ -634,13 +644,34 @@ class ToyAdapter:
         return result
 
 
-def _toy_effects_met(state: dict[str, Any], effects: list[dict[str, Any]] | None,
-                     inputs: dict[str, Any] | None) -> bool:
+def _toy_effects_met(
+        state: dict[str, Any], effects: list[dict[str, Any]] | None,
+        inputs: dict[str, Any] | None,
+        excluded_bindings: dict[str, set[Any]] | None = None) -> bool:
     if not effects:
         return False
     passed, _missing = check_effects(StateSnapshot(state), inputs or {}, effects,
                                      {"harness": "env"})
-    return passed
+    if not passed:
+        return False
+    exclusions = dict(excluded_bindings or {})
+    for effect in effects or []:
+        if not isinstance(effect, dict):
+            continue
+        for arg, raw_binding in dict(effect.get("args") or {}).items():
+            role = binding_slot_name(raw_binding) or str(arg)
+            excluded = set(exclusions.get(role) or set())
+            if not excluded:
+                continue
+            witnesses = matching_effect_witnesses(
+                state, effect, inputs or {}, distinct_arg=str(arg),
+                context=inputs or {})
+            if not any(
+                    not any(distinct_claims_conflict(witness, claimed)
+                            for claimed in excluded)
+                    for witness in witnesses):
+                return False
+    return True
 
 
 def _extract_code(text: str) -> str:

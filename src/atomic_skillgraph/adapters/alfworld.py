@@ -12,7 +12,10 @@ import re
 from typing import Any
 
 from ..core.llm import LLM
-from ..core.predicates import StateSnapshot, check_effects
+from ..core.binding_ir import binding_slot_name
+from ..core.predicates import (
+    StateSnapshot, check_effects, distinct_claims_conflict,
+    matching_effect_witnesses)
 from .benchmark import (
     BenchmarkAdapter,
     EnvRunResult,
@@ -301,7 +304,7 @@ class AlfWorldAdapter:
             result.current_observation = obs
             result.current_admissible = list(admissible)
             result.final_observation = obs
-            if not binding:
+            if not binding and not result.failure_type:
                 result.failure_type = "object_location_not_found"
             return binding, result
 
@@ -523,6 +526,7 @@ class AlfWorldAdapter:
                         resume: dict[str, Any] | None = None,
                         stop_effects: list[dict[str, Any]] | None = None,
                         effect_inputs: dict[str, Any] | None = None,
+                        excluded_effect_bindings: dict[str, set[Any]] | None = None,
                         node_ref: str = "",
                         phase_goal: str = "") -> EnvRunResult:
         result = EnvRunResult()
@@ -543,7 +547,7 @@ class AlfWorldAdapter:
         result.current_observation = obs
         result.current_admissible = list(admissible)
         if _effects_met(tracker.state(), stop_effects,
-                        realized_effect_inputs):
+                        realized_effect_inputs, excluded_effect_bindings):
             result.atomic_complete = True
             result.final_observation = obs
             return result
@@ -595,7 +599,8 @@ class AlfWorldAdapter:
                                    accepted=accepted)
                     if accepted:
                         realized_effect_inputs = _ground_effect_inputs_from_action(
-                            realized_effect_inputs, params)
+                            realized_effect_inputs, params,
+                            excluded_effect_bindings)
                     result.states.append({"step": len(result.actions),
                                           "state": tracker.state()})
                     # The action that establishes the final atomic Effect may
@@ -610,7 +615,8 @@ class AlfWorldAdapter:
                             action_index=len(result.actions) - 1)
                         result.atomic_complete = _effects_met(
                             tracker.state(), stop_effects,
-                            realized_effect_inputs)
+                            realized_effect_inputs,
+                            excluded_effect_bindings)
                         result.steps = len(result.actions)
                         result.final_observation = env_result.observation
                         result.node_spans.append({
@@ -622,7 +628,8 @@ class AlfWorldAdapter:
                         })
                         return result
                     if _effects_met(tracker.state(), stop_effects,
-                                    realized_effect_inputs):
+                                    realized_effect_inputs,
+                                    excluded_effect_bindings):
                         result.atomic_complete = True
                         result.steps = len(result.actions)
                         result.final_observation = obs
@@ -769,7 +776,8 @@ class AlfWorldAdapter:
                            accepted=accepted)
             if accepted:
                 realized_effect_inputs = _ground_effect_inputs_from_action(
-                    realized_effect_inputs, action_params)
+                    realized_effect_inputs, action_params,
+                    excluded_effect_bindings)
             _record_location_inspection(
                 tracker, action, env_result.observation, accepted=accepted)
             state_after_action = tracker.state()
@@ -798,12 +806,14 @@ class AlfWorldAdapter:
                     realized_effect_inputs,
                     action_index=len(result.actions) - 1)
                 result.atomic_complete = _effects_met(
-                    tracker.state(), stop_effects, realized_effect_inputs)
+                    tracker.state(), stop_effects, realized_effect_inputs,
+                    excluded_effect_bindings)
                 result.steps = len(result.actions)
                 result.final_observation = obs
                 return result
             if _effects_met(tracker.state(), stop_effects,
-                            realized_effect_inputs):
+                            realized_effect_inputs,
+                            excluded_effect_bindings):
                 result.atomic_complete = True
                 result.steps = len(result.actions)
                 result.final_observation = obs
@@ -870,17 +880,39 @@ class AlfWorldAdapter:
         return result
 
 
-def _effects_met(state: dict[str, Any], effects: list[dict[str, Any]] | None,
-                 inputs: dict[str, Any] | None) -> bool:
+def _effects_met(
+        state: dict[str, Any], effects: list[dict[str, Any]] | None,
+        inputs: dict[str, Any] | None,
+        excluded_bindings: dict[str, set[Any]] | None = None) -> bool:
     if not effects:
         return False
     passed, _missing = check_effects(StateSnapshot(state), inputs or {}, effects,
                                      {"harness": "env"})
-    return passed
+    if not passed:
+        return False
+    exclusions = dict(excluded_bindings or {})
+    for effect in effects or []:
+        if not isinstance(effect, dict):
+            continue
+        for arg, raw_binding in dict(effect.get("args") or {}).items():
+            role = binding_slot_name(raw_binding) or str(arg)
+            excluded = set(exclusions.get(role) or set())
+            if not excluded:
+                continue
+            witnesses = matching_effect_witnesses(
+                state, effect, inputs or {}, distinct_arg=str(arg),
+                context=inputs or {})
+            if not any(
+                    not any(distinct_claims_conflict(witness, claimed)
+                            for claimed in excluded)
+                    for witness in witnesses):
+                return False
+    return True
 
 
 def _ground_effect_inputs_from_action(inputs: dict[str, Any],
-                                      action_params: dict[str, Any]
+                                      action_params: dict[str, Any],
+                                      excluded_bindings: dict[str, set[Any]] | None = None
                                       ) -> dict[str, Any]:
     """Bind a shared class-valued Effect role to the executed instance.
 
@@ -891,9 +923,17 @@ def _ground_effect_inputs_from_action(inputs: dict[str, Any],
     concrete task roles, especially destinations, are never overwritten.
     """
     grounded = dict(inputs or {})
-    for role, observed in dict(action_params or {}).items():
+    observed_params = dict(action_params or {})
+    for role, observed in observed_params.items():
         observed_norm = _norm(observed)
         if not observed_norm:
+            continue
+        if any(distinct_claims_conflict(observed_norm, claimed)
+               for claimed in (excluded_bindings or {}).get(str(role), set())):
+            continue
+        if (str(role).endswith("_location")
+                and not _action_location_binding_matches_entity(
+                    grounded, observed_params, str(role))):
             continue
         current = grounded.get(role)
         current_norm = _norm(current) if current not in (None, "") else ""
@@ -906,6 +946,43 @@ def _ground_effect_inputs_from_action(inputs: dict[str, Any],
                 and _same_object_family(current_norm, observed_norm)):
             grounded[role] = observed_norm
     return grounded
+
+
+def _action_location_binding_matches_entity(
+        inputs: dict[str, Any], action_params: dict[str, Any],
+        location_role: str) -> bool:
+    """Reject a location observed for an incompatible entity in one action."""
+    grounded = dict(inputs or {})
+    observed = dict(action_params or {})
+    prefix_role = str(location_role)[:-len("_location")]
+    if prefix_role in grounded:
+        candidate = observed.get(prefix_role)
+        if candidate in (None, ""):
+            return False
+        return _action_binding_compatible(
+            grounded.get(prefix_role), candidate)
+
+    # ``source_location`` and other learned aliases need not share a lexical
+    # prefix with their entity role.  Any concrete shared entity disagreement
+    # proves that this action's location belongs to a different occurrence.
+    shared_roles = [
+        role for role in observed
+        if role in grounded and not str(role).endswith("_location")
+    ]
+    return all(_action_binding_compatible(
+        grounded.get(role), observed.get(role)) for role in shared_roles)
+
+
+def _action_binding_compatible(current: Any, observed: Any) -> bool:
+    current_norm = _norm(current)
+    observed_norm = _norm(observed)
+    if not current_norm or current_norm.startswith("$"):
+        return True
+    if current_norm == observed_norm:
+        return True
+    if re.search(r"_\d+$", current_norm):
+        return False
+    return _same_object_family(current_norm, observed_norm)
 
 
 # ---------------------------------------------------------------------------

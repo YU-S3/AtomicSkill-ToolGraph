@@ -16,6 +16,11 @@ from atomic_skillgraph.atomicizer.trace_atomicizer import TraceAtomicizer
 from atomic_skillgraph.core.config import SystemConfig
 from atomic_skillgraph.core.llm import LLMUsage
 from atomic_skillgraph.core.refs import SkillRef
+from atomic_skillgraph.core.semantic_roles import (
+    ENTITY,
+    semantic_role_family,
+    unsafe_composite_task_role_binding,
+)
 from atomic_skillgraph.core.skill_ir import AbstractAtomicSkill
 from atomic_skillgraph.core.status import SkillStatus
 from atomic_skillgraph.core.trace_ir import ActionRecord, TraceRecord
@@ -1082,6 +1087,83 @@ def test_composite_does_not_bind_unknown_source_to_same_family_target(workspace_
     assert acquire_params["object_location"] == "$flow.object_location"
 
 
+def test_composite_keeps_equal_source_target_and_station_roles_distinct(
+        workspace_tmp):
+    """Grounded equality cannot collapse workflow participant roles."""
+
+    registry = SkillGraphRegistry(workspace_tmp / "equal_location_roles")
+    acquire = _atomic(
+        "env.acquire", [],
+        [{"predicate": "agent.holds",
+          "args": {"object": "$inputs.object"}}],
+        [{"name": "object"}, {"name": "object_location"}],
+        [{"name": "object"}])
+    clean = _atomic(
+        "env.clean",
+        [{"predicate": "agent.holds",
+          "args": {"object": "$inputs.object"}}],
+        [{"predicate": "object.cleaned",
+          "args": {"object": "$inputs.object"}}],
+        [{"name": "object"}, {"name": "cleaning_station"}],
+        [{"name": "object"}])
+    place = _atomic(
+        "env.place",
+        [{"predicate": "agent.holds",
+          "args": {"object": "$inputs.object"}}],
+        [{"predicate": "object.at_location", "args": {
+            "object": "$inputs.object",
+            "location": "$inputs.target_location",
+        }}],
+        [{"name": "object"}, {"name": "target_location"}],
+        [{"name": "object"}])
+    for atomic in (acquire, clean, place):
+        registry.register(atomic)
+
+    trace = TraceRecord(
+        trace_id="same_source_and_destination",
+        task_id="same_source_and_destination",
+        task_type="clean_place", benchmark="env", success=True,
+        provenance={
+            "params": {"object": "mug",
+                       "target_location": "coffeemachine_1"},
+            "semantic_params": {"object": "mug",
+                                "target_location": "coffeemachine"},
+            "target_effects": [{
+                "predicate": "object.at_location", "args": {
+                    "object": "$object",
+                    "location": "$target_location",
+                },
+            }],
+        },
+    )
+    segments = [
+        {"phase_id": "acquire", "params": {
+            "object": "mug_1", "object_location": "coffeemachine_1"}},
+        {"phase_id": "clean", "params": {
+            "object": "mug_1", "cleaning_station": "coffeemachine_1"}},
+        {"phase_id": "place", "params": {
+            "object": "mug_1", "target_location": "coffeemachine_1"}},
+    ]
+
+    built = CompositeBuilder(
+        registry, SystemConfig(data_dir=workspace_tmp)).build_or_align(
+            [acquire.ref, clean.ref, place.ref], trace, segments=segments)
+
+    params = [step["params"] for step in built.composite.step_instances()]
+    assert params[0] == {
+        "object": "$task.object",
+        "object_location": "$flow.object_location",
+    }
+    assert params[1] == {
+        "object": "$task.object",
+        "cleaning_station": "$flow.cleaning_station",
+    }
+    assert params[2] == {
+        "object": "$task.object",
+        "target_location": "$task.target_location",
+    }
+
+
 def test_composite_role_mapping_uses_semantic_task_params():
     trace = _trace("semantic_role")
     trace.provenance["params"]["target_location"] = "cabinet_1"
@@ -1100,6 +1182,21 @@ def test_composite_role_mapping_uses_semantic_task_params():
         "container": "$task.target_location"}
     # target 的 semantic family 不能被借给 source role。
     assert _role_params({"object_location": "cabinet_5"}, trace) == {}
+    # 同值也不能把 transformation/station role 猜成最终目标。
+    assert _role_params({"cleaning_station": "cabinet_5"}, trace) == {}
+
+
+def test_entity_name_containing_source_is_not_a_source_location():
+    trace = TraceRecord(
+        trace_id="light_source_role", task_id="light_source_role",
+        provenance={"params": {"associated_entity": "desklamp_1"}},
+    )
+
+    assert semantic_role_family("light_source") == ENTITY
+    assert not unsafe_composite_task_role_binding(
+        "light_source", "$task.associated_entity")
+    assert _role_params({"light_source": "desklamp_1"}, trace) == {
+        "light_source": "$task.associated_entity"}
 
 
 def test_skill_registry_rejects_immutable_composite_overwrite(workspace_tmp):

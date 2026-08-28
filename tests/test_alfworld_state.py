@@ -146,6 +146,32 @@ def test_pick_two_cardinality_requires_distinct_grounded_objects():
     assert check_effects(two, inputs, effect)[0] is True
 
 
+def test_cardinality_counts_distinct_by_role_not_complete_fact_tuples():
+    effect = [{
+        "predicate": "object.observed_with",
+        # Reverse insertion order to ensure the predicate schema, rather than
+        # JSON object ordering, locates the distinct object argument.
+        "args": {
+            "associated_entity": "$associated_entity",
+            "object": "$object",
+        },
+        "cardinality": 2,
+        "distinct_by": "object",
+    }]
+    inputs = {"object": "mug", "associated_entity": "desklamp"}
+    repeated_object = StateSnapshot({"facts": [
+        "object_observed_with(mug_1, desklamp_1)",
+        "object_observed_with(mug_1, desklamp_2)",
+    ]})
+    distinct_objects = StateSnapshot({"facts": [
+        "object_observed_with(mug_1, desklamp_1)",
+        "object_observed_with(mug_2, desklamp_2)",
+    ]})
+
+    assert check_effects(repeated_object, inputs, effect)[0] is False
+    assert check_effects(distinct_objects, inputs, effect)[0] is True
+
+
 def test_pick_two_excludes_instances_already_placed_at_target():
     task = Task(
         task_id="two", benchmark="generic_env", task_type="arbitrary_batch_delivery",
@@ -595,6 +621,31 @@ def test_non_acquire_navigable_entity_binds_without_consuming_tool_step():
     assert result.actions == []
     assert result.states == []
     assert result.current_admissible == ["go to fixture 3"]
+
+
+def test_discovery_preserves_its_budget_exhaustion_reason():
+    class _NoStepEnv:
+        def step(self, action):
+            raise AssertionError(
+                f"zero action deadline must stop before env.step: {action}")
+
+    adapter = AlfWorldAdapter()
+    adapter._current_env = _NoStepEnv()
+    task = Task(task_id="discovery_budget", benchmark="alfworld",
+                task_type="hidden_label", goal="find a newspaper", context={})
+    resume = {
+        "observation": "room", "admissible": ["go to shelf 1"],
+        "actions": [], "states": [],
+        "state": {"facts": [], "inventory": [], "meta": {}},
+    }
+
+    binding, result = adapter.discover_object_location(
+        task, "newspaper", resume=resume, max_locations=2,
+        action_deadline=0)
+
+    assert binding == {}
+    assert result.failure_type == "discovery_budget_exhausted"
+    assert result.actions == []
 
 
 def test_llm_errors_do_not_advance_environment_and_are_persisted():

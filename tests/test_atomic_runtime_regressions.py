@@ -18,6 +18,7 @@ from atomic_skillgraph.runtime.runtime_graph import (
 )
 from atomic_skillgraph.system import (
     AtomicSkillGraphSystem,
+    _bind_known_location_slots,
     _ground_env_runtime_params,
     _realized_task_bindings,
     _refine_env_object_binding,
@@ -105,6 +106,31 @@ def test_runtime_carries_acquired_instance_to_downstream_nodes():
     assert params["object"] == "mug_1"
 
 
+def test_known_state_binds_generic_source_location_alias():
+    atomic = AbstractAtomicSkill(
+        ref=SkillRef("env.acquire", "1.0.0"), summary="acquire",
+        inputs=[{"name": "object"}, {"name": "source_location"}],
+        preconditions=[{
+            "predicate": "object.at_location",
+            "args": {"object": "$inputs.object",
+                     "location": "$inputs.source_location"},
+        }],
+        effects=[{"predicate": "agent.holds",
+                  "args": {"object": "$inputs.object"}}],
+        status=SkillStatus.ACTIVE,
+    )
+
+    bound = _bind_known_location_slots(
+        {"object": "newspaper",
+         "source_location": "$flow.source_location"},
+        atomic,
+        {"facts": ["object_at(newspaper_2, drawer_7)"], "inventory": []},
+    )
+
+    assert bound == {"object": "newspaper_2",
+                     "source_location": "drawer_7"}
+
+
 def test_atomic_only_runs_controlled_location_discovery(workspace_tmp):
     class _Adapter:
         supports_in_place_resume = True
@@ -156,7 +182,9 @@ def test_atomic_only_runs_controlled_location_discovery(workspace_tmp):
     config = SystemConfig(data_dir=workspace_tmp / "atomic_only")
     config.llm.mock = True
     config.features.enable_tool_evolution = False
-    config.features.enable_framework_discovery = True
+    # Atomic contract resolution is mandatory even when optional framework
+    # discovery is disabled for the experiment condition.
+    config.features.enable_framework_discovery = False
     adapter = _Adapter()
     system = AtomicSkillGraphSystem(config, adapter, MockLLM(script={}))
     acquire = AbstractAtomicSkill(
@@ -188,6 +216,83 @@ def test_atomic_only_runs_controlled_location_discovery(workspace_tmp):
     assert adapter.discovery_calls == 1
     assert runtime.nodes[0].params["object_location"] == "countertop_1"
     assert trace.metrics["controlled_location_discovery"][0]["found"] is True
+    assert trace.metrics["execution_routing"][0][
+        "mandatory_location_slots"] == ["object_location"]
+
+
+def test_failed_mandatory_discovery_does_not_start_seeded_and_owns_node_budget(
+        workspace_tmp):
+    class _Adapter:
+        supports_in_place_resume = True
+
+        def __init__(self):
+            self.agent_calls = 0
+
+        def discover_object_location(self, task, object_name, **kwargs):
+            state = {"facts": [], "inventory": [], "meta": {}}
+            actions = [{
+                "step": index, "name": f"go to drawer {index + 1}",
+                "params": {}, "accepted": True,
+                "origin": "framework_discovery",
+            } for index in range(30)]
+            return {}, EnvRunResult(
+                actions=actions,
+                states=[{"step": 30, "state": state}],
+                failure_type="discovery_budget_exhausted",
+                current_observation="not found",
+                current_admissible=["look"],
+            )
+
+        def run_env_episode(self, task, llm, **kwargs):
+            self.agent_calls += 1
+            raise AssertionError("Seeded/Dynamic must not run without source binding")
+
+    config = SystemConfig(data_dir=workspace_tmp / "discovery_failure")
+    config.llm.mock = True
+    config.max_steps = 100
+    config.features.enable_framework_discovery = False
+    adapter = _Adapter()
+    system = AtomicSkillGraphSystem(config, adapter, MockLLM(script={}))
+    acquire = AbstractAtomicSkill(
+        ref=SkillRef("env.acquire", "1.0.0"), summary="acquire object",
+        inputs=[{"name": "object"}, {"name": "object_location"}],
+        preconditions=[{
+            "predicate": "object.at_location",
+            "args": {"object": "$inputs.object",
+                     "location": "$inputs.object_location"},
+        }],
+        effects=[{"predicate": "agent.holds",
+                  "args": {"object": "$inputs.object"}}],
+        guideline={"rules": ["obtain the requested object"]},
+        status=SkillStatus.ACTIVE,
+    )
+    system.registry.register(acquire)
+    task = Task(
+        task_id="discovery_failure", benchmark="alfworld",
+        goal="obtain a newspaper",
+        context={"params": {"object": "newspaper"}},
+        state={"facts": [], "inventory": [], "meta": {}},
+        target_effects=list(acquire.effects),
+    )
+    plan = RuntimePlan(nodes=[PlannedNode(
+        ref=acquire.ref, step_id="step_000", occurrence_id="occ_000",
+        params={"object": "newspaper",
+                "object_location": "$flow.object_location"},
+        target_effects=list(acquire.effects),
+    )])
+    trace = TraceRecord(task_id=task.task_id, benchmark=task.benchmark)
+    runtime = RuntimeGraph(task.task_id, plan)
+
+    system._run_env_nodes(task, plan, trace, runtime)
+
+    node = runtime.nodes[0]
+    assert adapter.agent_calls == 0
+    assert node.attempt_started is False
+    assert node.executed_action_count == 30
+    assert node.attempts[0]["failure_type"] == "node_budget_exhausted"
+    assert node.attempts[0]["failure_stage"] == "budget"
+    assert node.attempts[0]["action_count"] == 30
+    assert trace.metrics["execution_routing"][0]["candidate_modes"] == []
 
 
 def test_effect_extractor_keeps_only_target_object_preconditions():
@@ -288,6 +393,40 @@ def test_seeded_action_backfills_runtime_slot_before_atomic_validation():
     validation = NodeValidator().validate_atomic(
         atomic, before, after, inputs=grounded)
     assert validation.passed is True
+
+
+def test_wrong_entity_action_cannot_backfill_relational_source_location():
+    from types import SimpleNamespace
+
+    atomic = AbstractAtomicSkill(
+        ref=SkillRef("env.acquire", "1.0.0"), summary="acquire",
+        inputs=[{"name": "object"}, {"name": "object_location"}],
+        preconditions=[{
+            "predicate": "object.at_location",
+            "args": {"object": "$inputs.object",
+                     "location": "$inputs.object_location"},
+        }],
+        effects=[{"predicate": "agent.holds",
+                  "args": {"object": "$inputs.object"}}],
+        status=SkillStatus.ACTIVE,
+    )
+    result = SimpleNamespace(actions=[{
+        "step": 0, "name": "take keychain 1 from sofa 1",
+        "params": {"object": "keychain 1", "object_location": "sofa 1"},
+        "accepted": True, "node_ref": str(atomic.ref),
+    }])
+    params = {"object": "newspaper",
+              "object_location": "$flow.object_location"}
+
+    grounded, evidence = _ground_env_runtime_params(
+        params, atomic, atomic.effects, result, action_start=0,
+        before={"facts": [], "inventory": []},
+        after={"facts": ["agent_holds(keychain_1)"],
+               "inventory": ["keychain_1"]},
+        node_ref=str(atomic.ref))
+
+    assert grounded == params
+    assert evidence == []
 
 
 def test_positive_state_effect_can_ground_slot_missing_from_action_params():

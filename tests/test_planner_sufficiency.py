@@ -7,10 +7,11 @@ from atomic_skillgraph.core.config import SystemConfig
 from atomic_skillgraph.core.refs import SkillRef
 from atomic_skillgraph.core.edge_ir import GraphEdge
 from atomic_skillgraph.core.skill_ir import AbstractAtomicSkill, CompositeSkill
-from atomic_skillgraph.core.status import EdgeType, SkillStatus
-from atomic_skillgraph.graph.registry import SkillGraphRegistry
+from atomic_skillgraph.core.status import EdgeType, SkillNodeKind, SkillStatus
+from atomic_skillgraph.graph.registry import RetrievalHit, SkillGraphRegistry
 from atomic_skillgraph.evolution.success_processor import SuccessProcessor
 from atomic_skillgraph.runtime.atomic_planner import AtomicPlanner
+from atomic_skillgraph.runtime.runtime_graph import RuntimeGraph
 from atomic_skillgraph.core.trace_ir import TraceRecord
 
 
@@ -302,6 +303,209 @@ def test_pick_two_atomic_plan_repeats_closed_acquire_place_branch(workspace_tmp)
         "alfworld.acquire_object", "alfworld.place_object",
         "alfworld.acquire_object", "alfworld.place_object",
     ]
+    assert [node.branch_id for node in plan.nodes] == [
+        "branch_000", "branch_000", "branch_001", "branch_001"]
+    assert [bool(node.distinct_bindings.get("object"))
+            for node in plan.nodes] == [True, True, True, True]
+
+
+def test_different_cardinality_targets_expand_exact_variable_width_branches(
+        workspace_tmp):
+    registry = SkillGraphRegistry(workspace_tmp / "different_cardinality")
+    clean = AbstractAtomicSkill(
+        ref=SkillRef("generic.clean", "1.0.0"), summary="clean",
+        inputs=[{"name": "clean_object"}],
+        effects=[{
+            "predicate": "object.cleaned",
+            "args": {"object": "$inputs.clean_object"},
+        }], status=SkillStatus.ACTIVE)
+    toggle = AbstractAtomicSkill(
+        ref=SkillRef("generic.toggle", "1.0.0"), summary="toggle",
+        inputs=[{"name": "toggle_object"}],
+        effects=[{
+            "predicate": "object.toggled",
+            "args": {"object": "$inputs.toggle_object"},
+        }], status=SkillStatus.ACTIVE)
+    registry.register(clean)
+    registry.register(toggle)
+    targets = [{
+        "predicate": "object.cleaned",
+        "args": {"object": "$clean_object"},
+        "cardinality": 2, "distinct_by": "object",
+    }, {
+        "predicate": "object.toggled",
+        "args": {"object": "$toggle_object"},
+        "cardinality": 3, "distinct_by": "object",
+    }]
+    task = Task(
+        task_id="two_plus_three", benchmark="generic_env",
+        goal="clean two widgets and toggle three lamps",
+        context={"params": {"clean_object": "widget",
+                            "toggle_object": "desklamp"}},
+        state={"facts": []}, target_effects=targets)
+    hits = [
+        RetrievalHit(ref=clean.ref, kind=SkillNodeKind.ABSTRACT_ATOMIC,
+                     obj=clean, score=1.0),
+        RetrievalHit(ref=toggle.ref, kind=SkillNodeKind.ABSTRACT_ATOMIC,
+                     obj=toggle, score=0.9),
+    ]
+    plan = AtomicPlanner(registry, SystemConfig())._compile_atomic_runtime_plan(
+        task, hits, hits)
+
+    assert [node.ref.logical_id for node in plan.nodes] == [
+        "generic.clean", "generic.toggle",
+        "generic.clean", "generic.toggle",
+        "generic.toggle",
+    ]
+    assert [node.branch_id for node in plan.nodes] == [
+        "branch_000", "branch_000", "branch_001", "branch_001",
+        "branch_002",
+    ]
+    clean_group = "target_000:object.cleaned:object"
+    toggle_group = "target_001:object.toggled:object"
+    assert sum(clean_group in node.distinct_bindings.get("clean_object", [])
+               for node in plan.nodes) == 2
+    assert sum(toggle_group in node.distinct_bindings.get("toggle_object", [])
+               for node in plan.nodes) == 3
+
+
+def test_same_predicate_cardinality_keeps_argument_families_separate(
+        workspace_tmp):
+    registry = SkillGraphRegistry(workspace_tmp / "same_predicate_cardinality")
+    place_mug = AbstractAtomicSkill(
+        ref=SkillRef("generic.place_mug", "1.0.0"), summary="place mug",
+        inputs=[{"name": "mug"}, {"name": "cabinet"}],
+        effects=[{
+            "predicate": "object.at_location",
+            "args": {"object": "$inputs.mug",
+                     "location": "$inputs.cabinet"},
+        }], status=SkillStatus.ACTIVE)
+    place_book = AbstractAtomicSkill(
+        ref=SkillRef("generic.place_book", "1.0.0"), summary="place book",
+        inputs=[{"name": "book"}, {"name": "shelf"}],
+        effects=[{
+            "predicate": "object.at_location",
+            "args": {"object": "$inputs.book",
+                     "location": "$inputs.shelf"},
+        }], status=SkillStatus.ACTIVE)
+    registry.register(place_mug)
+    registry.register(place_book)
+    targets = [{
+        "predicate": "object.at_location",
+        "args": {"object": "$mug", "location": "$cabinet"},
+        "cardinality": 2, "distinct_by": "object",
+    }, {
+        "predicate": "object.at_location",
+        "args": {"object": "$book", "location": "$shelf"},
+        "cardinality": 3, "distinct_by": "object",
+    }]
+    task = Task(
+        task_id="two_mugs_three_books", benchmark="generic_env",
+        goal="place two mugs in a cabinet and three books on a shelf",
+        context={"params": {
+            "mug": "mug", "cabinet": "cabinet_1",
+            "book": "book", "shelf": "shelf_1",
+        }}, state={"facts": []}, target_effects=targets)
+    hits = [
+        RetrievalHit(ref=place_mug.ref,
+                     kind=SkillNodeKind.ABSTRACT_ATOMIC,
+                     obj=place_mug, score=1.0),
+        RetrievalHit(ref=place_book.ref,
+                     kind=SkillNodeKind.ABSTRACT_ATOMIC,
+                     obj=place_book, score=0.9),
+    ]
+
+    plan = AtomicPlanner(registry, SystemConfig())._compile_atomic_runtime_plan(
+        task, hits, hits)
+
+    assert [node.ref.logical_id for node in plan.nodes] == [
+        "generic.place_mug", "generic.place_book",
+        "generic.place_mug", "generic.place_book",
+        "generic.place_book",
+    ]
+    assert [node.branch_id for node in plan.nodes] == [
+        "branch_000", "branch_000", "branch_001", "branch_001",
+        "branch_002",
+    ]
+
+
+def test_pick_two_composite_without_data_edges_projects_distinct_to_acquire(
+        workspace_tmp):
+    registry = SkillGraphRegistry(workspace_tmp / "pick_two_composite_graph")
+    acquire = _atomic("generic.acquire", "agent.holds", ["object"])
+    acquire.outputs = [{
+        "name": "object", "semantic_type": "object_ref",
+        "materializer": {"kind": "input_role", "role": "object"},
+    }]
+    place = _atomic(
+        "generic.place", "object.at_location",
+        ["object", "target_location"])
+    # This is a valid legacy Composite whose occurrence ordering is explicit,
+    # but which has neither DATA_FLOW nor REQUIRES_SKILL edges.
+    place.preconditions = []
+    registry.register(acquire)
+    registry.register(place)
+    steps = [
+        {"step_id": "a0", "node_ref": str(acquire.ref),
+         "params": {"object": "$task.object"}},
+        {"step_id": "p0", "node_ref": str(place.ref),
+         "params": {"object": "$task.object",
+                    "target_location": "$task.target_location"}},
+        {"step_id": "a1", "node_ref": str(acquire.ref),
+         "params": {"object": "$task.object"}},
+        {"step_id": "p1", "node_ref": str(place.ref),
+         "params": {"object": "$task.object",
+                    "target_location": "$task.target_location"}},
+    ]
+    control = [GraphEdge(
+        source=steps[index]["node_ref"],
+        target=steps[index + 1]["node_ref"], type=EdgeType.NEXT,
+        scope="composite", source_step=steps[index]["step_id"],
+        target_step=steps[index + 1]["step_id"]).to_dict()
+        for index in range(len(steps) - 1)]
+    target = [{
+        "predicate": "object.at_location",
+        "args": {"object": "$object_type", "location": "$target_location"},
+        "cardinality": 2, "distinct_by": "object",
+    }]
+    composite = CompositeSkill(
+        ref=SkillRef("composite.generic.pick-two", "1.0.0"),
+        summary="acquire and place two distinct objects",
+        graph={"nodes": [str(acquire.ref), str(place.ref)],
+               "steps": steps, "control": control, "data": []},
+        validator={"target_effects": target},
+        metadata={"statistics": {"utility": 1.0}},
+        status=SkillStatus.ACTIVE,
+    )
+    registry.register(composite)
+    task = Task(
+        task_id="pick_two_composite", benchmark="generic_env",
+        task_type="unseen_batch_task", goal="place two widgets",
+        state={"facts": []},
+        context={"params": {"object": "widget", "object_type": "widget",
+                            "target_location": "bay_1"}},
+        target_effects=target,
+    )
+
+    planner = AtomicPlanner(registry, SystemConfig())
+    hit = RetrievalHit(
+        ref=composite.ref, kind=SkillNodeKind.COMPOSITE,
+        obj=composite, score=1.0)
+    plan = planner._plan_from_composite(task, hit, [hit])
+
+    assert plan.composite_ref == str(composite.ref)
+    assert [node.branch_id for node in plan.nodes] == [
+        "branch_000", "branch_000", "branch_001", "branch_001"]
+    assert all(node.distinct_bindings.get("object") for node in plan.nodes)
+    group = plan.nodes[0].distinct_bindings["object"][0]
+    assert [node.distinct_branch_ids[group] for node in plan.nodes] == [
+        "occ_000", "occ_000", "occ_001", "occ_001"]
+    runtime = RuntimeGraph(task.task_id, plan)
+    runtime.nodes[0].passed = True
+    runtime.nodes[0].params["object"] = "widget_1"
+    runtime.nodes[0].outputs["object"] = "widget_1"
+    assert runtime.distinct_exclusions(1) == {}
+    assert runtime.distinct_exclusions(2) == {"object": {"widget_1"}}
 
 
 def test_legacy_composite_cannot_bind_destination_as_acquire_source():
@@ -311,6 +515,47 @@ def test_legacy_composite_cannot_bind_destination_as_acquire_source():
         _task(params={"object": "mug", "target_location": "cabinet 1"}),
     )
     assert resolved == {"object": "mug"}
+
+
+def test_planner_rejects_legacy_unsafe_composite_and_uses_atomics(
+        workspace_tmp):
+    registry = SkillGraphRegistry(workspace_tmp / "legacy_unsafe_composite")
+    acquire = _atomic(
+        "generic.acquire", "agent.holds", ["object", "object_location"])
+    place = _atomic(
+        "generic.place", "object.at_location", ["object", "target_location"])
+    place.preconditions = [{
+        "predicate": "agent.holds",
+        "args": {"object": "$inputs.object"},
+    }]
+    registry.register(acquire)
+    registry.register(place)
+    target = [{
+        "predicate": "object.at_location",
+        "args": {"object": "$object", "location": "$target_location"},
+    }]
+    legacy = _composite(
+        "composite.generic.legacy-unsafe-source",
+        [str(acquire.ref), str(place.ref)],
+        "acquire and place", 2.0, target_effects=target)
+    legacy.graph["steps"][0]["params"]["object_location"] = (
+        "$task.target_location")
+    registry.register(legacy)
+    task = Task(
+        task_id="legacy_unsafe", benchmark="generic_env",
+        task_type="unseen_task", goal="put mug in cabinet",
+        state={"facts": []},
+        context={"params": {"object": "mug",
+                            "target_location": "cabinet_1"}},
+        target_effects=target,
+    )
+
+    plan = AtomicPlanner(registry, SystemConfig()).compile_runtime_graph(task)
+
+    assert plan.composite_ref == ""
+    assert [node.ref.logical_id for node in plan.nodes] == [
+        "generic.acquire", "generic.place"]
+    assert plan.nodes[0].params.get("object_location") != "cabinet_1"
 
 
 def test_learned_parameter_family_binds_unstated_resource_without_task_type():

@@ -60,7 +60,9 @@ class FeatureFlags:
     enable_governance: bool = True           # utility/negative-transfer 治理
     enable_primitive_reuse: bool = True      # PrimitiveCompiler 作为 Tool 挖掘器
     task_type_hard_restricted: bool = False  # task_type 是否作为硬过滤
-    enable_framework_discovery: bool = False # 主方法禁用框架替 Agent 搜索位置
+    # Optional Tool-only discovery. Declared Atomic source-location contracts
+    # are resolved by bounded discovery regardless of this ablation flag.
+    enable_framework_discovery: bool = False
 
     def to_dict(self) -> dict[str, bool]:
         return {

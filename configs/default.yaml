@@ -59,7 +59,7 @@ features:                             # 消融开关（实验入口可覆盖）
   enable_governance: true
   enable_primitive_reuse: true
   task_type_hard_restricted: false
-  # 主方法由 Agent 在 Seeded/Dynamic 中完成未知位置定位；框架发现仅供消融。
+  # 仅控制可选 Tool-only 位置发现；Atomic 合同源位置始终由有界发现解析。
   enable_framework_discovery: false
 
 seed: 42

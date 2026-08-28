@@ -14,12 +14,13 @@ import re
 from typing import Any
 
 from ..adapters.benchmark import parse_goal_params
-from ..core.binding_ir import (BindingKind, BindingSpec, is_concrete_binding,
-                               resolve_binding)
+from ..core.binding_ir import (BindingKind, BindingSpec, binding_slot_name,
+                               is_concrete_binding, resolve_binding)
 from ..core.config import SystemConfig
 from ..core.edge_ir import GraphEdge
 from ..core.llm import LLM
 from ..core.refs import SkillRef
+from ..core.semantic_roles import unsafe_composite_task_role_binding
 from ..core.skill_ir import AbstractAtomicSkill, CompositeSkill
 from ..core.status import EdgeType, SkillNodeKind, SkillStatus
 from ..graph.graph import composite_step_order
@@ -262,6 +263,7 @@ class AtomicPlanner:
         edges.extend(self._atomic_dependency_edges(nodes))
         edges.extend(self.data_flow_synthesizer.synthesize(
             task, nodes, self.registry))
+        self._annotate_cardinality_constraints(task, nodes, edges)
         return RuntimePlan(
             start_mode="warm",
             nodes=nodes,
@@ -274,6 +276,219 @@ class AtomicPlanner:
             ],
             audit={"plan_source": "atomic_compilation"},
         )
+
+    def _annotate_cardinality_constraints(
+            self, task, nodes: list[PlannedNode],
+            edges: list[GraphEdge]) -> None:
+        """Project task ``distinct_by`` contracts onto occurrence inputs.
+
+        The goal contract names a predicate argument, while an Atomic may use
+        a different local input name.  Contract unification identifies the
+        terminal input and DATA_FLOW materializers propagate the same group
+        back through its causal branch.  Runtime can then reject cross-branch
+        instance reuse without knowing a benchmark task type or entity name.
+        """
+        task_params = dict(task.context.get("params") or {})
+        terminals_by_group: dict[str, list[PlannedNode]] = {}
+        terminal_roles_by_group: dict[str, dict[str, str]] = {}
+        target_roles_by_group: dict[str, str] = {}
+        for target_index, target in enumerate(task.target_effects or []):
+            if not isinstance(target, dict):
+                continue
+            cardinality = max(1, int(target.get("cardinality", 1) or 1))
+            distinct_arg = str(target.get("distinct_by") or "")
+            if cardinality <= 1 or not distinct_arg:
+                continue
+            target_args = dict(target.get("args") or {})
+            target_role = binding_slot_name(target_args.get(distinct_arg))
+            if not target_role:
+                target_role = distinct_arg
+            predicate = _canonical_predicate(str(target.get("predicate") or ""))
+            group_id = (
+                f"target_{target_index:03d}:{predicate}:{distinct_arg}")
+            target_roles_by_group[group_id] = target_role
+            single = {**target, "cardinality": 1, "distinct_by": ""}
+            matched_occurrences = 0
+            for node in nodes:
+                if matched_occurrences >= cardinality:
+                    break
+                atomic = self.registry.get(node.ref)
+                if atomic is None:
+                    continue
+                bindings = {**task_params, **dict(node.params or {})}
+                for effect in getattr(atomic, "effects", []) or []:
+                    if not isinstance(effect, dict):
+                        continue
+                    matched = match_effect_contract(effect, single, bindings)
+                    if not matched.passed:
+                        continue
+                    local_role = next((
+                        source_role
+                        for source_role, mapped_role in
+                        matched.unified_roles.items()
+                        if mapped_role == target_role
+                    ), "")
+                    if not local_role:
+                        local_role = binding_slot_name(
+                            dict(effect.get("args") or {}).get(distinct_arg))
+                    if local_role:
+                        _add_distinct_group(
+                            node, local_role, group_id)
+                        terminals = terminals_by_group.setdefault(group_id, [])
+                        if node not in terminals:
+                            terminals.append(node)
+                        terminal_roles_by_group.setdefault(group_id, {})[
+                            node.step_id] = local_role
+                        matched_occurrences += 1
+                        break
+
+        # Stored Composites predate branch_id in some repositories.  Their
+        # ordered target-producing occurrences still provide an unambiguous
+        # cardinality branch boundary; Atomic compilation already supplies the
+        # same branch ids and is left untouched.
+        for group_id, terminals in terminals_by_group.items():
+            for ordinal, node in enumerate(terminals):
+                if not node.branch_id:
+                    node.branch_id = f"branch_{ordinal:03d}"
+                _set_distinct_branch_id(
+                    node, group_id, f"occ_{ordinal:03d}")
+
+        # Walk causal DATA_FLOW edges backwards until every producer role that
+        # materializes a distinct consumer value carries the same constraint.
+        by_step = {node.step_id: node for node in nodes}
+        changed = True
+        while changed:
+            changed = False
+            for edge in edges:
+                if edge.type not in {
+                        EdgeType.DATA_FLOW, EdgeType.REQUIRES_SKILL}:
+                    continue
+                source = by_step.get(str(edge.source_step or ""))
+                target = by_step.get(str(edge.target_step or ""))
+                if source is None or target is None:
+                    continue
+                role_pairs: list[tuple[str, str]] = []
+                if edge.type == EdgeType.DATA_FLOW:
+                    mapping = dict(edge.mapping or {})
+                    target_role = str(mapping.get("target_input") or "")
+                    materializer = dict(mapping.get("materializer") or {})
+                    source_role = str(
+                        materializer.get("source_role")
+                        or mapping.get("source_output") or "")
+                    if source_role and target_role:
+                        role_pairs.append((source_role, target_role))
+                else:
+                    source_atomic = self.registry.get(source.ref)
+                    target_atomic = self.registry.get(target.ref)
+                    for effect in (
+                            getattr(source_atomic, "effects", []) or []):
+                        for precondition in (
+                                getattr(target_atomic, "preconditions", []) or []):
+                            matched = match_effect_contract(
+                                effect, precondition)
+                            if matched.passed:
+                                role_pairs.extend(
+                                    matched.unified_roles.items())
+                propagated = False
+                for source_role, target_role in role_pairs:
+                    groups = list(
+                        target.distinct_bindings.get(target_role) or [])
+                    for group_id in groups:
+                        added = _add_distinct_group(
+                            source, source_role, group_id)
+                        branch_added = _set_distinct_branch_id(
+                            source, group_id,
+                            target.distinct_branch_ids.get(group_id)
+                            or target.branch_id)
+                        propagated |= added or branch_added
+                changed |= propagated
+                if (propagated and target.branch_id
+                        and not source.branch_id):
+                    source.branch_id = target.branch_id
+                    changed = True
+
+        # Some valid stored Composites encode only ordered occurrences with
+        # task bindings; there is no DATA_FLOW/REQUIRES edge to traverse.  Each
+        # terminal closes one contiguous occurrence branch. Project the group
+        # to preceding nodes that carry the same semantic/task-bound value.
+        index_by_step = {node.step_id: index
+                         for index, node in enumerate(nodes)}
+        for group_id, terminals in terminals_by_group.items():
+            previous_terminal = -1
+            for terminal in terminals:
+                terminal_index = index_by_step.get(terminal.step_id, -1)
+                if terminal_index < 0:
+                    continue
+                terminal_role = terminal_roles_by_group[group_id].get(
+                    terminal.step_id, "")
+                branch_identity = (
+                    terminal.distinct_branch_ids.get(group_id)
+                    or terminal.branch_id)
+                for candidate in nodes[
+                        previous_terminal + 1:terminal_index + 1]:
+                    roles = self._contiguous_distinct_roles(
+                        candidate, terminal, terminal_role,
+                        target_roles_by_group.get(group_id, ""), task_params)
+                    for role in roles:
+                        _add_distinct_group(candidate, role, group_id)
+                        _set_distinct_branch_id(
+                            candidate, group_id, branch_identity)
+                    if roles and not candidate.branch_id:
+                        candidate.branch_id = terminal.branch_id
+                previous_terminal = terminal_index
+
+    def _contiguous_distinct_roles(
+            self, node: PlannedNode, terminal: PlannedNode,
+            terminal_role: str, target_role: str,
+            task_params: dict[str, Any]) -> set[str]:
+        """Find inputs carrying a terminal's distinct semantic entity."""
+        atomic = self.registry.get(node.ref)
+        terminal_atomic = self.registry.get(terminal.ref)
+        if atomic is None or terminal_atomic is None or not terminal_role:
+            return set()
+
+        def declaration_type(owner: Any, role: str) -> str:
+            return next((
+                str(item.get("semantic_type") or "")
+                for item in (getattr(owner, "inputs", []) or [])
+                if isinstance(item, dict)
+                and str(item.get("name") or "") == role
+            ), "")
+
+        wanted = (task_params.get(target_role)
+                  or terminal.params.get(terminal_role))
+        terminal_type = declaration_type(terminal_atomic, terminal_role)
+        roles: set[str] = set()
+        for declaration in getattr(atomic, "inputs", []) or []:
+            if not isinstance(declaration, dict):
+                continue
+            role = str(declaration.get("name") or "")
+            if not role:
+                continue
+            spec = node.binding_specs.get(role)
+            task_role = (str(spec.task_role)
+                         if spec is not None
+                         and spec.kind == BindingKind.TASK else "")
+            candidate_value = (node.params.get(role)
+                               or task_params.get(task_role))
+            same_value = bool(
+                wanted not in (None, "")
+                and candidate_value not in (None, "")
+                and _same_entity_family(wanted, candidate_value))
+            candidate_type = str(
+                declaration.get("semantic_type") or "")
+            same_type = bool(
+                terminal_type and candidate_type == terminal_type)
+            task_alias = bool(
+                task_role and target_role
+                and task_params.get(task_role) not in (None, "")
+                and task_params.get(target_role) not in (None, "")
+                and _same_entity_family(
+                    task_params[task_role], task_params[target_role]))
+            if same_value and (
+                    role == terminal_role or same_type or task_alias):
+                roles.add(role)
+        return roles
 
     def _task_dynamic_plan(self, task, retrieved: list[RetrievalHit], *,
                            reason: str) -> RuntimePlan:
@@ -445,6 +660,13 @@ class AtomicPlanner:
             if obj is None or obj.status != SkillStatus.ACTIVE:
                 raise PlanCompilationError(f"exact_child_unavailable:{exact_ref}")
             stored = dict(step.get("params") or {})
+            for slot_role, binding in stored.items():
+                if unsafe_composite_task_role_binding(
+                        str(slot_role), binding):
+                    raise PlanCompilationError(
+                        "unsafe_composite_task_role_binding:"
+                        f"step={step['step_id']}:slot={slot_role}:"
+                        f"binding={binding}")
             binding_specs: dict[str, BindingSpec] = {}
             params: dict[str, Any] = {}
             for key, value in stored.items():
@@ -468,11 +690,13 @@ class AtomicPlanner:
         # required producer; it is the strongest reason to retain the node,
         # never a reason to drop it.  Unbound occurrence parameters are
         # resolved from state/data-flow or bounded runtime discovery.
+        edges = self._runtime_edges(nodes, composite.edge_objects())
+        self._annotate_cardinality_constraints(task, nodes, edges)
         return RuntimePlan(
             start_mode="warm",
             composite_ref=str(composite.ref),
             nodes=nodes,
-            edges=self._runtime_edges(nodes, composite.edge_objects()),
+            edges=edges,
             retrieved=[h.to_dict() for h in retrieved],
             notes=[f"composite_plan:{composite.ref.logical_id}"],
         )
@@ -483,15 +707,14 @@ class AtomicPlanner:
         context = dict(task.context.get("params") or {})
         resolved: dict[str, Any] = {}
         for key, value in stored.items():
+            if unsafe_composite_task_role_binding(str(key), value):
+                # Historical banks may contain value-equality guesses that
+                # confused an occurrence source with the task destination.
+                # Keep this compatibility helper fail-closed; the actual
+                # Composite planning path rejects the whole unsafe asset.
+                continue
             if isinstance(value, str) and value.startswith("$task."):
                 role = value[len("$task."):]
-                # A hidden source location must be discovered, not rebound from
-                # a semantically different destination role. This also guards
-                # replay of older banks containing an unsafe role mapping.
-                if (str(key) in {"object_location", "source_location"}
-                        and role in {"target_location", "target_receptacle",
-                                     "destination", "destination_location"}):
-                    continue
                 if context.get(role) not in (None, ""):
                     resolved[str(key)] = context[role]
             elif isinstance(value, str) and value.startswith("$flow."):
@@ -511,18 +734,20 @@ class AtomicPlanner:
                 dict(task.context.get("params") or {}))
             base_branch = self._close_and_order_dependencies(
                 base_branch, hits, task.target_effects)
-            selected = self._expand_cardinality_workflow(
-                base_branch, task.target_effects)
+            expanded = self._expand_cardinality_workflow(
+                base_branch, task.target_effects,
+                dict(task.context.get("params") or {}))
         else:
             base_branch = self._llm_plan(task, hits) or hits[:3]
-            selected = list(base_branch)
+            expanded = [
+                (hit, "branch_000") for hit in base_branch]
         nodes: list[PlannedNode] = []
-        branch_width = max(1, len(base_branch))
-        for index, hit in enumerate(selected):
+        branch_offsets: dict[str, int] = {}
+        for index, (hit, branch_id) in enumerate(expanded):
             atomic = hit.obj
             params = self._bind_params(task, atomic)
-            branch_index = index // branch_width
-            branch_id = f"branch_{branch_index:03d}"
+            branch_offset = branch_offsets.get(branch_id, 0)
+            branch_offsets[branch_id] = branch_offset + 1
             task_params = dict(task.context.get("params") or {})
             binding_specs: dict[str, BindingSpec] = {}
             for declaration in (getattr(atomic, "inputs", []) or []):
@@ -540,7 +765,7 @@ class AtomicPlanner:
                         f"$inputs.{role}")
             nodes.append(PlannedNode(
                 ref=atomic.ref, step_id=f"step_{index:03d}",
-                occurrence_id=f"{branch_id}_occ_{index % branch_width:03d}",
+                occurrence_id=f"{branch_id}_occ_{branch_offset:03d}",
                 branch_id=branch_id, binding_specs=binding_specs,
                 params=params, source="atomic_compilation",
                 target_effects=list(getattr(atomic, "effects", []))))
@@ -549,19 +774,83 @@ class AtomicPlanner:
     @staticmethod
     def _expand_cardinality_workflow(
             selected: list[RetrievalHit],
-            target_effects: list[dict[str, Any]]) -> list[RetrievalHit]:
-        """Repeat a minimal causal branch for an explicit N-object goal.
+            target_effects: list[dict[str, Any]],
+            bindings: dict[str, Any] | None = None,
+            ) -> list[tuple[RetrievalHit, str]]:
+        """Expand variable-width causal branches by target cardinality.
 
-        Repeating only a terminal node can violate its producer dependencies;
-        repeating the already dependency-closed ordered branch preserves the
-        executable data flow for any explicit cardinality target.
+        At occurrence ordinal ``j`` only targets with ``cardinality > j`` are
+        active; their backwards dependency closures are unioned in original
+        topological order. Thus a 2+3 goal yields ``A+B, A+B, B`` rather than
+        repeating the whole union three times.
         """
-        repeat = max(
-            [max(1, int(effect.get("cardinality", 1) or 1))
-             for effect in target_effects if isinstance(effect, dict)] or [1])
-        if repeat <= 1 or not selected:
-            return selected
-        return [hit for _ in range(repeat) for hit in selected]
+        if not selected:
+            return []
+        cardinalities = [
+            max(1, int(effect.get("cardinality", 1) or 1))
+            for effect in target_effects if isinstance(effect, dict)]
+        if max(cardinalities or [1]) <= 1:
+            return [(hit, "branch_000") for hit in selected]
+
+        def produces(producer: RetrievalHit, consumer: RetrievalHit) -> bool:
+            return any(
+                match_effect_contract(effect, precondition).passed
+                for effect in (getattr(producer.obj, "effects", []) or [])
+                for precondition in (
+                    getattr(consumer.obj, "preconditions", []) or []))
+
+        expanded: list[tuple[RetrievalHit, str]] = []
+        covered_ids: set[str] = set()
+        max_cardinality = max(cardinalities or [1])
+        for ordinal in range(max_cardinality):
+            active_targets = [
+                target for target in target_effects
+                if isinstance(target, dict)
+                and max(1, int(target.get("cardinality", 1) or 1)) > ordinal
+            ]
+            terminal_ids: set[str] = set()
+            for target in active_targets:
+                single = {**target, "cardinality": 1, "distinct_by": ""}
+                terminal_ids.update(
+                    hit.obj.ref.logical_id for hit in selected
+                    if any(
+                        match_effect_contract(
+                            effect, single, bindings).passed
+                           for effect in (
+                               getattr(hit.obj, "effects", []) or [])))
+            if not terminal_ids:
+                continue
+            closure_ids = set(terminal_ids)
+            changed = True
+            while changed:
+                changed = False
+                consumers = [
+                    hit for hit in selected
+                    if hit.obj.ref.logical_id in closure_ids]
+                for producer in selected:
+                    logical_id = producer.obj.ref.logical_id
+                    if logical_id in closure_ids:
+                        continue
+                    if any(produces(producer, consumer)
+                           for consumer in consumers):
+                        closure_ids.add(logical_id)
+                        changed = True
+            closure = [
+                hit for hit in selected
+                if hit.obj.ref.logical_id in closure_ids]
+            covered_ids.update(closure_ids)
+            branch_id = f"branch_{ordinal:03d}"
+            expanded.extend((hit, branch_id) for hit in closure)
+
+        # Preserve a non-target helper exactly once if closure inference could
+        # not associate it with a formal target; never multiply it by max(N).
+        leftovers = [
+            hit for hit in selected
+            if hit.obj.ref.logical_id not in covered_ids]
+        if leftovers:
+            branch_id = f"branch_{max_cardinality:03d}"
+            expanded.extend((hit, branch_id) for hit in leftovers)
+        return expanded
 
     @staticmethod
     def _close_and_order_dependencies(selected: list[RetrievalHit],
@@ -987,6 +1276,36 @@ def _parse_plan_json(text: str) -> list[str] | None:
     return ids or None
 
 
+def _add_distinct_group(node: PlannedNode, role: str, group_id: str) -> bool:
+    """Attach one normalized group once and report whether IR changed."""
+    role_name = str(role or "")
+    group_name = str(group_id or "")
+    if not role_name or not group_name:
+        return False
+    groups = node.distinct_bindings.setdefault(role_name, [])
+    if group_name in groups:
+        return False
+    groups.append(group_name)
+    return True
+
+
+def _set_distinct_branch_id(
+        node: PlannedNode, group_id: str, branch_id: str) -> bool:
+    group_name = str(group_id or "")
+    branch_name = str(branch_id or "")
+    if not group_name or not branch_name:
+        return False
+    current = node.distinct_branch_ids.get(group_name)
+    if current == branch_name:
+        return False
+    if current:
+        # Conflicting projections are kept explicit instead of silently
+        # replacing one cardinality occurrence with another.
+        return False
+    node.distinct_branch_ids[group_name] = branch_name
+    return True
+
+
 def _deduplicate_runtime_edges(edges: list[GraphEdge]) -> list[GraphEdge]:
     """Keep edge semantics exact while removing duplicate synthesis results."""
     unique: list[GraphEdge] = []
@@ -1010,6 +1329,10 @@ def _deduplicate_runtime_edges(edges: list[GraphEdge]) -> list[GraphEdge]:
 def _canonical_predicate(name: str) -> str:
     aliases = {
         "object.in_receptacle": "object.at_location",
+        "object.in.receptacle": "object.at_location",
+        "object_in_receptacle": "object.at_location",
         "object.in_container": "object.at_location",
+        "object.in.container": "object.at_location",
+        "object_in_container": "object.at_location",
     }
     return aliases.get(str(name), str(name))

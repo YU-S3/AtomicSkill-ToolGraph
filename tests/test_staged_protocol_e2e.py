@@ -318,8 +318,24 @@ def test_real_entrypoints_stage_freeze_extend_and_regressions(
     for condition in OURS:
         for path in (eval_12 / condition / "data" / "traces").glob("*.json"):
             traces.append(json.loads(path.read_text()))
-    assert all(not trace.get("metrics", {}).get(
-        "controlled_location_discovery") for trace in traces)
+    discoveries = [
+        discovery
+        for trace in traces
+        for discovery in trace.get("metrics", {}).get(
+            "controlled_location_discovery", [])
+    ]
+    # The fixture deliberately omits object_location. Atomic execution must
+    # therefore perform mandatory bounded source discovery even when optional
+    # framework discovery is disabled. The protocol adapter resolves it
+    # without taking an environment action.
+    assert discoveries
+    assert all(
+        discovery.get("entity_role") == "object"
+        and discovery.get("location_role") == "object_location"
+        and discovery.get("found") is True
+        and discovery.get("search_actions") == 0
+        for discovery in discoveries
+    )
     assert not any(action.get("origin") == "framework_discovery"
                    for trace in traces for action in trace.get("actions", []))
     assert not any(
