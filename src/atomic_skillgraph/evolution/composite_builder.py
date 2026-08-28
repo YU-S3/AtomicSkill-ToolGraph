@@ -12,7 +12,8 @@ from typing import Any
 
 from ..core.config import SystemConfig
 from ..core.edge_ir import GraphEdge
-from ..core.refs import SkillRef, bump_version
+from ..core.binding_ir import binding_slot_name
+from ..core.refs import SkillRef, bump_version, content_hash
 from ..core.skill_ir import CompositeSkill
 from ..core.status import EdgeType, SkillStatus
 from ..core.trace_ir import TraceRecord
@@ -22,7 +23,12 @@ from .composite_lifecycle import evaluate_composite
 from .composite_revision import CompositeRevisionBuilder
 from .trace_graph_reconstructor import TraceGraphRevision
 from ..runtime.contract_matcher import match_effect_contract
-from ..runtime.output_materializer import output_is_materializable
+from ..runtime.output_materializer import validate_output_materializer
+from ..atomicizer.effect_extractor import (
+    is_fully_parameterized_predicate,
+    parameterize_predicates,
+)
+from ..persistence_guard import validate_long_term_asset
 
 
 @dataclass
@@ -81,17 +87,48 @@ class CompositeBuilder:
             pairs = [by_phase[phase_id] for phase_id in proposed_order]
         atomic_refs = [pair[0] for pair in pairs]
         segments = [pair[1] for pair in pairs]
+        target_effects, target_errors = _portable_target_effects(trace)
+        if target_errors:
+            return CompositeBuildResult(
+                decision="skipped",
+                reason="target_contract_not_portable:" + "|".join(target_errors))
         node_refs = [f"{ref.logical_id}@{ref.version}" for ref in atomic_refs]
         occurrence_params = _role_params_for_segments(segments, trace)
+        occurrence_evidence = [
+            self.registry.evidence_store.put(
+                "composite_occurrence",
+                {
+                    "params": dict(segment.get("params") or {}),
+                    "before": dict(segment.get("before") or {}),
+                    "after": dict(segment.get("after") or {}),
+                    "effect": [dict(item) for item in
+                               (segment.get("effect") or [])
+                               if isinstance(item, dict)],
+                    "negative_effect": [dict(item) for item in
+                                        (segment.get("negative_effect") or [])
+                                        if isinstance(item, dict)],
+                },
+                trace_id=trace.trace_id,
+                event_start=_optional_int(segment.get("event_start")),
+                event_end=_optional_int(segment.get("event_end")),
+            )
+            for segment in segments
+        ]
+        source_phase_ids = [
+            str(segment.get("phase_id") or f"phase_{index:03d}")
+            for index, segment in enumerate(segments)
+        ]
         steps = [
             {"step_id": f"step_{index:03d}", "node_ref": node_ref,
              "params": occurrence_params[index],
              "metadata": {"source_trace_id": trace.trace_id,
-                          "phase_id": str(segment.get("phase_id") or f"phase_{index:03d}"),
+                          # The Extractor's raw phase id is occurrence evidence
+                          # and may itself contain an entity instance.  The
+                          # reusable graph uses a local canonical id.
+                          "phase_id": f"phase_{index:03d}",
                           "event_start": segment.get("event_start"),
                           "event_end": segment.get("event_end"),
-                          # Instance values are evidence only, never identity.
-                          "grounded_params": dict(segment.get("params") or {})}}
+                          "evidence_ref": occurrence_evidence[index]}}
             for index, (node_ref, segment) in enumerate(zip(node_refs, segments))
         ]
         control = [
@@ -104,9 +141,20 @@ class CompositeBuilder:
             ).to_dict()
             for index in range(len(steps) - 1)
         ]
-        data = _infer_data_edges(steps, self.registry, trace.trace_id)
+        proposal_evidence_ref = self.registry.evidence_store.put(
+            "composite_semantic_proposal", graph_proposal,
+            trace_id=trace.trace_id)
+        data = _infer_data_edges(
+            steps, segments, occurrence_evidence,
+            self.registry, trace.trace_id)
         dependencies = _infer_dependency_edges(
-            steps, self.registry, trace.trace_id, graph_proposal)
+            steps, self.registry, trace.trace_id, graph_proposal,
+            proposal_evidence_ref, source_phase_ids=source_phase_ids)
+        revision_evidence_ref = (
+            self.registry.evidence_store.put(
+                "graph_revision", revision.to_dict(),
+                trace_id=trace.trace_id)
+            if revision is not None else {})
         logical_id = _composite_id(atomic_refs)
         candidate = CompositeSkill(
             ref=SkillRef(logical_id=logical_id, version="1.0.0"),
@@ -134,15 +182,25 @@ class CompositeBuilder:
             validator={"checks": _composite_checks(
                            atomic_refs, self.registry, segments),
                        "check_semantics": "terminal_effect_closure_v2",
-                       "target_effects": list(trace.provenance.get("target_effects") or [])},
+                       "target_effects": target_effects},
             metadata={
                 "source_trace_ids": [trace.trace_id],
                 "independent_support_keys": [_support_key(trace)],
                 "semantic_proposals": [{
                     "source_trace_id": trace.trace_id,
-                    "summary_raw": str(graph_proposal.get("summary") or "").strip(),
-                    "implicit_dependencies_raw": list(
-                        graph_proposal.get("implicit_dependencies") or []),
+                    "evidence_ref": proposal_evidence_ref,
+                }],
+                # The canonical graph remains instance-free and immutable;
+                # occurrence evidence from every aligned trace is retained in
+                # this append-only side index instead of replacing graph.steps.
+                "occurrence_evidence_refs": [{
+                    "source_trace_id": trace.trace_id,
+                    "support_key": _support_key(trace),
+                    "steps": [
+                        {"step_id": step["step_id"],
+                         "evidence_ref": occurrence_evidence[index]}
+                        for index, step in enumerate(steps)
+                    ],
                 }],
                 "candidate": {"admission": "multi_trace",
                               "graph_proposal_validated": bool(graph_proposal.get("validated")),
@@ -152,8 +210,7 @@ class CompositeBuilder:
                 "statistics": {"use_count": 0, "success_count": 1,
                                "failure_count": 0, "utility": 0.5,
                                "support_count": 1},
-                "source_graph_revision": (
-                    revision.to_dict() if revision is not None else {}),
+                "source_graph_revision_ref": revision_evidence_ref,
             },
             status=SkillStatus.DRAFT,
         )
@@ -229,6 +286,36 @@ class CompositeBuilder:
                                   for item in proposals):
                 proposals.append(dict(proposal))
         existing.metadata["semantic_proposals"] = proposals
+        occurrence_groups = list(
+            existing.metadata.get("occurrence_evidence_refs") or [])
+        for group in incoming.metadata.get("occurrence_evidence_refs") or []:
+            identity = (
+                str(group.get("source_trace_id") or ""),
+                str(group.get("support_key") or ""),
+                tuple(
+                    (str(item.get("step_id") or ""),
+                     str((item.get("evidence_ref") or {}).get(
+                         "evidence_ref") or ""))
+                    for item in (group.get("steps") or [])
+                    if isinstance(item, dict)
+                ),
+            )
+            if not any(
+                    identity == (
+                        str(item.get("source_trace_id") or ""),
+                        str(item.get("support_key") or ""),
+                        tuple(
+                            (str(step.get("step_id") or ""),
+                             str((step.get("evidence_ref") or {}).get(
+                                 "evidence_ref") or ""))
+                            for step in (item.get("steps") or [])
+                            if isinstance(step, dict)
+                        ),
+                    )
+                    for item in occurrence_groups
+                    if isinstance(item, dict)):
+                occurrence_groups.append(dict(group))
+        existing.metadata["occurrence_evidence_refs"] = occurrence_groups
         if independent:
             existing.insight["sample_count"] = int(existing.insight.get("sample_count", 0)) + 1
 
@@ -252,6 +339,50 @@ def _summary_from_refs(atomic_refs: list[SkillRef]) -> str:
         leaf = ref.logical_id.rsplit(".", 1)[-1]
         names.append(leaf.replace("-", " ").replace("_", " "))
     return f"复合能力：{' → '.join(names)}"
+
+
+def _portable_target_effects(
+        trace: TraceRecord) -> tuple[list[dict[str, Any]], list[str]]:
+    """Return a complete role-parameterized target contract or fail closed."""
+    bindings = dict(trace.provenance.get("params") or {})
+    # Semantic roles refine the concrete task params but must not replace
+    # fields they omit.
+    bindings.update(dict(trace.provenance.get("semantic_params") or {}))
+    raw = [dict(item) for item in
+           (trace.provenance.get("target_effects") or [])
+           if isinstance(item, dict)]
+    # Benchmark/task contracts historically use ``$role`` and ``$task.role``
+    # while reusable Skill contracts require the explicit ``$inputs.role``
+    # namespace.  Canonicalize only roles that the trace actually binds; an
+    # unknown symbolic role remains unbound and is rejected below.
+    canonical_raw: list[dict[str, Any]] = []
+    for item in raw:
+        candidate = dict(item)
+        args: dict[str, Any] = {}
+        for name, value in dict(item.get("args") or {}).items():
+            role = binding_slot_name(value)
+            args[str(name)] = (
+                f"$inputs.{role}"
+                if role and role in bindings else value
+            )
+        candidate["args"] = args
+        canonical_raw.append(candidate)
+    parameterized = parameterize_predicates(
+        canonical_raw,
+        bindings,
+    )
+    errors: list[str] = []
+    if len(parameterized) != len(raw):
+        errors.append("target_effect_count_changed")
+    for index, item in enumerate(parameterized):
+        args = dict(item.get("args") or {})
+        if args and not is_fully_parameterized_predicate(item):
+            errors.append(f"target_effect_unbound:{index}")
+        findings = validate_long_term_asset(
+            {"target_effect": item}, asset_kind="composite_target_contract")
+        if findings:
+            errors.append(f"target_effect_unsafe:{index}:{findings[0]}")
+    return (parameterized if not errors else []), errors
 
 
 def _composite_checks(atomic_refs: list[SkillRef],
@@ -300,8 +431,11 @@ def _effect_key(effect: dict[str, Any]) -> tuple[str, tuple[tuple[str, str], ...
     return str(effect.get("predicate") or ""), args
 
 
-def _infer_data_edges(steps: list[dict[str, Any]], registry: SkillGraphRegistry,
-                      trace_id: str) -> list[dict[str, Any]]:
+def _infer_data_edges(
+        steps: list[dict[str, Any]], segments: list[dict[str, Any]],
+        occurrence_evidence: list[dict[str, Any]],
+        registry: SkillGraphRegistry, trace_id: str,
+        ) -> list[dict[str, Any]]:
     """Infer nearest-producer output→input mappings across the occurrence DAG."""
     edges: list[dict[str, Any]] = []
     for target_index in range(1, len(steps)):
@@ -327,19 +461,25 @@ def _infer_data_edges(steps: list[dict[str, Any]], registry: SkillGraphRegistry,
                 matched = False
                 for output in list(getattr(source, "outputs", None) or []):
                     output_name = str(output.get("name") or "")
-                    if (not output_name
-                            or not output_is_materializable(
-                                source, output_name)):
+                    materializer = validate_output_materializer(
+                        source, output_name)
+                    if not output_name or not materializer.passed:
                         continue
                     same_type = bool(
                         output.get("semantic_type")
                         and output.get("semantic_type")
                         == input_spec.get("semantic_type"))
-                    source_value = dict(source_step.get("metadata", {}).get(
-                        "grounded_params") or {}).get(
-                        output_name)
-                    target_value = dict(target_step.get("metadata", {}).get(
-                        "grounded_params") or {}).get(
+                    source_params = dict(
+                        (segments[source_index] if source_index < len(segments)
+                         else {}).get("params") or {})
+                    target_params = dict(
+                        (segments[target_index] if target_index < len(segments)
+                         else {}).get("params") or {})
+                    source_role = _materializer_source_role(
+                        source, materializer.materializer)
+                    source_value = source_params.get(
+                        source_role or output_name)
+                    target_value = target_params.get(
                         str(input_spec.get("name") or ""))
                     grounded_same_value = bool(
                         source_value not in (None, "")
@@ -360,8 +500,13 @@ def _infer_data_edges(steps: list[dict[str, Any]], registry: SkillGraphRegistry,
                             "schema": str(input_spec.get("semantic_type") or "value"),
                             "transform": "identity",
                             "evidence": {
-                                "source_value": source_value,
-                                "target_value": target_value,
+                                "grounding_match": True,
+                                "source_evidence_hash": str(
+                                    occurrence_evidence[source_index].get(
+                                        "evidence_hash") or ""),
+                                "target_evidence_hash": str(
+                                    occurrence_evidence[target_index].get(
+                                        "evidence_hash") or ""),
                             },
                         },
                         evidence=[trace_id],
@@ -382,15 +527,25 @@ def _same_grounded_value(left: Any, right: Any) -> bool:
 def _support_key(trace: TraceRecord) -> str:
     instance = str((trace.provenance or {}).get("environment_instance") or
                    (trace.provenance or {}).get("game_file") or "")
-    return f"{trace.benchmark}:{trace.task_id}:{instance}"
+    return "support:" + content_hash({
+        "benchmark": trace.benchmark,
+        "task_id": trace.task_id,
+        "environment_instance": instance,
+    })
 
 
 def _infer_dependency_edges(steps: list[dict[str, Any]], registry: SkillGraphRegistry,
                             trace_id: str,
-                            graph_proposal: dict[str, Any]) -> list[dict[str, Any]]:
+                            graph_proposal: dict[str, Any],
+                            proposal_evidence_ref: dict[str, Any],
+                            source_phase_ids: list[str] | None = None,
+                            ) -> list[dict[str, Any]]:
     """Build causal edges from the nearest Effect producer plus gated LLM hints."""
     edges: list[dict[str, Any]] = []
-    phase_to_step = {str(step.get("metadata", {}).get("phase_id")): step for step in steps}
+    aliases = list(source_phase_ids or [
+        str(step.get("metadata", {}).get("phase_id")) for step in steps])
+    phase_to_step = {phase_id: step
+                     for phase_id, step in zip(aliases, steps)}
     for target_index, target_step in enumerate(steps):
         target_ref = SkillRef.parse(target_step["node_ref"])
         target = registry.get(target_ref) or registry.get_recommended(target_ref.logical_id)
@@ -424,7 +579,7 @@ def _infer_dependency_edges(steps: list[dict[str, Any]], registry: SkillGraphReg
             evidence=[trace_id], metadata={
                 "origin": "llm_semantic_proposal",
                 "reason": "LLM 提议存在非显式依赖；执行结构仍由代码验证",
-                "llm_reason_raw": str(hint.get("reason") or ""),
+                "proposal_evidence_ref": proposal_evidence_ref,
             },
         ).to_dict())
     unique: dict[tuple[str, str, str], dict[str, Any]] = {}
@@ -432,6 +587,33 @@ def _infer_dependency_edges(steps: list[dict[str, Any]], registry: SkillGraphReg
         unique[(str(edge.get("source_step")), str(edge.get("target_step")),
                 str((edge.get("metadata") or {}).get("predicate") or "semantic"))] = edge
     return list(unique.values())
+
+
+def _materializer_source_role(atomic: Any,
+                              materializer: dict[str, Any]) -> str:
+    kind = str(materializer.get("kind") or "")
+    if kind == "input_role":
+        return str(materializer.get("role") or "")
+    if kind != "effect_arg":
+        return ""
+    predicate = str(materializer.get("predicate") or "")
+    arg = str(materializer.get("arg") or "")
+    roles = {
+        binding_slot_name(dict(effect.get("args") or {}).get(arg))
+        for effect in list(getattr(atomic, "effects", []) or [])
+        if isinstance(effect, dict)
+        and str(effect.get("predicate") or "") == predicate
+        and arg in dict(effect.get("args") or {})
+    }
+    roles.discard("")
+    return next(iter(roles)) if len(roles) == 1 else ""
+
+
+def _optional_int(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _role_params(params: dict[str, Any], trace: TraceRecord) -> dict[str, Any]:

@@ -86,7 +86,13 @@ def _sample_atomic(logical_id: str = "test.acquire-object") -> AbstractAtomicSki
         summary="获取目标对象，使 Agent 持有该对象",
         inputs=[{"name": "object", "semantic_type": "object_ref"},
                 {"name": "object_location", "semantic_type": "location_ref"}],
-        outputs=[{"name": "held_object", "semantic_type": "object_ref"}],
+        outputs=[{
+            "name": "held_object", "semantic_type": "object_ref",
+            "materializer": {
+                "kind": "effect_arg", "predicate": "agent.holds",
+                "arg": "object",
+            },
+        }],
         preconditions=[{"predicate": "object.exists", "args": {"object": "$object"}}],
         effects=[{"predicate": "agent.holds", "args": {"object": "$object"}}],
         validator={"pre_checks": ["object_exists"], "post_checks": ["agent_holds"]},
@@ -185,7 +191,9 @@ def check_registry_and_graph(tmp_path: Path) -> None:
     place = AbstractAtomicSkill(
         ref=SkillRef("test.place-object", "1.0.0"),
         summary="将对象放置到目标位置",
-        inputs=[{"name": "object"}], outputs=[],
+        inputs=[{"name": "object", "semantic_type": "object_ref"},
+                {"name": "location", "semantic_type": "location_ref"}],
+        outputs=[],
         effects=[{"predicate": "object.at_location", "args": {"object": "$object",
                                                               "location": "$location"}}],
         validator={}, metadata={"task_type_labels": ["pick_and_place_simple"]},
@@ -218,7 +226,10 @@ def check_registry_and_graph(tmp_path: Path) -> None:
                 "source_step": "acquire_000", "target_step": "place_000",
                 "type": EdgeType.DATA_FLOW.value, "scope": "composite",
                 "mapping": {"source_output": "held_object",
-                            "target_input": "object"},
+                            "target_input": "object",
+                            "source_semantic_type": "object_ref",
+                            "target_semantic_type": "object_ref",
+                            "transform": "identity"},
             }],
         },
         validator={}, metadata={"task_type_labels": ["pick_and_place_simple"]},
@@ -333,11 +344,13 @@ def check_aligner(tmp_path: Path) -> None:
 
 
 def check_tool_registry_and_resolver(tmp_path: Path) -> None:
+    from atomic_skillgraph.tools.admission_adapter import AdmissionEngine
     from atomic_skillgraph.tools.registry import ToolRegistry
     from atomic_skillgraph.tools.resolver import ToolResolver
     registry = ToolRegistry(tmp_path / "tools")
     tool = _sample_tool()
-    tool.status = ToolLifecycle.CANDIDATE
+    expect(AdmissionEngine().admit(tool).passed,
+           "Tool 必须经 Admission 后注册为 candidate")
     registry.register(tool)
     expect(registry.get(tool.ref) is not None, "Tool 注册失败")
     expect(registry.get_recommended("test.acquire-template") is not None, "推荐版本缺失")
@@ -542,7 +555,8 @@ def check_generalizer(tmp_path: Path) -> None:
                             code=f"def solve(x):\n    return {constant} * x\n")
         tool.signature["entry_point"] = "solve"
         tool.tests = [{"kind": "replay", "entry_point": "solve", "tests": [test]}]
-        tool.status = ToolLifecycle.CANDIDATE
+        expect(AdmissionEngine(sandbox=sandbox).admit(tool).passed,
+               "泛化来源 Tool 必须先通过 Admission")
         return tool
 
     t2 = make("arith.double", 2, "assert solve(3) == 6")

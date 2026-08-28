@@ -16,7 +16,18 @@ from ..core.binding_ir import (
     source_name_for_kind,
 )
 from ..core.status import EdgeType
-from .output_materializer import validate_output_materializer
+from .output_materializer import (
+    get_output_declaration,
+    validate_output_materializer,
+)
+
+
+# A DATA_FLOW transform is executable semantics, not descriptive metadata.
+# Runtime currently transfers one already-materialized value into a differently
+# named input slot, so only the two transforms below are implemented.  New
+# transforms must be added to the executor and eager propagation paths before
+# they may be admitted here.
+IMPLEMENTED_DATA_FLOW_TRANSFORMS = {"", "identity", "rename"}
 
 
 @dataclass
@@ -183,28 +194,23 @@ def validate_composite_binding_closure(composite: Any, registry: Any
     for edge in composite.edge_objects():
         if edge.type != EdgeType.DATA_FLOW:
             continue
-        target_input = str((edge.mapping or {}).get("target_input") or "")
-        source_output = str((edge.mapping or {}).get("source_output") or "")
         source_step = steps.get(edge.source_step)
         target_step = steps.get(edge.target_step)
         source_atomic = _atomic_of_step(source_step, registry)
+        target_atomic = _atomic_of_step(target_step, registry)
         if source_step is None or target_step is None:
             errors.append(f"data_flow_unknown_step:{edge.edge_id}")
             continue
         if order[edge.source_step] >= order[edge.target_step]:
             errors.append(f"data_flow_source_not_prior:{edge.edge_id}")
             continue
-        materializer = validate_output_materializer(source_atomic, source_output)
-        if not materializer.passed:
-            errors.append(
-                f"data_flow_output_unmaterializable:{edge.source_step}:"
-                f"{source_output}:{'|'.join(materializer.errors)}")
+        spec, edge_errors = _validated_data_flow_spec(
+            edge, source_atomic, target_atomic, incoming)
+        errors.extend(edge_errors)
+        if spec is None:
             continue
-        if target_input and source_output:
-            incoming[(edge.target_step, target_input)] = BindingSpec(
-                BindingKind.DATA_FLOW, source_step=edge.source_step,
-                source_output=source_output,
-                symbol=f"$flow.{source_output}")
+        target_input, binding = spec
+        incoming[(edge.target_step, target_input)] = binding
 
     reports: list[NodeBindingReport] = []
     for step_id, step in steps.items():
@@ -298,8 +304,6 @@ def _incoming_flow_specs(plan: Any, registry: Any,
         if edge.type != EdgeType.DATA_FLOW:
             continue
         source_entry, target_entry = nodes.get(edge.source_step), nodes.get(edge.target_step)
-        source_output = str((edge.mapping or {}).get("source_output") or "")
-        target_input = str((edge.mapping or {}).get("target_input") or "")
         if source_entry is None or target_entry is None:
             errors.append(f"data_flow_unknown_step:{edge.edge_id}")
             continue
@@ -307,16 +311,101 @@ def _incoming_flow_specs(plan: Any, registry: Any,
             errors.append(f"data_flow_source_not_prior:{edge.edge_id}")
             continue
         source_atomic = registry.get(source_entry[1].ref)
-        validation = validate_output_materializer(source_atomic, source_output)
-        if not validation.passed:
-            errors.append(
-                f"data_flow_output_unmaterializable:{edge.source_step}:"
-                f"{source_output}:{'|'.join(validation.errors)}")
+        target_atomic = registry.get(target_entry[1].ref)
+        spec, edge_errors = _validated_data_flow_spec(
+            edge, source_atomic, target_atomic, incoming)
+        errors.extend(edge_errors)
+        if spec is None:
             continue
-        incoming[(edge.target_step, target_input)] = BindingSpec(
-            BindingKind.DATA_FLOW, source_step=edge.source_step,
-            source_output=source_output, symbol=f"$flow.{source_output}")
+        target_input, binding = spec
+        incoming[(edge.target_step, target_input)] = binding
     return incoming, errors
+
+
+def _validated_data_flow_spec(
+        edge: Any, source_atomic: Any, target_atomic: Any,
+        incoming: dict[tuple[str, str], BindingSpec],
+        ) -> tuple[tuple[str, BindingSpec] | None, list[str]]:
+    """Validate one edge against authoritative child I/O declarations.
+
+    Edge mapping annotations are audit data only.  They cannot override the
+    source/target Atomic schemas, and duplicate producers fail closed instead
+    of depending on JSON/list iteration order.
+    """
+
+    mapping = dict(getattr(edge, "mapping", None) or {})
+    source_output = str(mapping.get("source_output") or "")
+    target_input = str(mapping.get("target_input") or "")
+    edge_id = str(getattr(edge, "edge_id", "") or "unknown")
+    target_step = str(getattr(edge, "target_step", "") or "")
+    source_step = str(getattr(edge, "source_step", "") or "")
+    errors: list[str] = []
+
+    if not source_output:
+        errors.append(f"data_flow_source_output_missing:{edge_id}")
+    if not target_input:
+        errors.append(f"data_flow_target_input_missing:{target_step}:missing")
+    if errors:
+        return None, errors
+
+    key = (target_step, target_input)
+    if key in incoming:
+        return None, [
+            f"conflicting_data_flow_sources:{target_step}:{target_input}"]
+
+    source_decl = get_output_declaration(source_atomic, source_output)
+    materializer = validate_output_materializer(source_atomic, source_output)
+    if not materializer.passed:
+        errors.append(
+            f"data_flow_output_unmaterializable:{source_step}:"
+            f"{source_output}:{'|'.join(materializer.errors)}")
+
+    target_decl = _input_declaration(target_atomic, target_input)
+    if target_decl is None:
+        errors.append(
+            f"data_flow_target_input_missing:{target_step}:{target_input}")
+
+    transform = str(mapping.get("transform") or "").strip().lower()
+    if transform not in IMPLEMENTED_DATA_FLOW_TRANSFORMS:
+        errors.append(
+            f"unsupported_data_flow_transform:{edge_id}:{transform or 'missing'}")
+
+    if isinstance(source_decl, dict) and isinstance(target_decl, dict):
+        source_type = str(source_decl.get("semantic_type") or "")
+        target_type = str(target_decl.get("semantic_type") or "")
+        declared_source = str(mapping.get("source_semantic_type") or "")
+        declared_target = str(mapping.get("target_semantic_type") or "")
+        declared_schema = str(mapping.get("schema") or "")
+        annotation_mismatch = (
+            (declared_source and source_type and declared_source != source_type)
+            or (declared_target and target_type and declared_target != target_type)
+            or (declared_schema and target_type and declared_schema != target_type)
+        )
+        if not source_type or not target_type:
+            errors.append(f"data_flow_schema_missing:{edge_id}")
+        elif (annotation_mismatch
+                or not _semantic_types_compatible(source_type, target_type)):
+            errors.append(f"data_flow_schema_mismatch:{edge_id}")
+
+    if errors:
+        return None, errors
+    return (target_input, BindingSpec(
+        BindingKind.DATA_FLOW, source_step=source_step,
+        source_output=source_output, symbol=f"$flow.{source_output}")), []
+
+
+def _input_declaration(atomic: Any, name: str) -> dict[str, Any] | None:
+    return next((
+        item for item in list(getattr(atomic, "inputs", []) or [])
+        if isinstance(item, dict) and str(item.get("name") or "") == name
+    ), None)
+
+
+def _semantic_types_compatible(source: str, target: str) -> bool:
+    """Only an explicit generic ``value`` declaration is a wildcard."""
+
+    return bool(source and target) and (
+        source == target or "value" in {source, target})
 
 
 def _resolution_state(requirement: SlotRequirement, spec: BindingSpec,

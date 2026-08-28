@@ -180,17 +180,12 @@ class AtomicSkillGraphSystem:
         self.episode_count += 1
         if trace.success:
             self.success_count += 1
-        node_mode_counts: dict[str, int] = {}
-        executed_node_count = 0
-        already_satisfied_node_count = 0
-        for node in runtime_graph.nodes:
-            if node.execution_status == NodeExecutionStatus.ALREADY_SATISFIED:
-                already_satisfied_node_count += 1
-                continue
-            if not node.attempts and node.validation is None and not node.impl_ref:
-                continue
-            executed_node_count += 1
-            node_mode_counts[node.mode.value] = node_mode_counts.get(node.mode.value, 0) + 1
+        node_metrics = _runtime_node_metrics(runtime_graph)
+        node_mode_counts = dict(node_metrics["node_mode_counts"])
+        executed_node_count = int(node_metrics["executed_node_count"])
+        already_satisfied_node_count = int(
+            node_metrics["already_satisfied_node_count"])
+        completed_node_count = int(node_metrics["completed_node_count"])
         validation_summary = {
             "tool_passed": sum(bool(item.get("passed"))
                                for item in trace.validation_layers.get("tool", [])),
@@ -205,7 +200,7 @@ class AtomicSkillGraphSystem:
         goal_terminal_before_plan_complete = bool(
             trace.success
             and len(runtime_graph.nodes) > 0
-            and executed_node_count < len(runtime_graph.nodes)
+            and completed_node_count < len(runtime_graph.nodes)
         )
         episode = {
             "episode": self.episode_count,
@@ -236,13 +231,15 @@ class AtomicSkillGraphSystem:
             "planned_node_count": len(runtime_graph.nodes),
             "executed_node_count": executed_node_count,
             "already_satisfied_node_count": already_satisfied_node_count,
+            "completed_node_count": completed_node_count,
+            "not_started_node_count": int(node_metrics["not_started_node_count"]),
             # The benchmark may legally terminate before every retrieved node is
             # needed.  Keep this separate from a runtime/tool failure.  This is
             # observable in ALFWorld games whose initial PDDL state already
             # satisfies one component of the natural-language goal.
             "goal_terminal_before_plan_complete": goal_terminal_before_plan_complete,
             "goal_terminal_skipped_node_count": (
-                len(runtime_graph.nodes) - executed_node_count
+                len(runtime_graph.nodes) - completed_node_count
                 if goal_terminal_before_plan_complete else 0
             ),
             "fallback_node_count": sum(bool(node.fallback_reason)
@@ -250,10 +247,26 @@ class AtomicSkillGraphSystem:
             "validation_summary": validation_summary,
             "proposal_replay_count": len(evolution.get("proposal_replays") or []),
             "trace_id": trace.trace_id,
-            "reused_skill_refs": (trace.retrieved_skill_refs
-                                  if trace.start_mode == "warm" else []),
+            # Retrieval is only candidate generation.  Formal reuse evidence
+            # requires a selected registered Atomic to run and pass validation.
+            "retrieved_skill_refs": list(trace.retrieved_skill_refs),
+            "selected_skill_refs": list(node_metrics["selected_skill_refs"]),
+            "executed_skill_refs": list(node_metrics["executed_skill_refs"]),
+            "successful_reused_skill_refs": list(
+                node_metrics["successful_reused_skill_refs"]),
+            "successful_atomic_reuse_count": int(
+                node_metrics["successful_atomic_reuse_count"]),
+            "successful_tool_refs": list(
+                node_metrics["successful_tool_refs"]),
+            # Backward-compatible key, with corrected realized semantics.
+            "reused_skill_refs": list(
+                node_metrics["successful_reused_skill_refs"]),
             "used_tool_refs": list(trace.tool_refs),
-            "cross_task_type_reuse": self._cross_task_type_reuse(task, trace),
+            "cross_task_type_reuse": self._cross_task_type_reuse(
+                task, trace,
+                list(node_metrics["successful_reused_skill_refs"])),
+            "cross_task_type_tool_reuse": self._cross_task_type_tool_reuse(
+                task, list(node_metrics["successful_tool_refs"])),
             "skill_graph": self.registry.stats(),
             "tool_repo": self.tool_registry.stats(),
         }
@@ -266,25 +279,17 @@ class AtomicSkillGraphSystem:
         return sum(int(getattr(client.usage, "total_tokens", 0) or 0)
                    for client in clients.values())
 
-    def _cross_task_type_reuse(self, task: Task, trace: TraceRecord) -> bool:
+    def _cross_task_type_reuse(
+            self, task: Task, trace: TraceRecord,
+            successful_skill_refs: list[str] | None = None) -> bool:
         """是否发生了跨 task_type 的能力复用（§58.3 指标）。"""
-        tool_types: set[str] = set()
-        for tool_ref_text in trace.tool_refs:
-            try:
-                from .core.refs import ToolRef
-                ref = ToolRef.parse(tool_ref_text)
-            except ValueError:
-                continue
-            tool = self.tool_registry.get(ref)
-            if tool is None:
-                continue
-            tool_types |= set(tool.provenance.get("source_task_types") or [])
-        if task.task_type and tool_types and not tool_types.issubset({task.task_type}):
-            return True
-        used_refs = [str(node["ref"]) for node in trace.realized_atomic_nodes
-                     if node.get("ref")]
-        if trace.selected_composite:
-            used_refs.append(trace.selected_composite)
+        # Merely retrieving or planning a node is not reuse evidence.  Formal
+        # metrics pass the Atomics that actually executed and validated.  Keep
+        # the old realized-node fallback only for external callers.
+        used_refs = (list(successful_skill_refs)
+                     if successful_skill_refs is not None else
+                     [str(node["ref"]) for node in trace.realized_atomic_nodes
+                      if node.get("ref")])
         seen_task_skills: set[str] = set()
         for ref_text in used_refs:
             try:
@@ -304,6 +309,23 @@ class AtomicSkillGraphSystem:
             if task.task_type and labels and not labels.issubset({task.task_type}):
                 return True
         return False
+
+    def _cross_task_type_tool_reuse(
+            self, task: Task, successful_tool_refs: list[str]) -> bool:
+        """Successful Direct Tool reuse uses its own denominator and field."""
+        source_types: set[str] = set()
+        for tool_ref_text in successful_tool_refs:
+            try:
+                from .core.refs import ToolRef
+                ref = ToolRef.parse(tool_ref_text)
+            except ValueError:
+                continue
+            tool = self.tool_registry.get(ref)
+            if tool is not None:
+                source_types |= set(
+                    tool.provenance.get("source_task_types") or [])
+        return bool(task.task_type and source_types
+                    and not source_types.issubset({task.task_type}))
 
     # ------------------------------------------------------------------
     # Code / Math 任务
@@ -371,6 +393,10 @@ class AtomicSkillGraphSystem:
                 node.after = after
                 node.attempt_started = True
                 node.executed_action_count = 1
+                node.execution_status = (
+                    NodeExecutionStatus.EXECUTED_SUCCESS
+                    if validation.passed else
+                    NodeExecutionStatus.EXECUTED_FAILURE)
                 node.outputs = (materialize_atomic_outputs(
                     atomic, node.params, task.state, after,
                     tool_result=_execution_output_payload(direct_result))
@@ -1835,6 +1861,80 @@ def _mark_result_action_origin(result: Any, start: int, end: int, *,
     result.actions = actions
 
 
+def _runtime_node_metrics(runtime_graph: RuntimeGraph) -> dict[str, Any]:
+    """Derive execution/reuse metrics from realized occurrence state.
+
+    Selection, execution and successful reuse are deliberately separate.  A
+    planning/budget record with ``started=false`` and an Implementation chosen
+    by the router are not evidence that the Atomic executed.
+    """
+    executed_statuses = {
+        NodeExecutionStatus.EXECUTED_SUCCESS,
+        NodeExecutionStatus.EXECUTED_FAILURE,
+    }
+    node_mode_counts: dict[str, int] = {}
+    executed_node_count = 0
+    already_satisfied_node_count = 0
+    selected_refs: list[str] = []
+    executed_refs: list[str] = []
+    successful_refs: list[str] = []
+    successful_tool_refs: list[str] = []
+    successful_occurrences = 0
+
+    def append_unique(target: list[str], value: str) -> None:
+        if value and value not in target:
+            target.append(value)
+
+    for planned, node in zip(runtime_graph.plan.nodes, runtime_graph.nodes):
+        reusable = not bool(planned.dynamic)
+        if reusable:
+            append_unique(selected_refs, str(planned.ref))
+        if node.execution_status == NodeExecutionStatus.ALREADY_SATISFIED:
+            already_satisfied_node_count += 1
+            continue
+        executed = (
+            node.execution_status in executed_statuses
+            and int(node.executed_action_count or 0) > 0
+        )
+        if not executed:
+            continue
+        executed_node_count += 1
+        started_attempts = [
+            item for item in node.attempts if bool(item.get("started"))]
+        for attempt in started_attempts:
+            if (str(attempt.get("mode") or "") == ExecutionMode.DIRECT.value
+                    and bool(attempt.get("passed"))):
+                for tool_ref in attempt.get("tool_refs") or []:
+                    append_unique(successful_tool_refs, str(tool_ref))
+        mode = (str(started_attempts[-1].get("mode") or "")
+                if started_attempts else node.mode.value)
+        if mode not in {item.value for item in ExecutionMode}:
+            mode = node.mode.value
+        node_mode_counts[mode] = node_mode_counts.get(mode, 0) + 1
+        if reusable:
+            append_unique(executed_refs, str(planned.ref))
+        if (reusable
+                and node.execution_status == NodeExecutionStatus.EXECUTED_SUCCESS):
+            successful_occurrences += 1
+            append_unique(successful_refs, str(planned.ref))
+
+    planned_count = len(runtime_graph.nodes)
+    completed_node_count = min(
+        planned_count, executed_node_count + already_satisfied_node_count)
+    return {
+        "node_mode_counts": node_mode_counts,
+        "executed_node_count": executed_node_count,
+        "already_satisfied_node_count": already_satisfied_node_count,
+        "completed_node_count": completed_node_count,
+        "not_started_node_count": max(0, planned_count - completed_node_count),
+        "selected_skill_refs": selected_refs,
+        "executed_skill_refs": executed_refs,
+        "successful_reused_skill_refs": successful_refs,
+        "successful_atomic_reuse_count": successful_occurrences,
+        "successful_tool_refs": successful_tool_refs,
+    }
+
+
 def _append_planned_runtime_spans(trace: TraceRecord,
                                   runtime_graph: RuntimeGraph) -> None:
     """Persist final occurrence boundaries without merging task-gap spans."""
@@ -1846,18 +1946,29 @@ def _append_planned_runtime_spans(trace: TraceRecord,
                     if bool(item.get("started"))]
         if not attempts:
             continue
-        successful = [item for item in attempts if bool(item.get("passed"))]
-        chosen = successful[-1] if successful else attempts[-1]
+        action_start = min(int(item.get("action_start", 0)) for item in attempts)
+        action_end = max(int(item.get("action_end", 0)) for item in attempts)
+        attempt_spans = [{
+            "mode": str(item.get("mode") or ""),
+            "action_start": int(item.get("action_start", 0)),
+            "action_end": int(item.get("action_end", 0)),
+            "action_count": int(item.get("action_count", 0)),
+            "passed": bool(item.get("passed")),
+            "failure_type": str(item.get("failure_type") or ""),
+            "failure_stage": str(item.get("failure_stage") or ""),
+            "failure_cause": str(item.get("failure_cause") or ""),
+        } for item in attempts]
         key = ("planned_node", node.occurrence_id)
         if key in existing:
             continue
         trace.runtime_spans.append(RuntimeSpan(
             kind="planned_node", occurrence_id=node.occurrence_id,
-            action_start=int(chosen.get("action_start", 0)),
-            action_end=int(chosen.get("action_end", 0)),
+            action_start=action_start,
+            action_end=action_end,
             node_ref=node.ref, learnable=True,
             metadata={"step_id": node.step_id,
-                      "execution_status": node.execution_status.value},
+                      "execution_status": node.execution_status.value,
+                      "attempt_spans": attempt_spans},
         ))
     trace.runtime_spans.sort(
         key=lambda span: (span.action_start, span.action_end, span.kind))

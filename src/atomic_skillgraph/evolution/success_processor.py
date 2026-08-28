@@ -167,11 +167,6 @@ class SuccessProcessor:
                 result.notes.append(
                     f"tool_mining_blocked_benchmark_finalization:{atomic_ref.logical_id}")
                 continue
-            if (source_kind == "task_gap"
-                    and revision.revision_kind == "implementation_repair"):
-                result.notes.append(
-                    f"tool_mining_deferred_to_implementation_repair:{atomic_ref.logical_id}")
-                continue
             is_env_segment = (str(segment.get("kind") or "") == "env"
                               or trace.benchmark in ("alfworld", "toy_env"))
             safe_event_slice = (bool(segment.get("event_slice_validated"))
@@ -217,8 +212,7 @@ class SuccessProcessor:
                           == "llm_proposal_code_validated")
         allow_mock_fallback = bool(self.config.llm.mock)
         revision_blocks_composite = revision.revision_kind in {
-            "implementation_repair", "benchmark_finalization_only",
-            "observation_only_gap"}
+            "benchmark_finalization_only", "observation_only_gap"}
         build_atomic_refs = list(atomic_refs)
         build_segments = list(segments)
         if revision.revision_kind in {
@@ -288,14 +282,12 @@ class SuccessProcessor:
             result.notes.append("composite_skipped:semantic_extraction_not_validated")
 
         if (revision.task_gap_proved_missing_effect
-                and revision.revision_kind != "implementation_repair"
                 and not result.composite.get("composite")):
-            suppressed = self.composite_builder.revision_builder \
-                .suppress_proven_incomplete_parent(
-                    revision, trace_id=trace.trace_id)
-            if suppressed:
-                result.notes.append(
-                    f"selected_composite_suppressed_without_replacement:{suppressed}")
+            # A proof that the selected parent was incomplete is not itself a
+            # verified replacement.  Keep the parent available until a revised
+            # candidate reaches Active through independent support/replay.
+            result.notes.append(
+                "selected_composite_retained_until_active_replacement")
 
         # 6. 语义证据已在 apply（Abstract statistics）与 record 中更新
 
@@ -504,7 +496,9 @@ def _revision_build_inputs(revision, registry) \
     """
     refs: list[SkillRef] = []
     segments: list[dict[str, Any]] = []
-    occurrences = list(getattr(revision, "realized_occurrences", None) or [])
+    occurrences = list(
+        getattr(revision, "canonical_occurrences", None)
+        or getattr(revision, "realized_occurrences", None) or [])
     if len(occurrences) < 2:
         return None
     for index, occurrence in enumerate(occurrences):

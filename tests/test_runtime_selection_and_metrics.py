@@ -9,21 +9,27 @@ from atomic_skillgraph.core.status import ArtifactKind, SkillStatus, ToolLifecyc
 from atomic_skillgraph.core.tool_ir import ToolAsset
 from atomic_skillgraph.graph.registry import SkillGraphRegistry
 from atomic_skillgraph.runtime.implementation_selector import ImplementationSelector
+from atomic_skillgraph.tools.admission_adapter import AdmissionEngine
 from atomic_skillgraph.tools.registry import ToolRegistry
 from atomic_skillgraph.tools.resolver import ToolResolver
 from experiments.report import summarize_episodes
 
 
 def _action_tool(tool_id: str, steps: list[str]) -> ToolAsset:
-    return ToolAsset(
+    parameters = [{"name": "fixture"}]
+    if any("{fixture_location}" in step for step in steps):
+        parameters.append({"name": "fixture_location"})
+    tool = ToolAsset(
         ref=ToolRef(tool_id, "1.0.0"),
         artifact_kind=ArtifactKind.ACTION_TEMPLATE,
         summary="generic verified transition",
-        signature={"parameters": [{"name": "fixture"},
-                                   {"name": "fixture_location"}]},
+        signature={"parameters": parameters},
         artifact={"steps": steps},
         status=ToolLifecycle.CANDIDATE,
     )
+    assert AdmissionEngine(
+        replay_fn=lambda *_args: {"passed": True}).admit(tool).passed
+    return tool
 
 
 def test_prepared_context_prefers_structurally_minimal_tool(workspace_tmp):
@@ -93,6 +99,8 @@ def test_selector_discovers_location_slot_from_learned_tool_contract(workspace_t
         artifact={"steps": [
             "move near {fixture_location}", "engage {fixture}"]},
         status=ToolLifecycle.CANDIDATE)
+    assert AdmissionEngine(
+        replay_fn=lambda *_args: {"passed": True}).admit(tool).passed
     tools.register(tool)
     impl = ImplementationAtom(
         ref=SkillRef("impl.generic.fixture_engaged", "1.0.0"),

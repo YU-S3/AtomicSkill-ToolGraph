@@ -13,6 +13,7 @@ from atomic_skillgraph.evolution.branch_repair import FailureBranchManager
 from atomic_skillgraph.evolution.failure_processor import FailureProcessor
 from atomic_skillgraph.graph.registry import SkillGraphRegistry
 from atomic_skillgraph.system import AtomicSkillGraphSystem
+from atomic_skillgraph.tools.admission_adapter import AdmissionEngine
 from atomic_skillgraph.tools.registry import ToolRegistry
 
 
@@ -87,6 +88,8 @@ def _bank(root: Path, *, effect_predicate: str = "object.done"):
                     "failure_count": 0, "utility": 0.5},
         status=ToolLifecycle.CANDIDATE,
     )
+    assert AdmissionEngine(
+        replay_fn=lambda *_args: {"passed": True}).admit(tool).passed
     tools.register(tool)
     tools.set_status(tool.ref, ToolLifecycle.ACTIVE)
     impl = ImplementationAtom(
@@ -183,6 +186,40 @@ def test_atomic_failure_is_not_double_counted_as_task_evidence(workspace_tmp):
     assert stats["failure_count"] == 1
     assert stats["task_failure_count"] == 1
     assert stats["task_use_count"] == 1
+
+
+def test_repeated_failure_mode_retains_each_occurrence_evidence(workspace_tmp):
+    root = workspace_tmp / "repeated_failure_evidence"
+    registry, tools, atomic, _tool = _bank(root)
+    processor = FailureProcessor(
+        registry, tools, SystemConfig(data_dir=root))
+
+    for index, object_value in enumerate(("apple_1", "plate_2")):
+        trace = TraceRecord(
+            trace_id=f"failure_trace_{index}", task_id=f"failed_{index}",
+            task_type="toy", benchmark="toy_env", success=False,
+            realized_atomic_nodes=[{
+                "ref": str(atomic.ref), "passed": False,
+                "params": {"object": object_value},
+                "attempt_started": True, "executed_action_count": 1,
+                "attempts": [{
+                    "mode": "dynamic", "started": True, "passed": False,
+                    "failure_stage": "execution", "action_start": 0,
+                    "action_end": 1, "action_count": 1,
+                }],
+            }],
+        )
+        processor.process_failure(trace)
+
+    saved = registry.get(atomic.ref)
+    assert saved is not None
+    assert len(saved.failure_modes) == 1
+    mode = saved.failure_modes[0]
+    assert mode["occurrence_count"] == 2
+    assert mode["source_trace_ids"] == ["failure_trace_0", "failure_trace_1"]
+    assert len(mode["evidence_refs"]) == 2
+    assert all(registry.evidence_store.get(pointer) is not None
+               for pointer in mode["evidence_refs"])
 
 
 def test_successful_atomic_is_not_penalized_by_downstream_task_failure(workspace_tmp):

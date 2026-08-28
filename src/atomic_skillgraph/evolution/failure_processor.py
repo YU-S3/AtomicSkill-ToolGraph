@@ -124,12 +124,50 @@ class FailureProcessor:
             stats = dict(atomic.metadata.get("statistics") or {})
             stats["failure_count"] = int(stats.get("failure_count", 0)) + 1
             atomic.metadata["statistics"] = stats
+            # The complete failed occurrence is private replay evidence.  A
+            # portable Skill records only a categorical failure mode and an
+            # opaque reference; validator messages often contain concrete
+            # objects, paths, observations, or other task data.
+            failure_ref = self.registry.evidence_store.put(
+                "atomic_failure",
+                {"node": node, "failure_type": trace.failure_type},
+                trace_id=trace.trace_id,
+            )
             # 失败模式记录（§33.1 add_failure_mode）
             failure_modes = list(atomic.failure_modes)
             mode_name = _failure_mode_of(node)
-            if mode_name and mode_name not in {str(m.get("name")) for m in failure_modes}:
-                failure_modes.append({"name": mode_name,
-                                      "source_trace_id": trace.trace_id})
+            matching = next(
+                (item for item in failure_modes
+                 if str(item.get("name") or "") == mode_name), None)
+            if mode_name and matching is None:
+                failure_modes.append({
+                    "name": mode_name,
+                    "source_trace_ids": [trace.trace_id],
+                    "evidence_refs": [failure_ref],
+                    "occurrence_count": 1,
+                })
+                atomic.failure_modes = failure_modes
+            elif mode_name and matching is not None:
+                # Migrate the former singular representation in memory and
+                # retain every repeated occurrence.  A categorical failure
+                # mode may recur, but each supporting trace must remain
+                # reachable through its own private evidence pointer.
+                trace_ids = list(matching.get("source_trace_ids") or [])
+                legacy_trace = str(matching.pop("source_trace_id", "") or "")
+                if legacy_trace and legacy_trace not in trace_ids:
+                    trace_ids.append(legacy_trace)
+                if trace.trace_id and trace.trace_id not in trace_ids:
+                    trace_ids.append(trace.trace_id)
+                refs = list(matching.get("evidence_refs") or [])
+                legacy_ref = matching.pop("evidence_ref", None)
+                if isinstance(legacy_ref, dict) and legacy_ref not in refs:
+                    refs.append(legacy_ref)
+                if failure_ref not in refs:
+                    refs.append(failure_ref)
+                matching["source_trace_ids"] = trace_ids
+                matching["evidence_refs"] = refs
+                matching["occurrence_count"] = int(
+                    matching.get("occurrence_count") or 1) + 1
                 atomic.failure_modes = failure_modes
             self.registry.update_runtime_state(atomic)
             result.evidence_updates.append(f"atomic_failure_evidence:{ref.logical_id}")
@@ -172,8 +210,21 @@ class FailureProcessor:
 
 
 def _failure_mode_of(node: dict[str, Any]) -> str:
-    validation = node.get("validation") or {}
-    messages = validation.get("messages") or []
-    if messages:
-        return str(messages[0])[:80]
-    return ""
+    """Return an instance-free categorical failure identity."""
+    import re
+    attempts = [item for item in (node.get("attempts") or [])
+                if item.get("started") and not item.get("passed")]
+    stage = next((str(item.get("failure_stage") or "")
+                  for item in attempts if item.get("failure_stage")), "")
+    mode = next((str(item.get("mode") or "")
+                 for item in attempts if item.get("mode")), "")
+    status = str(node.get("execution_status") or "")
+
+    def token(value: str) -> str:
+        normalized = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+        # Status/stage/mode are framework enums.  Reject anything that looks
+        # like a concrete environment instance rather than persisting it.
+        return "" if re.search(r"(?:^|_)\w+_\d+(?:_|$)", normalized) else normalized
+
+    parts = [item for item in (token(stage), token(mode), token(status)) if item]
+    return ":".join(parts[:3]) or "effect_validation_failed"

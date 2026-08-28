@@ -82,16 +82,18 @@ class InsightUpdater:
         for trace in traces:
             for action in trace.actions:
                 payload = action.to_dict() if hasattr(action, "to_dict") else dict(action)
-                for role, value in (payload.get("params") or {}).items():
-                    family = _entity_family(value)
-                    if not family:
+                for role in (payload.get("params") or {}):
+                    portable_role = _portable_role(role)
+                    if not portable_role:
                         continue
-                    role_counter[(str(role), family)] += 1
-                    if any(token in str(role).lower()
-                           for token in ("location", "place", "station", "source", "destination")):
-                        location_counter[family] += 1
+                    role_counter[portable_role] += 1
+                    if any(token in portable_role
+                           for token in ("location", "place", "station",
+                                         "source", "destination")):
+                        location_counter[portable_role] += 1
             # 常见 pitfall：重复动作（机械重复 = 搜索低效信号）
-            action_names = [a.name for a in trace.actions]
+            action_names = [str(a.name or "").strip().lower()
+                            for a in trace.actions]
             for i in range(len(action_names) - 1):
                 if action_names[i] == action_names[i + 1]:
                     pitfall_counter[action_names[i]] += 1
@@ -99,13 +101,13 @@ class InsightUpdater:
         common_locations = [name for name, count in location_counter.most_common(5) if count >= 1]
         search_priority = [name for name, _count in location_counter.most_common(8)]
         environment_facts = [
-            f"role {role} repeatedly binds entity family {family}"
-            for (role, family), count in role_counter.most_common(5) if count >= 2
+            f"semantic role {role} recurs across validated occurrences"
+            for role, count in role_counter.most_common(5) if count >= 2
         ]
         common_pitfalls = []
         if pitfall_counter:
-            top_action = pitfall_counter.most_common(1)[0][0]
-            common_pitfalls.append(f"重复执行 {top_action} 动作会增加步数开销，先确认目标状态再行动")
+            common_pitfalls.append(
+                "重复执行同一动作会增加步数开销，先确认目标状态再行动")
         return {
             "layer": 3,
             "sample_count": len(traces),
@@ -117,7 +119,11 @@ class InsightUpdater:
         }
 
 
-def _entity_family(value: Any) -> str:
+def _portable_role(value: Any) -> str:
     import re
-    normalized = re.sub(r"\s+", "_", str(value or "").strip().lower())
-    return re.sub(r"_\d+$", "", normalized)
+    normalized = re.sub(r"[^a-z0-9_]+", "_",
+                        str(value or "").strip().lower()).strip("_")
+    # Roles describe slots, not values. Numbered names are occurrence-local
+    # and stay in Trace evidence.
+    return normalized if re.fullmatch(r"[a-z][a-z0-9_]*", normalized) \
+        and not re.search(r"_\d+$", normalized) else ""

@@ -27,7 +27,9 @@ from ..core.skill_ir import (
     load_skill_from_dict,
 )
 from ..core.status import EdgeType, SkillNodeKind, SkillStatus
+from ..evidence_store import EvidenceStore
 from ..persistence import atomic_write_json
+from ..persistence_guard import validate_long_term_asset
 
 _SKILL_KIND_DIR = {
     SkillNodeKind.ABSTRACT_ATOMIC: "abstract_atomic",
@@ -61,6 +63,8 @@ class SkillGraphRegistry:
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
         self.graph_path = self.root / "graph.json"
+        self.evidence_store = EvidenceStore(
+            self.root.parent / "evidence" / "skill_traces")
         self.root.mkdir(parents=True, exist_ok=True)
         if not self.graph_path.exists():
             self._write_graph({"nodes": {}, "edges": []})
@@ -80,6 +84,12 @@ class SkillGraphRegistry:
         return raw
 
     def _write_graph(self, graph: dict[str, Any]) -> None:
+        findings = validate_long_term_asset(
+            graph, asset_kind="skill_graph_index")
+        if findings:
+            raise ValueError(
+                "long_term_asset_guard_failed:skill_graph_index:"
+                + ";".join(findings[:12]))
         atomic_write_json(self.graph_path, graph)
 
     def _version_path(self, kind: SkillNodeKind, logical_id: str, version: str) -> Path:
@@ -96,7 +106,14 @@ class SkillGraphRegistry:
 
     def _save_obj(self, obj) -> SkillRef:
         path = self._version_path(obj.kind, obj.ref.logical_id, obj.ref.version)
-        atomic_write_json(path, obj.to_dict())
+        payload = obj.to_dict()
+        findings = validate_long_term_asset(
+            payload, asset_kind=f"skill:{obj.kind.value}")
+        if findings:
+            raise ValueError(
+                "long_term_asset_guard_failed:"
+                f"{obj.ref}:" + ";".join(findings[:12]))
+        atomic_write_json(path, payload)
         return obj.ref
 
     def _touch(self) -> None:

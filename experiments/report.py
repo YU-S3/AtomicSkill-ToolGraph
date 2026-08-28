@@ -27,8 +27,36 @@ def summarize_episodes(episodes: list[dict[str, Any]]) -> dict[str, Any]:
     direct_episodes = sum(1 for e in episodes if int(e.get("direct_reuse_count", 0)) > 0)
     seeded_episodes = sum(1 for e in episodes if int(e.get("seeded_generation_count", 0)) > 0)
     dynamic_episodes = sum(1 for e in episodes if int(e.get("dynamic_generation_count", 0)) > 0)
-    reuse_episodes = sum(1 for e in episodes if e.get("reused_skill_refs"))
+    def successful_reuse_refs(episode: dict[str, Any]) -> list[Any]:
+        # New episodes distinguish retrieval from realized reuse.  Fall back
+        # only for historical result files that predate the explicit field.
+        if "successful_reused_skill_refs" in episode:
+            return list(episode.get("successful_reused_skill_refs") or [])
+        return list(episode.get("reused_skill_refs") or [])
+
+    def completed_nodes(episode: dict[str, Any]) -> int:
+        if "completed_node_count" in episode:
+            return int(episode.get("completed_node_count", 0))
+        return (int(episode.get("executed_node_count", 0))
+                + int(episode.get("already_satisfied_node_count", 0)))
+
+    def goal_ended_before_plan_complete(episode: dict[str, Any]) -> bool:
+        planned = int(episode.get("planned_node_count", 0))
+        if planned > 0:
+            # Recompute from the corrected completion definition instead of
+            # trusting a stale flag emitted by older buggy runs.
+            return bool(episode.get("success")) and completed_nodes(episode) < planned
+        return bool(episode.get("goal_terminal_before_plan_complete"))
+
+    reuse_episodes = sum(1 for e in episodes if successful_reuse_refs(e))
+    successful_atomic_reuse_count = sum(
+        int(e.get("successful_atomic_reuse_count", 0))
+        for e in episodes)
     cross_type = sum(1 for e in episodes if e.get("cross_task_type_reuse"))
+    successful_tool_reuse_episodes = sum(
+        1 for e in episodes if e.get("successful_tool_refs"))
+    cross_type_tool = sum(
+        1 for e in episodes if e.get("cross_task_type_tool_reuse"))
     retries = sum(int(e.get("retries", 0)) for e in episodes)
     first_attempt = sum(1 for e in episodes
                         if e.get("success") and int(e.get("retries", 0)) == 0)
@@ -67,32 +95,21 @@ def summarize_episodes(episodes: list[dict[str, Any]]) -> dict[str, Any]:
         == int(e.get("executed_node_count", 0)))
     goal_early_terminal_episodes = sum(
         1 for e in episodes
-        if bool(e.get("goal_terminal_before_plan_complete"))
-        or (
-            bool(e.get("success"))
-            and int(e.get("planned_node_count", 0)) > 0
-            and int(e.get("executed_node_count", 0))
-            < int(e.get("planned_node_count", 0))
-        )
+        if goal_ended_before_plan_complete(e)
     )
     goal_terminal_skipped_nodes = sum(
-        max(0, int(e.get("planned_node_count", 0))
-            - int(e.get("executed_node_count", 0)))
+        max(0, int(e.get("planned_node_count", 0)) - completed_nodes(e))
         for e in episodes
-        if bool(e.get("goal_terminal_before_plan_complete"))
-        or (
-            bool(e.get("success"))
-            and int(e.get("planned_node_count", 0)) > 0
-            and int(e.get("executed_node_count", 0))
-            < int(e.get("planned_node_count", 0))
-        )
+        if goal_ended_before_plan_complete(e)
     )
     return {
         "num_tasks": n,
         "num_passed": successes,
         "success_rate": round(successes / n, 4),
         "late_run_success_rate": round(late_successes / max(len(late), 1), 4),
-        "first_attempt_success_rate": round(first_attempt / max(successes, 1), 4),
+        "first_attempt_success_rate": round(first_attempt / n, 4),
+        "first_attempt_success_given_success": round(
+            first_attempt / max(successes, 1), 4),
         "avg_retries": round(retries / n, 3),
         "avg_tokens_per_task": round(sum(tokens) / n, 1),
         "total_tokens": sum(tokens),
@@ -118,9 +135,16 @@ def summarize_episodes(episodes: list[dict[str, Any]]) -> dict[str, Any]:
         "seeded_episode_rate": round(seeded_episodes / n, 4),
         "dynamic_episode_rate": round(dynamic_episodes / n, 4),
         "atomic_reuse_rate": round(reuse_episodes / n, 4),
+        "successful_atomic_reuse_count": successful_atomic_reuse_count,
         "cross_task_type_reuse_rate": round(cross_type / max(reuse_episodes, 1), 4)
         if reuse_episodes else 0.0,
         "cross_task_type_reuse_episodes": cross_type,
+        "successful_tool_reuse_episode_rate": round(
+            successful_tool_reuse_episodes / n, 4),
+        "cross_task_type_tool_reuse_rate": round(
+            cross_type_tool / max(successful_tool_reuse_episodes, 1), 4)
+        if successful_tool_reuse_episodes else 0.0,
+        "cross_task_type_tool_reuse_episodes": cross_type_tool,
         "admission_pass": admission_pass,
         "admission_shadow": admission_shadow,
         "admission_pass_rate": round(admission_pass / max(admission_pass + admission_shadow, 1), 4),

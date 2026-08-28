@@ -3,6 +3,7 @@ from atomic_skillgraph.core.refs import SkillRef, ToolRef
 from atomic_skillgraph.core.skill_ir import ImplementationAtom, ToolBinding
 from atomic_skillgraph.core.status import ArtifactKind, SkillStatus, ToolLifecycle
 from atomic_skillgraph.core.tool_ir import ToolAsset
+from atomic_skillgraph.tools.admission_adapter import AdmissionEngine
 from atomic_skillgraph.tools.registry import ToolRegistry
 from atomic_skillgraph.tools.resolver import ToolResolver
 
@@ -21,6 +22,8 @@ def test_resolver_requires_exact_tool_version_and_concrete_values(workspace_tmp)
         summary="take an object",
         signature={"parameters": [{"name": "object"}]},
         artifact={"steps": ["take {object}"]}, status=ToolLifecycle.CANDIDATE)
+    assert AdmissionEngine(
+        replay_fn=lambda *_args: {"passed": True}).admit(tool).passed
     tools.register(tool)
     impl = ImplementationAtom(
         ref=SkillRef("impl.take", "1.0.0"),

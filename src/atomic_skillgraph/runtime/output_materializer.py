@@ -84,6 +84,35 @@ def validate_output_materializer(
         if not predicate or not arg or not any(
                 arg in dict(effect.get("args") or {}) for effect in matches):
             errors.append(f"materializer_effect_arg_missing:{predicate}:{arg}")
+        else:
+            # The value selected by an Effect argument normally originates
+            # from one declared input role.  A declaration cannot relabel an
+            # object-valued role as a location (or vice versa) merely by
+            # changing output.semantic_type.
+            roles = {
+                binding_slot_name(dict(effect.get("args") or {}).get(arg))
+                for effect in matches
+                if arg in dict(effect.get("args") or {})
+            }
+            roles.discard("")
+            output_type = str(declaration.get("semantic_type") or "")
+            input_types = {
+                str(item.get("semantic_type") or "")
+                for role in roles
+                for item in [_input_declaration(atomic, role)]
+                if isinstance(item, dict)
+            }
+            if len(roles) > 1:
+                errors.append(
+                    f"materializer_effect_arg_ambiguous_roles:{predicate}:{arg}")
+            elif any(output_type and input_type
+                     and "value" not in {output_type, input_type}
+                     and output_type != input_type
+                     for input_type in input_types):
+                source_type = next(iter(input_types), "")
+                errors.append(
+                    f"materializer_semantic_type_mismatch:"
+                    f"{source_type}->{output_type}")
     elif kind == "tool_result":
         key = str(materializer.get("key") or "")
         if not key:

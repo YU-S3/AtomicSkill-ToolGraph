@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from ..core.binding_ir import is_concrete_binding
-from ..core.status import ArtifactKind, ValidationLevel
+from ..core.status import ArtifactKind, ToolLifecycle, ValidationLevel
 from ..core.tool_ir import ToolAsset
 from ..tools import sandbox as _sandbox_mod
 
@@ -59,6 +59,22 @@ class ToolValidator:
         if missing:
             result.messages.append(f"缺少必填参数：{missing}")
 
+        certificate_present = bool(
+            (tool.safety or {}).get("admission_certificate"))
+        certificate_valid = tool.admission_certificate_valid()
+        certificate_required = tool.status in {
+            ToolLifecycle.CANDIDATE,
+            ToolLifecycle.ACTIVE,
+            ToolLifecycle.PREFERRED,
+        }
+        if certificate_present or certificate_required:
+            checks["admission_certificate"] = certificate_valid
+            if not certificate_valid:
+                result.messages.append(
+                    "可用状态 Tool 缺少有效 Admission certificate"
+                    if not certificate_present else
+                    "Admission certificate 与当前 Tool 内容不一致")
+
         if tool.artifact_kind == ArtifactKind.ACTION_TEMPLATE:
             # 模板可实例化：所有 slot 都有值
             steps = tool.artifact.get("steps") or []
@@ -67,20 +83,44 @@ class ToolValidator:
             checks["template_instantiable"] = not unbound
             if unbound:
                 result.messages.append(f"模板 slot 未绑定：{sorted(unbound)}")
+            live_replay_passed = False
             if self.replay_fn is not None:
                 replay = self.replay_fn(tool, inputs or {}, {})
-                checks["template_executed"] = bool(replay.get("passed"))
+                live_replay_passed = bool(replay.get("passed"))
+                checks["template_executed"] = live_replay_passed
                 result.result["after"] = replay.get("after") or {}
                 if not replay.get("passed"):
                     result.messages.append(f"模板执行失败：{replay.get('reason', 'unknown')}")
+            # Merely possessing a replay payload is not proof that this
+            # validator executed it.  Action templates therefore require
+            # either a successful live replay or the immutable Admission
+            # certificate.  This makes stripped/tampered frozen banks fail
+            # closed just like Python callables.
+            checks["evidence_or_certificate"] = bool(
+                live_replay_passed or certificate_valid)
+            if not checks["evidence_or_certificate"]:
+                if tool.has_unresolved_test_evidence():
+                    result.messages.append(
+                        "本地 replay evidence 不可用且 Admission certificate 无效")
+                else:
+                    result.messages.append(
+                        "未执行环境 replay 且无有效 Admission certificate")
         else:
             # python_callable：单测/replay 执行
             test_cases: list[str] = []
-            for case in tool.replay_cases():
+            available_cases = tool.all_test_cases()
+            for case in available_cases:
+                if case.get("kind") == "parameterized_replay":
+                    continue
                 test_cases.extend(case.get("tests") or [])
+            parameterized_cases = [
+                case for case in available_cases
+                if case.get("kind") == "parameterized_replay"]
+            executed_any = bool(test_cases or parameterized_cases)
+            replay_passed = True
             if test_cases:
                 run = self.sandbox.run_tests(tool.artifact_body(), test_cases)
-                checks["replay_tests"] = run["passed"]
+                replay_passed = replay_passed and bool(run["passed"])
                 result.result["run"] = {
                     "passed_count": run["passed_count"],
                     "total": run["total"],
@@ -90,6 +130,26 @@ class ToolValidator:
                 if not run["passed"]:
                     result.messages.append(
                         f"replay 测试未通过：{run['passed_count']}/{run['total']}")
+            parameterized_result = _run_parameterized_replay(
+                self.sandbox, tool.artifact_body(), parameterized_cases)
+            if parameterized_cases:
+                replay_passed = replay_passed and parameterized_result["passed"]
+                result.result["parameterized_replay"] = parameterized_result
+                if not parameterized_result["passed"]:
+                    result.messages.append(
+                        "parameterized replay 未通过："
+                        f"{parameterized_result['passed_count']}/"
+                        f"{parameterized_result['total']}")
+            if executed_any:
+                checks["replay_tests"] = replay_passed
+            elif tool.has_unresolved_test_evidence() and certificate_valid:
+                # Frozen/exported banks intentionally omit private replay
+                # payloads.  The certificate binds the passed Admission to the
+                # exact artifact, signature, interface and evidence hashes.
+                checks["replay_tests"] = True
+                checks["evidence_or_certificate"] = True
+                result.messages.append(
+                    "本地 replay evidence 不可用；使用有效 Admission certificate")
             else:
                 checks["replay_tests"] = False
                 result.messages.append("无可用 replay 测试")
@@ -106,3 +166,32 @@ class ToolValidator:
 def _extract_slots(step: str) -> set[str]:
     import re
     return set(re.findall(r"\{([a-z_][a-z0-9_]*)\}", str(step)))
+
+
+def _run_parameterized_replay(sandbox, code: str,
+                              cases: list[dict[str, Any]]) -> dict[str, Any]:
+    passed_count = 0
+    total = 0
+    failures: list[dict[str, Any]] = []
+    for case in cases:
+        for binding in (case.get("bindings") or []):
+            total += 1
+            assignments = "\n".join(
+                f"{key} = {value!r}"
+                for key, value in (binding.get("value") or {}).items())
+            harness = code.rstrip() + "\n" + assignments + "\n"
+            run = sandbox.run_tests(harness, binding.get("tests") or [])
+            if run["passed"]:
+                passed_count += 1
+            else:
+                failures.append({
+                    "value": dict(binding.get("value") or {}),
+                    "failures": list(run.get("failures") or []),
+                    "timeout": bool(run.get("timeout")),
+                })
+    return {
+        "passed": bool(cases) and total > 0 and passed_count == total,
+        "passed_count": passed_count,
+        "total": total,
+        "failures": failures,
+    }

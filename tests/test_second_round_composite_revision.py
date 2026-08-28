@@ -234,7 +234,7 @@ def test_suppressed_recommendation_falls_back_to_best_active(workspace_tmp):
     assert registry.get_recommended("cap.versioned").ref == old.ref
 
 
-def test_task_gap_revision_derives_new_graph_and_suppresses_exact_parent(
+def test_task_gap_revision_keeps_parent_until_replacement_is_active(
         workspace_tmp):
     registry = SkillGraphRegistry(workspace_tmp / "revision")
     first, second, inserted = (
@@ -294,7 +294,8 @@ def test_task_gap_revision_derives_new_graph_and_suppresses_exact_parent(
         [first.ref, second.ref, inserted.ref], trace,
         segments=segments, revision=revision)
     assert result.composite is not None
-    assert registry.get(old.ref).status == SkillStatus.SUPPRESSED
+    assert result.composite.status == SkillStatus.DRAFT
+    assert registry.get(old.ref).status == SkillStatus.ACTIVE
     lineage = [edge for edge in registry.edge_objects(EdgeType.DERIVED_FROM)
                if edge.source == str(result.composite.ref)]
     assert [edge.target for edge in lineage] == [str(old.ref)]

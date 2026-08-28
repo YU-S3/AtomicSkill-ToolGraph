@@ -94,14 +94,9 @@ def extract_effect(before: dict[str, Any], after: dict[str, Any],
         result.suggested_name = name
         result.summary = summary
 
-    # 输出：从正向效果参数推断
-    output_names: list[str] = []
-    for effect in positive:
-        for key, value in (effect.get("args") or {}).items():
-            if key not in output_names and value not in output_names:
-                output_names.append(key)
-    result.outputs = [{"name": name, "semantic_type": _semantic_type_of(name)}
-                      for name in output_names]
+    # 输出：每个声明在创建时就固定到已验证 Effect 参数。后续 DATA_FLOW
+    # 不再依赖按名称猜测来源。
+    result.outputs = output_declarations_from_effects(positive)
 
     # 输入：绑定参数
     result.inputs = [{"name": key, "semantic_type": _semantic_type_of(key)}
@@ -140,6 +135,43 @@ def extract_effect(before: dict[str, Any], after: dict[str, Any],
         "post_checks": sorted({str(p.get("predicate")) for p in positive}),
     }
     return result
+
+
+def output_declarations_from_effects(
+        effects: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Create deterministic, explicitly materialized output declarations.
+
+    Semantic splitting normally leaves one producer per argument.  If several
+    verified Effects expose the same argument name, keep it only when they
+    select the same value/role; otherwise omit the ambiguous output so a bad
+    DATA_FLOW edge cannot be synthesized from a guessed producer.
+    """
+
+    producers: dict[str, list[tuple[str, Any]]] = {}
+    for effect in effects or []:
+        if not isinstance(effect, dict):
+            continue
+        predicate = str(effect.get("predicate") or "")
+        for arg, value in dict(effect.get("args") or {}).items():
+            producers.setdefault(str(arg), []).append((predicate, value))
+
+    declarations: list[dict[str, Any]] = []
+    for name in sorted(producers):
+        candidates = producers[name]
+        values = {repr(value) for _predicate, value in candidates}
+        if len(values) != 1:
+            continue
+        predicate, _value = candidates[0]
+        declarations.append({
+            "name": name,
+            "semantic_type": _semantic_type_of(name),
+            "materializer": {
+                "kind": "effect_arg",
+                "predicate": predicate,
+                "arg": name,
+            },
+        })
+    return declarations
 
 
 def _has_input_reference(predicate: dict[str, Any]) -> bool:

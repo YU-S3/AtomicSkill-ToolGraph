@@ -22,6 +22,7 @@ from ..graph.aligner import (
     align_atomic,
 )
 from ..graph.registry import SkillGraphRegistry
+from ..runtime.output_materializer import validate_output_materializer
 from .boundary_detector import detect_boundaries
 from .effect_extractor import (
     _FACT_FAMILY_NAMES,
@@ -29,6 +30,7 @@ from .effect_extractor import (
     _semantic_type_of,
     ExtractedEffect,
     extract_effect,
+    output_declarations_from_effects,
     parameterize_predicates,
 )
 from .split_score import SplitScoreResult, compute_split_score
@@ -168,16 +170,36 @@ class TraceAtomicizer:
         parameterized_negative_effects = _parameterize_negative_effects(
             effect.negative, bound_params)
 
-        proposed_alias = str(segment.get("proposed_intent") or segment.get("name") or "")
-        observed_families = {
-            str(key): [_entity_family(value)]
-            for key, value in bound_params.items() if value not in (None, "")
-        }
-        return AbstractAtomicSkill(
+        # Store the grounded occurrence in the local Evidence Store.  The
+        # portable Atomic node contains only generalized contracts plus an
+        # opaque content-addressed reference.
+        occurrence_ref = self.registry.evidence_store.put(
+            "atomic_occurrence",
+            {
+                "segment": segment,
+                "positive_effects": effect.positive,
+                "negative_effects": effect.negative,
+                "preconditions": effect.preconditions,
+            },
+            trace_id=trace.trace_id,
+            event_start=_optional_int(segment.get("event_start")),
+            event_end=_optional_int(segment.get("event_end")),
+        )
+        # Raw LLM aliases and entity values are occurrence evidence even when
+        # they do not carry a numeric suffix (for example a customer name).
+        # The portable alias is therefore the code-derived Effect identity.
+        safe_aliases = {segment_name: 1} if segment_name else {}
+        portable_negative_effects = [
+            item for item in parameterized_negative_effects
+            if _fully_portable_predicate(item)
+        ]
+        portable_outputs = output_declarations_from_effects(
+            parameterized_effects)
+        skill = AbstractAtomicSkill(
             ref=SkillRef(logical_id=logical_id, version="1.0.0"),
             summary=effect.summary or f"原子能力：{segment_name}",
             inputs=effect.inputs,
-            outputs=effect.outputs,
+            outputs=portable_outputs,
             preconditions=parameterized_preconditions,
             effects=parameterized_effects,
             validator=effect.validator,
@@ -199,12 +221,13 @@ class TraceAtomicizer:
                     "support_count": 1,
                 },
                 "benchmark": trace.benchmark,
-                "semantic_alias_counts": ({proposed_alias: 1} if proposed_alias else {}),
-                "observed_parameter_families": observed_families,
+                "semantic_alias_counts": safe_aliases,
+                "observed_parameter_families": {},
                 # Negative deltas are occurrence evidence used for causal and
                 # terminal-effect closure. They are not inferred from the
                 # capability name and remain auditable after registration.
-                "observed_negative_effects": parameterized_negative_effects,
+                "observed_negative_effects": portable_negative_effects,
+                "occurrence_evidence_refs": [occurrence_ref],
                 "generalization": {
                     "canonical_name": segment_name,
                     "identity_source": "code_validated_core_effect",
@@ -216,6 +239,15 @@ class TraceAtomicizer:
             # frozen knowledge. Independent trace support promotes it below.
             status=SkillStatus.DRAFT,
         )
+        # The final Effect contract may be smaller than the Extractor proposal
+        # after parameterization/privacy filtering.  Revalidate materializers
+        # against that exact contract so no output can point at a removed
+        # producer or silently relabel its semantic type.
+        skill.outputs = [
+            output for output in skill.outputs
+            if validate_output_materializer(skill, output).passed
+        ]
+        return skill
 
     # ------------------------------------------------------------------
     def apply(self, trace: TraceRecord) -> AtomicizationResult:
@@ -310,20 +342,21 @@ class TraceAtomicizer:
         for alias, count in (incoming.metadata.get("semantic_alias_counts") or {}).items():
             alias_counts[str(alias)] = int(alias_counts.get(str(alias), 0)) + int(count)
         existing.metadata["semantic_alias_counts"] = alias_counts
-        observed = {str(key): list(values) for key, values in
-                    (existing.metadata.get("observed_parameter_families") or {}).items()}
-        for role, values in (incoming.metadata.get("observed_parameter_families") or {}).items():
-            bucket = observed.setdefault(str(role), [])
-            for value in values:
-                if value not in bucket:
-                    bucket.append(value)
-        existing.metadata["observed_parameter_families"] = observed
+        # Grounded entity families remain in occurrence evidence.  Retain the
+        # field only for schema compatibility with older planners/banks.
+        existing.metadata["observed_parameter_families"] = {}
         negative_evidence = list(
             existing.metadata.get("observed_negative_effects") or [])
         for effect in incoming.metadata.get("observed_negative_effects") or []:
             if effect not in negative_evidence:
                 negative_evidence.append(effect)
         existing.metadata["observed_negative_effects"] = negative_evidence
+        occurrence_refs = list(
+            existing.metadata.get("occurrence_evidence_refs") or [])
+        for evidence_ref in incoming.metadata.get("occurrence_evidence_refs") or []:
+            if evidence_ref not in occurrence_refs:
+                occurrence_refs.append(evidence_ref)
+        existing.metadata["occurrence_evidence_refs"] = occurrence_refs
         # Provenance is occurrence evidence as well.  Reusing a generalized
         # Atomic must not erase the fact that one support occurrence came from
         # an explicit TaskGap (or which Runtime occurrence supplied it).
@@ -409,25 +442,7 @@ def _materialize_segment_effect(segment: dict[str, Any]) -> ExtractedEffect:
             effect.primary_family, (effect.primary_family, effect.primary_family))
         effect.suggested_name = name
         effect.summary = summary
-    output_names: list[str] = []
-    for item in effect.positive:
-        for name in (item.get("args") or {}):
-            if name not in output_names:
-                output_names.append(str(name))
-    effect.outputs = []
-    for name in output_names:
-        producer = next((
-            item for item in effect.positive
-            if name in (item.get("args") or {})), {})
-        effect.outputs.append({
-            "name": name,
-            "semantic_type": _semantic_type_of(name),
-            "materializer": {
-                "kind": "effect_arg",
-                "predicate": str(producer.get("predicate") or ""),
-                "arg": name,
-            },
-        })
+    effect.outputs = output_declarations_from_effects(effect.positive)
     effect.validator = {
         "pre_checks": sorted({str(item.get("predicate"))
                               for item in effect.preconditions if item.get("predicate")}),
@@ -446,13 +461,7 @@ def _split_effect(effect: ExtractedEffect) -> list[ExtractedEffect]:
         output_names = list((positive.get("args") or {}).keys())
         children.append(ExtractedEffect(
             positive=[positive], negative=[], inputs=list(effect.inputs),
-            outputs=[{
-                "name": name, "semantic_type": "value",
-                "materializer": {
-                    "kind": "effect_arg", "predicate": predicate,
-                    "arg": name,
-                },
-            } for name in output_names],
+            outputs=output_declarations_from_effects([positive]),
             preconditions=list(effect.preconditions),
             validator={
                 "pre_checks": list(effect.validator.get("pre_checks") or []),
@@ -513,6 +522,25 @@ def _entity_family(value: Any) -> str:
     import re
     normalized = str(value).strip().lower().replace(" ", "_")
     return re.sub(r"_\d+$", "", normalized)
+
+
+def _fully_portable_predicate(value: Any) -> bool:
+    """Negative closure may persist only role-parameterized contracts."""
+    predicates = [value.get("not")] if isinstance(value, dict) \
+        and isinstance(value.get("not"), dict) else [value]
+    return all(isinstance(item, dict)
+               and all(isinstance(arg, str) and arg.startswith("$inputs.")
+                       for arg in dict(item.get("args") or {}).values())
+               for item in predicates)
+
+
+def _optional_int(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _safe_parameterized_effects(effects: list[dict[str, Any]],

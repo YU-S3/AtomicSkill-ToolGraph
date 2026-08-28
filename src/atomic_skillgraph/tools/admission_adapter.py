@@ -64,6 +64,10 @@ class AdmissionEngine:
     def admit(self, tool: ToolAsset) -> AdmissionResult:
         """执行 admission。通过 → status=candidate；失败 → status=shadow。"""
         tool.status = ToolLifecycle.ADMISSION_PENDING
+        tool.safety = dict(tool.safety or {})
+        # A certificate belongs to one exact executable/interface/test set.
+        # Never carry a parent's certificate into a new Admission attempt.
+        tool.safety.pop("admission_certificate", None)
         checks: dict[str, bool] = {}
         reasons: list[str] = []
 
@@ -75,6 +79,7 @@ class AdmissionEngine:
         if not reasons:
             tool.status = ToolLifecycle.CANDIDATE
             checks["admitted"] = True
+            tool.issue_admission_certificate(checks=checks)
         else:
             tool.status = ToolLifecycle.SHADOW
             checks["admitted"] = False
@@ -118,12 +123,14 @@ class AdmissionEngine:
             reasons.append("no entry point specified")
 
         # 5. unit / replay tests（沙箱执行）+ parameterized_replay（泛化 replay 门禁）
+        available_tests = tool.all_test_cases()
         plain_cases: list[str] = []
-        for test in tool.tests:
+        for test in available_tests:
             if test.get("kind") in ("parameterized_replay", "env_replay"):
                 continue
             plain_cases.extend(test.get("tests") or [])
-        param_cases = [t for t in tool.tests if t.get("kind") == "parameterized_replay"]
+        param_cases = [t for t in available_tests
+                       if t.get("kind") == "parameterized_replay"]
 
         if plain_cases:
             run = self.sandbox.run_tests(code, plain_cases)
@@ -208,9 +215,20 @@ class AdmissionEngine:
         # ``cabinet 3`` 等具体 ALFWorld 实例不能绕过参数化后进入 Admission。
         concrete_literals = sorted({literal for step in steps
                                     for literal in _concrete_action_literals(str(step))})
-        checks["instance_free_template"] = not concrete_literals
+        # Numbered-instance regexes are not sufficient: identifiers such as
+        # ``customer_a`` or a human-readable resource name may be grounded
+        # values without a numeric suffix.  Replay bindings give us a
+        # benchmark-agnostic oracle for those concrete values.  Any such value
+        # found outside ``{declared_slot}`` is an unparameterized leak.
+        grounded_literals = _grounded_binding_literals_in_texts(
+            tool, [*steps, tool.summary])
+        checks["instance_free_template"] = not (
+            concrete_literals or grounded_literals)
         if concrete_literals:
             reasons.append(f"concrete_instance_literals: {concrete_literals}")
+        if grounded_literals:
+            reasons.append(
+                f"unparameterized_grounded_bindings: {grounded_literals}")
         # 3. 动作合法：每步以已知动词开头且长度受限
         legal = all(
             len(str(step)) <= 300 and str(step).strip() for step in steps
@@ -219,7 +237,8 @@ class AdmissionEngine:
         if not legal:
             reasons.append("illegal_action_lines")
         # 无效模板不应启动昂贵的环境 replay，更不能在 replay 时才偶然暴露。
-        if unknown or unused or concrete_literals or not legal:
+        if (unknown or unused or concrete_literals or grounded_literals
+                or not legal):
             checks["env_replay"] = False
             return
         # 4. source trace replay（环境回调）
@@ -293,3 +312,51 @@ def _concrete_action_literals(step: str) -> set[str]:
             for match in re.finditer(
                 r"(?<![a-z0-9])(?:[a-z][a-z0-9]*)(?:_|\s+)\d+(?![a-z0-9])",
                 without_slots, flags=re.IGNORECASE)}
+
+
+def _grounded_binding_literals_in_texts(
+        tool: ToolAsset, texts: list[Any]) -> list[str]:
+    """Find replay-bound strings copied into portable action text/summary.
+
+    Space and underscore spellings are normalized to the same token sequence,
+    so ``customer_a`` also catches ``customer a``.  Only values bound to a
+    declared Tool parameter are considered; observations and expected outputs
+    are not action arguments and therefore cannot create false positives.
+    """
+    declared = set(tool.param_names())
+    if not declared:
+        return []
+    without_slots = "\n".join(
+        re.sub(r"\{[a-z_][a-z0-9_]*\}", " ", str(step),
+               flags=re.IGNORECASE)
+        for step in texts
+    )
+    artifact_tokens = _normalized_literal_tokens(without_slots)
+    findings: set[str] = set()
+    for case in tool.all_test_cases():
+        bindings = case.get("bindings") or {}
+        binding_sets = bindings if isinstance(bindings, list) else [bindings]
+        for binding_set in binding_sets:
+            if not isinstance(binding_set, dict):
+                continue
+            # parameterized_replay wraps concrete values under ``value``.
+            values = binding_set.get("value") \
+                if isinstance(binding_set.get("value"), dict) \
+                else binding_set
+            for name, raw in values.items():
+                if str(name) not in declared or not isinstance(raw, str):
+                    continue
+                candidate = _normalized_literal_tokens(raw)
+                if len(candidate) < 3:
+                    continue
+                if re.search(
+                        rf"(?<![a-z0-9]){re.escape(candidate)}(?![a-z0-9])",
+                        artifact_tokens):
+                    findings.add(raw)
+    return sorted(findings)
+
+
+def _normalized_literal_tokens(value: str) -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[_\s]+", " ", text)
+    return re.sub(r"[^a-z0-9]+", " ", text).strip()

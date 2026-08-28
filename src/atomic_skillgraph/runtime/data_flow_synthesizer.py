@@ -133,7 +133,11 @@ def _output_type(atomic: Any, output_name: str) -> str:
 
 
 def _types_compatible(source: str, target: str) -> bool:
-    return not source or not target or source == target or "value" in {source, target}
+    # Missing schema is not evidence of compatibility.  Keeping synthesis and
+    # persisted-plan validation equally fail-closed avoids generating an edge
+    # that the next validation stage must immediately reject.
+    return bool(source and target) and (
+        source == target or "value" in {source, target})
 
 
 def _same_branch(source: Any, target: Any) -> bool:

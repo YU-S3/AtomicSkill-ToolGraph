@@ -138,6 +138,16 @@ def balanced_task_subset(tasks: list, task_types: list[str],
 # 运行
 # ---------------------------------------------------------------------------
 
+
+def restore_system_episode_counters(
+        system: AtomicSkillGraphSystem,
+        episodes: list[dict[str, Any]]) -> None:
+    """Restore process-local counters before appending resumed episodes."""
+    system.episode_count = len(episodes)
+    system.success_count = sum(
+        1 for episode in episodes if bool(episode.get("success")))
+
+
 def run_our_condition(condition: str, adapter, config: SystemConfig,
                       tasks: list, mock_script: dict[str, Any] | None = None,
                       output_dir: str | Path | None = None,
@@ -181,6 +191,10 @@ def run_our_condition(condition: str, adapter, config: SystemConfig,
     llm = make_llm(config, mock_script=mock_script)
     system = AtomicSkillGraphSystem(config, adapter, llm)
     completed = len(episodes)
+    # Persistent banks survive process restarts; these process-local counters
+    # do not.  Restore them before the next task so episode metrics are appended
+    # rather than overwritten and maintenance cadence remains continuous.
+    restore_system_episode_counters(system, episodes)
     if monitor is not None and completed:
         monitor.task_update(completed, note=f"resume {completed}/{len(tasks)}")
     for index, task in enumerate(tasks[completed:], start=completed + 1):

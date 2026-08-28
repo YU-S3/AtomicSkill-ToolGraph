@@ -7,6 +7,8 @@ Tool = <Σ, X, T_s, S_f, P_v, Q, L>：
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -48,6 +50,13 @@ class ToolAsset:
     statistics: dict[str, Any] = field(default_factory=dict)
     lineage: dict[str, Any] = field(default_factory=dict)
     status: ToolLifecycle = ToolLifecycle.DRAFT
+    # Evidence payloads are hydrated by ToolRegistry only when the local
+    # EvidenceStore is available.  They are deliberately excluded from
+    # ``to_dict`` so a portable Tool bank cannot re-embed private replay data.
+    _resolved_tests: list[dict[str, Any]] | None = field(
+        default=None, repr=False, compare=False)
+    _unresolved_test_refs: list[str] = field(
+        default_factory=list, repr=False, compare=False)
 
     # -- 属性 ----------------------------------------------------------------
     @property
@@ -78,11 +87,105 @@ class ToolAsset:
         return str(self.signature.get("entry_point") or self.artifact.get("entry_point") or "")
 
     def replay_cases(self) -> list[dict[str, Any]]:
-        cases = [t for t in self.tests if t.get("kind") in (None, "replay", "unit", "perturbation")]
-        return cases or list(self.tests)
+        source = self.all_test_cases()
+        cases = [t for t in source
+                 if t.get("kind") in (None, "replay", "unit", "perturbation")]
+        return cases or source
+
+    def all_test_cases(self) -> list[dict[str, Any]]:
+        """Return every locally available hydrated test, including parameterized cases."""
+        return (list(self._resolved_tests)
+                if self._resolved_tests is not None
+                else [dict(item) for item in self.tests
+                      if not _is_evidence_pointer(item)])
+
+    def set_resolved_tests(self, tests: list[dict[str, Any]], *,
+                           unresolved_refs: list[str] | None = None) -> None:
+        self._resolved_tests = [dict(item) for item in tests]
+        self._unresolved_test_refs = list(unresolved_refs or [])
+
+    def has_unresolved_test_evidence(self) -> bool:
+        return bool(self._unresolved_test_refs)
+
+    def test_evidence_identities(self) -> list[dict[str, str]]:
+        """Canonical evidence ref/hash pairs bound into Admission.
+
+        Raw pre-registration tests deterministically map to the same
+        ``evidence://tool_test/<sha256>`` URI that ToolRegistry later writes.
+        Sorting is order-independent, while intentionally preserving duplicate
+        occurrences so removal of one certified case is detectable.
+        """
+        identities: list[dict[str, str]] = []
+        for item in self.tests:
+            if _is_evidence_pointer(item):
+                ref = str(item.get("evidence_ref") or "")
+                digest = str(item.get("evidence_hash") or "")
+            else:
+                digest = _full_content_hash(item)
+                ref = f"evidence://tool_test/{digest}"
+            identities.append({"evidence_ref": ref,
+                               "evidence_hash": digest})
+        return sorted(identities, key=lambda value: (
+            value["evidence_ref"], value["evidence_hash"]))
+
+    def test_evidence_hashes(self) -> list[str]:
+        """Compatibility view of certified hashes, preserving multiplicity."""
+        return [item["evidence_hash"]
+                for item in self.test_evidence_identities()]
+
+    def issue_admission_certificate(
+            self, *, checks: dict[str, bool] | None = None) -> dict[str, Any]:
+        """Bind a passed Admission decision to executable and test hashes."""
+        certificate = {
+            "schema_version": 2,
+            "passed": True,
+            "artifact_hash": self.artifact_hash(),
+            "contract_hash": self.admission_contract_hash(),
+            "test_evidence": self.test_evidence_identities(),
+            "test_evidence_hashes": self.test_evidence_hashes(),
+            "checks": {str(key): bool(value)
+                       for key, value in sorted((checks or {}).items())},
+        }
+        self.safety = dict(self.safety or {})
+        self.safety["admission_certificate"] = certificate
+        return certificate
+
+    def admission_contract_hash(self) -> str:
+        """Hash every executable/interface field covered by Admission."""
+        return _full_content_hash({
+            "artifact_kind": self.artifact_kind.value,
+            "signature": self.signature,
+            "interface": self.interface,
+            "artifact": self.artifact,
+            "safety_policy": {
+                str(key): value for key, value in (self.safety or {}).items()
+                if str(key) != "admission_certificate"
+            },
+        })
+
+    def admission_certificate_valid(self) -> bool:
+        certificate = dict(
+            (self.safety or {}).get("admission_certificate") or {})
+        checks = dict(certificate.get("checks") or {})
+        if (not certificate
+                or int(certificate.get("schema_version") or 0) != 2
+                or not bool(certificate.get("passed"))
+                or not bool(checks.get("admitted"))
+                or not all(bool(value) for value in checks.values())):
+            return False
+        return bool(
+            str(certificate.get("artifact_hash") or "")
+            == self.artifact_hash()
+            and str(certificate.get("contract_hash") or "")
+            == self.admission_contract_hash()
+            and list(certificate.get("test_evidence") or [])
+            == self.test_evidence_identities()
+            and list(certificate.get("test_evidence_hashes") or [])
+            == self.test_evidence_hashes()
+        )
 
     def is_usable(self) -> bool:
-        return self.status in USABLE
+        return self.status in USABLE and self.admission_certificate_valid()
 
     def utility(self) -> float:
         return float(self.statistics.get("utility", 0.0))
@@ -181,3 +284,16 @@ class ToolAsset:
 
 def lifecycle_rank(status: ToolLifecycle) -> int:
     return _LIFECYCLE_RANK.get(status, -4)
+
+
+def _is_evidence_pointer(item: Any) -> bool:
+    return bool(isinstance(item, dict)
+                and str(item.get("evidence_ref") or "").startswith(
+                    "evidence://"))
+
+
+def _full_content_hash(payload: Any) -> str:
+    canonical = json.dumps(
+        payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+        default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

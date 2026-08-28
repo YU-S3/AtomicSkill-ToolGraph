@@ -129,8 +129,10 @@ def test_same_effect_name_cannot_merge_incompatible_role_contracts(workspace_tmp
     discovery_shaped = _atomic(
         "generic.object_at_location", [],
         [{"predicate": "object.at_location",
-          "args": {"object": "mug_1", "location": "$inputs.target_location"}}],
-        [{"name": "target_location"}], [{"name": "object"}, {"name": "location"}])
+          "args": {"object": "$inputs.discovered_object",
+                   "location": "$inputs.target_location"}}],
+        [{"name": "discovered_object"}, {"name": "target_location"}],
+        [{"name": "object"}, {"name": "location"}])
     producer = _atomic(
         "generic.object_at_location", [],
         [{"predicate": "object.at_location",
@@ -553,7 +555,16 @@ def test_later_extractor_receives_catalog_and_node_accumulates_generalization(wo
     assert node is not None
     assert node.metadata["statistics"]["support_count"] == 2
     assert node.metadata["generalization"]["status"] == "cross_trace_validated"
-    assert "acquire_and_transport_mug_to_microwave" in node.metadata["semantic_alias_counts"]
+    assert "acquire_and_transport_mug_to_microwave" not in (
+        node.metadata["semantic_alias_counts"])
+    assert node.ref.logical_id.rsplit(".", 1)[-1] in (
+        node.metadata["semantic_alias_counts"])
+    occurrence_payloads = [
+        registry.evidence_store.get(ref)
+        for ref in node.metadata["occurrence_evidence_refs"]
+    ]
+    assert "acquire_and_transport_mug_to_microwave" in json.dumps(
+        occurrence_payloads, ensure_ascii=False)
     assert llm.inputs[0]["known_atomic_contracts"] == []
     assert llm.inputs[0]["task"] == {"goal": "heat and place mug"}
     assert "task_type" not in json.dumps(llm.inputs[0])

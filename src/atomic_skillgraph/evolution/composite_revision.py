@@ -50,8 +50,22 @@ class CompositeRevisionBuilder:
         )
         metadata = dict(composite.metadata or {})
         history = list(metadata.get("graph_revision_history") or [])
-        record = revision.to_dict()
-        record["source_trace_id"] = trace_id
+        evidence_ref = self.registry.evidence_store.put(
+            "graph_revision", revision.to_dict(), trace_id=trace_id)
+        record = {
+            "source_trace_id": trace_id,
+            "revision_kind": revision.revision_kind,
+            "selected_composite_ref": revision.selected_composite_ref,
+            "inserted_skill_refs": [
+                str(item.get("skill_ref") or "")
+                for item in revision.inserted_occurrences],
+            "canonical_skill_refs": [
+                str(item.get("skill_ref") or "")
+                for item in revision.canonical_occurrences],
+            "task_gap_proved_missing_effect": bool(
+                revision.task_gap_proved_missing_effect),
+            "evidence_ref": evidence_ref,
+        }
         if not any(str(item.get("source_trace_id") or "") == trace_id
                    for item in history):
             history.append(record)
@@ -86,7 +100,8 @@ class CompositeRevisionBuilder:
                         "reason": "validated_revised_composite_promoted"})
                 outcome.supersedes.append(ancestor)
 
-        if (revision.task_gap_proved_missing_effect
+        if (composite.status == SkillStatus.ACTIVE
+                and revision.task_gap_proved_missing_effect
                 and revision.revision_kind in _INSERT_REVISIONS):
             suppressed = self.suppress_proven_incomplete_parent(
                 revision, trace_id=trace_id,

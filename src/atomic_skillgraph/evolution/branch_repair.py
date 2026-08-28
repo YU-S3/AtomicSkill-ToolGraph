@@ -30,6 +30,7 @@ from ..core.tool_ir import ToolAsset
 from ..core.trace_ir import TraceRecord
 from ..graph.registry import SkillGraphRegistry
 from ..graph.validator import validate_graph
+from ..persistence_guard import validate_long_term_asset
 from ..tools.admission_adapter import AdmissionEngine
 from ..tools.registry import ToolRegistry
 from ..atomicizer.effect_extractor import (
@@ -145,6 +146,11 @@ class FailureBranchManager:
         if len(rescue_actions) > 12:
             return self._record_unverified_branch(
                 incident, "rescue_not_atomic_after_denoising")
+        if validate_long_term_asset(
+                {"repair_action_template": rescue_actions},
+                asset_kind="atomic_repair_template"):
+            return self._record_unverified_branch(
+                incident, "repair_template_contains_private_or_instance_literal")
         guideline = dict(payload.get("guideline") or {})
         rules = list(guideline.get("rules") or [])
         guideline_steps = [_guideline_placeholders(step) for step in rescue_actions]
@@ -178,8 +184,19 @@ class FailureBranchManager:
             rules.append(repair_rule)
         guideline["rules"] = rules
         payload["guideline"] = guideline
+        repair_evidence_ref = self.registry.evidence_store.put(
+            "atomic_repair",
+            {"incident": incident, "event_slice": event_slice,
+             "repair_bindings": repair_bindings,
+             "rescue_actions": rescue_actions,
+             "repair_guard": _repair_guard(
+                 dict(rescue.get("before") or {}), repair_bindings)},
+            trace_id=trace.trace_id,
+            event_start=start,
+            event_end=end,
+        )
         metadata = dict(payload.get("metadata") or {})
-        metadata["repair_branch"] = incident["branch_id"]
+        metadata["repair_branch_ref"] = _branch_ref(incident["branch_id"])
         metadata["repair_parent_ref"] = str(parent.ref)
         metadata["repair_source_trace_id"] = trace.trace_id
         metadata["repair_generalized"] = True
@@ -190,6 +207,7 @@ class FailureBranchManager:
             str(key) for key in (node.get("params") or {}))
         metadata["repair_guard"] = _repair_guard(
             dict(rescue.get("before") or {}), repair_bindings)
+        metadata["repair_evidence_ref"] = repair_evidence_ref
         payload["metadata"] = metadata
         candidate = parent if duplicate_rule else AbstractAtomicSkill.from_dict(payload)
         if not duplicate_rule:
@@ -197,7 +215,7 @@ class FailureBranchManager:
             branch_registry.add_edge(
                 str(candidate.ref), str(parent.ref), EdgeType.SUPERSEDES,
                 evidence=[trace.trace_id],
-                metadata={"branch_id": incident["branch_id"],
+                metadata={"branch_ref": _branch_ref(incident["branch_id"]),
                           "strict_seeded_replay": True})
         branch_report = validate_graph(branch_registry, branch_tools)
         seed_context = "\n".join(
@@ -276,7 +294,8 @@ class FailureBranchManager:
             parent_metadata.update({
                 "repair_replay_trace_ids": evidence_ids,
                 "repair_replay_count": len(evidence_ids),
-                "last_repair_branch": incident["branch_id"],
+                "last_repair_branch_ref": _branch_ref(incident["branch_id"]),
+                "repair_evidence_ref": repair_evidence_ref,
             })
             parent.metadata = parent_metadata
             before_update = _bank_digest(self.data_dir)
@@ -295,7 +314,7 @@ class FailureBranchManager:
         self.registry.register(candidate)
         self.registry.add_edge(str(candidate.ref), str(parent.ref),
                                EdgeType.SUPERSEDES, evidence=[trace.trace_id],
-                               metadata={"branch_id": incident["branch_id"],
+                               metadata={"branch_ref": _branch_ref(incident["branch_id"]),
                                          "strict_seeded_replay": True})
         main_report = validate_graph(self.registry, self.tool_registry)
         if not main_report.passed:
@@ -420,7 +439,7 @@ class FailureBranchManager:
             if parent:
                 self.registry.add_edge(str(impl.ref), parent, EdgeType.SUPERSEDES,
                                        evidence=[trace.trace_id],
-                                       metadata={"branch_id": incident["branch_id"],
+                                       metadata={"branch_ref": _branch_ref(incident["branch_id"]),
                                                  "strict_direct_replay": True})
         main_report = validate_graph(self.registry, self.tool_registry)
         if not main_report.passed:
@@ -578,7 +597,7 @@ class FailureBranchManager:
             if parent:
                 self.registry.add_edge(str(impl.ref), parent, EdgeType.SUPERSEDES,
                                        evidence=[trace.trace_id],
-                                       metadata={"branch_id": incident["branch_id"],
+                                       metadata={"branch_ref": _branch_ref(incident["branch_id"]),
                                                  "strict_direct_replay": True})
         main_report = validate_graph(self.registry, self.tool_registry)
         if not main_report.passed:
@@ -697,7 +716,7 @@ class FailureBranchManager:
                 abstract_ref=impl.abstract_ref,
                 tool_bindings=bindings,
                 execution_policy={**dict(impl.execution_policy),
-                                  "repair_branch": branch_id,
+                                  "repair_branch_ref": _branch_ref(branch_id),
                                   "repair_parent_impl": str(impl.ref),
                                   "strict_direct_replay": True},
                 compatibility=dict(impl.compatibility),
@@ -707,8 +726,8 @@ class FailureBranchManager:
             )
             registry.register(candidate)
             registry.add_edge(str(candidate.ref), str(impl.ref), EdgeType.SUPERSEDES,
-                              metadata={"branch_id": branch_id},
-                              evidence=[branch_id])
+                              metadata={"branch_ref": _branch_ref(branch_id)},
+                              evidence=[_branch_ref(branch_id)])
             evolved.append(candidate)
         return evolved
 
@@ -721,6 +740,15 @@ class FailureBranchManager:
             shutil.copytree(self.registry.root, skill_dst)
         if not tool_dst.exists():
             shutil.copytree(self.tool_registry.root, tool_dst)
+        # Branch Tool assets contain only evidence refs.  The branch is a
+        # mutable local validation workspace (not a portable frozen export),
+        # so copy its private Tool evidence as well; otherwise even diagnostic
+        # shadow versions would inherit dangling refs and fail closed before
+        # branch validation can run.
+        evidence_src = self.tool_registry.evidence_store.root
+        evidence_dst = bank / "evidence" / "tool_tests"
+        if evidence_src.exists() and not evidence_dst.exists():
+            shutil.copytree(evidence_src, evidence_dst)
         return branch_dir, SkillGraphRegistry(skill_dst), ToolRegistry(tool_dst)
 
     def _record_unverified_branch(self, incident: dict[str, Any],
@@ -751,8 +779,12 @@ class FailureBranchManager:
         draft and can never be merged by this path.
         """
         candidates: list[dict[str, Any]] = []
-        failure_type = str(incident.get("failure_type") or "unknown_failure")
+        failure_type = _failure_category(incident.get("failure_type"))
         branch_id = str(incident["branch_id"])
+        branch_ref = _branch_ref(branch_id)
+        incident_evidence = registry.evidence_store.put(
+            "repair_incident", incident,
+            trace_id=str(incident.get("trace_id") or ""))
         node_ref_text = str(incident.get("node_ref") or "")
         try:
             node_ref = SkillRef.parse(node_ref_text)
@@ -768,7 +800,8 @@ class FailureBranchManager:
             observation = {
                 "type": failure_type,
                 "source_trace_id": incident.get("trace_id"),
-                "branch_id": branch_id,
+                "branch_ref": branch_ref,
+                "evidence_ref": incident_evidence,
                 "verified_repair": False,
             }
             if observation not in failure_modes:
@@ -783,7 +816,8 @@ class FailureBranchManager:
             guideline["rules"] = rules
             payload["guideline"] = guideline
             metadata = dict(payload.get("metadata") or {})
-            metadata.update({"repair_branch": branch_id,
+            metadata.update({"repair_branch_ref": branch_ref,
+                             "repair_evidence_ref": incident_evidence,
                              "repair_parent_ref": str(source.ref),
                              "verified_repair": False,
                              "awaiting_reason": reason})
@@ -808,7 +842,8 @@ class FailureBranchManager:
             guideline["rules"] = rules
             payload["guideline"] = guideline
             metadata = dict(payload.get("metadata") or {})
-            metadata.update({"repair_branch": branch_id,
+            metadata.update({"repair_branch_ref": branch_ref,
+                             "repair_evidence_ref": incident_evidence,
                              "repair_parent_ref": str(source.ref),
                              "verified_repair": False,
                              "awaiting_reason": reason})
@@ -841,7 +876,7 @@ class FailureBranchManager:
                           "passed": False})
             payload["tests"] = tests
             provenance = dict(payload.get("provenance") or {})
-            provenance.update({"repair_branch": branch_id,
+            provenance.update({"repair_branch_ref": branch_ref,
                                "repair_parent_ref": str(source_tool.ref),
                                "verified_repair": False,
                                "awaiting_reason": reason})
@@ -1338,3 +1373,22 @@ def _bank_digest(data_dir: Path) -> str:
 
 def _safe_id(text: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]+", "_", text)[:180]
+
+
+def _branch_ref(branch_id: Any) -> str:
+    """Portable opaque identity for a trace-derived repair branch."""
+    digest = hashlib.sha256(str(branch_id or "").encode("utf-8")).hexdigest()
+    return f"branch:{digest}"
+
+
+def _failure_category(value: Any) -> str:
+    """Map raw error text to a portable framework-level category."""
+    text = str(value or "").lower()
+    categories = (
+        "precondition", "data_flow", "control_flow", "binding", "budget",
+        "planning", "timeout", "llm", "tool", "effect", "validation",
+        "environment",
+    )
+    return next((category for category in categories
+                 if category.replace("_", " ") in text
+                 or category in text), "unknown_failure")

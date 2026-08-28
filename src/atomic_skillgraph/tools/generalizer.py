@@ -193,20 +193,34 @@ class ToolGeneralizer:
                             constraints: dict[str, Any], reason: str) -> ToolAsset:
         """为稳定的特殊输入域创建独立候选；不直接修改来源 Tool。"""
         slug = content_hash(constraints)[:8]
+        specialization_evidence = self.registry.evidence_store.put(
+            "tool_specialization",
+            {"constraints": constraints, "reason": reason,
+             "source_tool_ref": str(source.ref)},
+        )
         data = copy.deepcopy(source.to_dict())
         data["tool_id"] = f"{source.tool_id}.specialized.{slug}"
         data["version"] = "1.0.0"
-        data["summary"] = f"{source.summary} [specialized: {reason}]"
+        data["summary"] = f"{source.summary} [specialized variant]"
         data["status"] = ToolLifecycle.DRAFT.value
         data["statistics"] = {"support_count": 1, "call_count": 0,
                               "success_count": 0, "failure_count": 0,
                               "utility": 0.5}
+        # ``to_dict`` intentionally contains only portable evidence refs.
+        # Admission, however, must execute the locally hydrated replay cases.
+        data["tests"] = source.replay_cases()
         data["lineage"] = {**dict(source.lineage),
                            "specialized_from": [str(source.ref)],
-                           "specialization_constraints": constraints}
+                           "specialization_evidence_ref":
+                               specialization_evidence}
         data["provenance"] = {**dict(source.provenance),
                               "extraction_method": "tool_specializer_rules"}
-        return ToolAsset.from_dict(data)
+        candidate = ToolAsset.from_dict(data)
+        candidate.set_resolved_tests(
+            source.all_test_cases(),
+            unresolved_refs=list(source._unresolved_test_refs),
+        )
+        return candidate
 
     def propose_split(self, source: ToolAsset,
                       partitions: list[dict[str, Any]]) -> list[ToolAsset]:
@@ -224,10 +238,11 @@ class ToolGeneralizer:
             data["tool_id"] = f"{source.tool_id}.split.{suffix or index}"
             data["version"] = "1.0.0"
             data["summary"] = str(partition.get("summary") or
-                                  f"Split part {index + 1} of {source.summary}")
+                                  f"Split capability derived from {source.summary}")
             if steps:
                 data["artifact"] = {**dict(source.artifact), "steps": steps}
-            data["tests"] = list(partition.get("tests") or source.tests)
+            data["tests"] = list(
+                partition.get("tests") or source.replay_cases())
             data["status"] = ToolLifecycle.DRAFT.value
             data["statistics"] = {"support_count": 1, "call_count": 0,
                                   "success_count": 0, "failure_count": 0,
@@ -235,7 +250,13 @@ class ToolGeneralizer:
             data["lineage"] = {**dict(source.lineage),
                                "split_from": str(source.ref),
                                "split_effects": list(partition.get("effects") or [])}
-            children.append(ToolAsset.from_dict(data))
+            child = ToolAsset.from_dict(data)
+            if not partition.get("tests"):
+                child.set_resolved_tests(
+                    source.all_test_cases(),
+                    unresolved_refs=list(source._unresolved_test_refs),
+                )
+            children.append(child)
         return children
 
     def admit_evolution(self, candidates: list[ToolAsset], kind: str,

@@ -8,6 +8,8 @@ from typing import Any
 
 from ..core.binding_ir import binding_slot_name, is_concrete_binding
 from ..core.refs import SkillRef
+from ..core.predicates import StateSnapshot, evaluate_predicate
+from ..core.status import EdgeType
 from ..runtime.contract_matcher import match_effect_contract
 
 
@@ -15,6 +17,9 @@ from ..runtime.contract_matcher import match_effect_contract
 class TraceGraphRevision:
     selected_composite_ref: str = ""
     realized_occurrences: list[dict[str, Any]] = field(default_factory=list)
+    # Full recovery execution remains trace evidence.  Only this causal
+    # subsequence is eligible to become a revised long-term Composite.
+    canonical_occurrences: list[dict[str, Any]] = field(default_factory=list)
     inserted_occurrences: list[dict[str, Any]] = field(default_factory=list)
     reused_atomic_refs: list[str] = field(default_factory=list)
     new_atomic_refs: list[str] = field(default_factory=list)
@@ -28,6 +33,7 @@ class TraceGraphRevision:
         return {
             "selected_composite_ref": self.selected_composite_ref,
             "realized_occurrences": self.realized_occurrences,
+            "canonical_occurrences": self.canonical_occurrences,
             "inserted_occurrences": self.inserted_occurrences,
             "reused_atomic_refs": self.reused_atomic_refs,
             "new_atomic_refs": self.new_atomic_refs,
@@ -177,18 +183,20 @@ class TraceGraphReconstructor:
             for item in inserted
         }
         repeated = bool(inserted_contracts & selected_contracts)
-        if repeated and self._matching_planned_occurrence_failed(
-                trace, inserted_contracts, spans):
-            revision.revision_kind = "implementation_repair"
-            revision.replaced_occurrences = self._failed_matching_occurrences(
-                trace, inserted_contracts, spans)
-        elif repeated:
+        if repeated:
             revision.revision_kind = "repeated_occurrence_insert"
         elif any(not str(item.get("atomic_decision") or "").startswith("reuse")
                  for item in inserted):
             revision.revision_kind = "new_capability_insert"
         else:
             revision.revision_kind = "existing_capability_insert"
+        canonical, canonical_notes = _canonical_recovery_occurrences(
+            trace, selected, occurrences)
+        revision.notes.extend(canonical_notes)
+        # A one-node result is not a Composite.  Retain the complete realized
+        # chain rather than silently losing an otherwise valid revision.
+        revision.canonical_occurrences = (
+            canonical if len(canonical) >= 2 else list(occurrences))
         return revision
 
     def _validated_parent_occurrences(
@@ -292,33 +300,6 @@ class TraceGraphReconstructor:
                    if isinstance(item, dict)]
         return json.dumps(effects, sort_keys=True, ensure_ascii=False,
                           separators=(",", ":"))
-
-    def _matching_planned_occurrence_failed(
-            self, trace, contracts: set[str], spans: list[dict[str, Any]]) -> bool:
-        return bool(self._failed_matching_occurrences(trace, contracts, spans))
-
-    def _failed_matching_occurrences(
-            self, trace, contracts: set[str], spans: list[dict[str, Any]],
-            ) -> list[dict[str, Any]]:
-        gap_ids = {str(span.get("occurrence_id") or "") for span in spans
-                   if span.get("kind") == "task_gap"}
-        result: list[dict[str, Any]] = []
-        for node in getattr(trace, "realized_atomic_nodes", None) or []:
-            if str(node.get("occurrence_id") or "") in gap_ids:
-                continue
-            if (not bool(node.get("passed"))
-                    and self._contract_key(str(node.get("ref") or
-                                               node.get("node_ref") or ""))
-                    in contracts):
-                result.append({
-                    "occurrence_id": str(node.get("occurrence_id") or ""),
-                    "step_id": str(node.get("step_id") or ""),
-                    "atomic_ref": str(node.get("ref") or node.get("node_ref") or ""),
-                    "implementation_ref": str(node.get("impl_ref") or ""),
-                    "tool_refs": list(node.get("tool_refs") or []),
-                })
-        return result
-
 
 def _strong_gap_proof(trace, selected, spans: list[dict[str, Any]],
                       gap_effects: list[dict[str, Any]],
@@ -480,3 +461,170 @@ def _normalized_skill_ref(value: str) -> str:
         return str(SkillRef.parse(str(value or "")))
     except ValueError:
         return str(value or "")
+
+
+def _canonical_recovery_occurrences(
+        trace: Any, selected: Any,
+        occurrences: list[dict[str, Any]],
+        ) -> tuple[list[dict[str, Any]], list[str]]:
+    """Return the smallest executed causal subsequence that proves the goal.
+
+    This is deliberately a *slice*, not a speculative reorder: retained
+    occurrences keep their actual event order.  Grounded bindings and negative
+    Effects distinguish repeated objects/branches and prevent an earlier,
+    subsequently invalidated producer from being treated as live.
+    """
+
+    if not occurrences:
+        return [], ["canonicalization_skipped:no_occurrences"]
+    provenance = dict(getattr(trace, "provenance", None) or {})
+    global_bindings = dict(provenance.get("params") or {})
+    global_bindings.update(dict(provenance.get("realized_params") or {}))
+    targets = [dict(item) for item in (provenance.get("target_effects") or [])
+               if isinstance(item, dict)]
+    if not targets:
+        return list(occurrences), ["canonicalization_skipped:no_target_effects"]
+
+    selected_indices: set[int] = set()
+    notes: list[str] = []
+    first_before = dict(occurrences[0].get("before") or {})
+
+    def grounded(contract: dict[str, Any], bindings: dict[str, Any]) \
+            -> dict[str, Any]:
+        return _ground_effect_contract(contract, bindings) or dict(contract)
+
+    def negative_contract(raw: dict[str, Any], bindings: dict[str, Any]) \
+            -> dict[str, Any]:
+        inner = raw.get("not") if isinstance(raw.get("not"), dict) else raw
+        return grounded(dict(inner), bindings)
+
+    def effect_live(effect: dict[str, Any], producer: int,
+                    consumer: int) -> bool:
+        for later_index in range(producer + 1, consumer):
+            later = occurrences[later_index]
+            bindings = dict(later.get("params") or {})
+            for raw in later.get("negative_effect") or []:
+                if (isinstance(raw, dict)
+                        and match_effect_contract(
+                            negative_contract(raw, bindings), effect).passed):
+                    return False
+        return True
+
+    def producers(required: dict[str, Any], before_index: int,
+                  *, cardinality: int = 1,
+                  distinct_by: str = "") -> list[int]:
+        found: list[int] = []
+        witnesses: set[str] = set()
+        target = dict(required)
+        target["cardinality"] = 1
+        target["distinct_by"] = ""
+        for index in range(before_index - 1, -1, -1):
+            occurrence = occurrences[index]
+            bindings = dict(occurrence.get("params") or {})
+            for raw_effect in occurrence.get("effect") or []:
+                if not isinstance(raw_effect, dict):
+                    continue
+                effect = grounded(raw_effect, bindings)
+                if (not match_effect_contract(effect, target).passed
+                        or not effect_live(effect, index, before_index)):
+                    continue
+                if distinct_by:
+                    witness = str(dict(effect.get("args") or {}).get(
+                        distinct_by) or bindings.get(distinct_by) or "")
+                    if not witness or witness in witnesses:
+                        continue
+                    witnesses.add(witness)
+                found.append(index)
+                break
+            if len(found) >= cardinality:
+                break
+        return found
+
+    target_closed = True
+    for raw_target in targets:
+        required = grounded(raw_target, global_bindings)
+        cardinality = max(1, int(raw_target.get("cardinality", 1) or 1))
+        distinct_by = str(raw_target.get("distinct_by") or "")
+        matches = producers(
+            required, len(occurrences), cardinality=cardinality,
+            distinct_by=distinct_by)
+        if len(matches) < cardinality:
+            # A target that was already true before the workflow is an
+            # external condition, not evidence that a hidden producer should
+            # be invented.  Otherwise fail conservative and retain all nodes.
+            if evaluate_predicate(StateSnapshot(first_before), required):
+                notes.append(
+                    f"canonical_external_target:{required.get('predicate', '')}")
+                continue
+            target_closed = False
+            notes.append(
+                f"canonicalization_incomplete_target:"
+                f"{required.get('predicate', '')}")
+            break
+        selected_indices.update(matches)
+    if not target_closed or not selected_indices:
+        return list(occurrences), notes
+
+    # Exact parent DATA_FLOW edges are additional causal evidence for retained
+    # parent occurrences.  Gap occurrences are connected through verified
+    # Effect→Precondition contracts below.
+    parent_flow: dict[str, list[str]] = {}
+    if selected is not None:
+        for edge in selected.edge_objects():
+            if edge.type == EdgeType.DATA_FLOW:
+                parent_flow.setdefault(str(edge.target_step), []).append(
+                    str(edge.source_step))
+    origin_to_index = {
+        str(item.get("origin_step_id") or ""): index
+        for index, item in enumerate(occurrences)
+        if str(item.get("origin_step_id") or "")
+    }
+
+    queue = list(sorted(selected_indices, reverse=True))
+    causal_closed = True
+    while queue and causal_closed:
+        consumer_index = queue.pop()
+        occurrence = occurrences[consumer_index]
+        occurrence_bindings = dict(occurrence.get("params") or {})
+
+        for source_step in parent_flow.get(
+                str(occurrence.get("origin_step_id") or ""), []):
+            source_index = origin_to_index.get(source_step)
+            if source_index is not None and source_index < consumer_index \
+                    and source_index not in selected_indices:
+                selected_indices.add(source_index)
+                queue.append(source_index)
+
+        for raw_precondition in occurrence.get("preconditions") or []:
+            if not isinstance(raw_precondition, dict):
+                continue
+            required = grounded(raw_precondition, occurrence_bindings)
+            match = producers(required, consumer_index)
+            if match:
+                producer_index = match[0]
+                if producer_index not in selected_indices:
+                    selected_indices.add(producer_index)
+                    queue.append(producer_index)
+                continue
+            before = dict(occurrence.get("before") or {})
+            if evaluate_predicate(StateSnapshot(before), required):
+                notes.append(
+                    f"canonical_external_precondition:"
+                    f"{required.get('predicate', '')}")
+                continue
+            causal_closed = False
+            notes.append(
+                f"canonicalization_incomplete_precondition:"
+                f"{required.get('predicate', '')}")
+            break
+
+    if not causal_closed:
+        return list(occurrences), notes
+    canonical = [dict(item) for index, item in enumerate(occurrences)
+                 if index in selected_indices]
+    if len(canonical) < len(occurrences):
+        notes.append(
+            f"canonicalized_recovery:{len(occurrences)}->{len(canonical)}")
+    else:
+        notes.append("canonicalized_recovery:no_redundant_occurrence")
+    return canonical, notes

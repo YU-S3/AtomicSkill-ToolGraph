@@ -52,6 +52,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from atomic_skillgraph.core.config import SystemConfig  # noqa: E402
 from atomic_skillgraph.system import AtomicSkillGraphSystem  # noqa: E402
 from atomic_skillgraph.graph.validator import validate_graph  # noqa: E402
+from atomic_skillgraph.tools.registry import ToolRegistry  # noqa: E402
 from experiments.common import (  # noqa: E402
     BASELINE_FLOWEVO_CONDITIONS,
     PROJECT_ROOT,
@@ -60,6 +61,7 @@ from experiments.common import (  # noqa: E402
     load_conda_config,
     make_adapter,
     make_llm,
+    restore_system_episode_counters,
     run_balanced_baseline_condition,
     run_baseline_condition,
 )
@@ -129,6 +131,12 @@ def _infer_online_limit(run_dir: Path, condition: str) -> int | None:
 
 def _snapshot_frozen_bank(src_data: Path, dst_data: Path) -> str:
     """原子地建立不可变里程碑快照，拒绝混用不同在线 bank。"""
+    tool_root = src_data / "tools"
+    if tool_root.exists():
+        # A frozen snapshot deliberately excludes private evidence.  Refuse
+        # legacy inline tests and usable Tools that cannot prove Admission;
+        # migration/re-admission must be an explicit online-stage operation.
+        ToolRegistry(tool_root).assert_frozen_ready()
     source_digest = _bank_digest(src_data)
     marker_path = dst_data.parent / "frozen_snapshot.json"
     if marker_path.exists():
@@ -231,6 +239,7 @@ def run_frozen_condition(condition: str, run_dir: Path, eval_dir: Path,
                 f"{condition} 冻结评估断点与本次任务清单不一致；请使用新输出目录")
         episodes = list(progress.get("episodes") or [])
     completed = len(episodes)
+    restore_system_episode_counters(system, episodes)
     if monitor is not None and completed:
         monitor.task_update(completed, note=f"resume {completed}/{len(tasks)}")
     for index, task in enumerate(tasks[completed:], start=completed + 1):
