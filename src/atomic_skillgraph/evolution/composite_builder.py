@@ -19,7 +19,10 @@ from ..core.trace_ir import TraceRecord
 from ..graph.aligner import align_composite
 from ..graph.registry import SkillGraphRegistry
 from .composite_lifecycle import evaluate_composite
+from .composite_revision import CompositeRevisionBuilder
+from .trace_graph_reconstructor import TraceGraphRevision
 from ..runtime.contract_matcher import match_effect_contract
+from ..runtime.output_materializer import output_is_materializable
 
 
 @dataclass
@@ -42,11 +45,14 @@ class CompositeBuilder:
     def __init__(self, registry: SkillGraphRegistry, config: SystemConfig) -> None:
         self.registry = registry
         self.config = config
+        self.revision_builder = CompositeRevisionBuilder(registry)
 
     def build_or_align(self, atomic_refs: list[SkillRef],
                        trace: TraceRecord, *,
                        segments: list[dict[str, Any]] | None = None,
-                       graph_proposal: dict[str, Any] | None = None) -> CompositeBuildResult:
+                       graph_proposal: dict[str, Any] | None = None,
+                       revision: TraceGraphRevision | None = None
+                       ) -> CompositeBuildResult:
         features = self.config.features
         if not features.enable_composite:
             return CompositeBuildResult(decision="skipped",
@@ -146,6 +152,8 @@ class CompositeBuilder:
                 "statistics": {"use_count": 0, "success_count": 1,
                                "failure_count": 0, "utility": 0.5,
                                "support_count": 1},
+                "source_graph_revision": (
+                    revision.to_dict() if revision is not None else {}),
             },
             status=SkillStatus.DRAFT,
         )
@@ -172,6 +180,8 @@ class CompositeBuilder:
                 existing.metadata.setdefault("candidate", {})[
                     "lifecycle_reason"] = lifecycle.reason
                 self.registry.update_runtime_state(existing)
+                self.revision_builder.apply(
+                    existing, revision, trace_id=trace.trace_id)
                 return CompositeBuildResult(composite=existing, decision="reuse",
                                             reason="same_atomic_chain")
         # 同一逻辑链下确有不同的已验证 DAG 时分配新版本，绝不再次写入
@@ -186,6 +196,8 @@ class CompositeBuilder:
             candidate.ref = SkillRef(logical_id=logical_id, version=version)
             candidate.metadata["version_reason"] = "genuinely_distinct_occurrence_dag"
         self.registry.register(candidate)
+        self.revision_builder.apply(
+            candidate, revision, trace_id=trace.trace_id)
         return CompositeBuildResult(composite=candidate, decision="new",
                                     reason="registered")
 
@@ -314,13 +326,18 @@ def _infer_data_edges(steps: list[dict[str, Any]], registry: SkillGraphRegistry,
                     continue
                 matched = False
                 for output in list(getattr(source, "outputs", None) or []):
+                    output_name = str(output.get("name") or "")
+                    if (not output_name
+                            or not output_is_materializable(
+                                source, output_name)):
+                        continue
                     same_type = bool(
                         output.get("semantic_type")
                         and output.get("semantic_type")
                         == input_spec.get("semantic_type"))
                     source_value = dict(source_step.get("metadata", {}).get(
                         "grounded_params") or {}).get(
-                        str(output.get("name") or ""))
+                        output_name)
                     target_value = dict(target_step.get("metadata", {}).get(
                         "grounded_params") or {}).get(
                         str(input_spec.get("name") or ""))
@@ -338,7 +355,7 @@ def _infer_data_edges(steps: list[dict[str, Any]], registry: SkillGraphRegistry,
                         source_step=source_step["step_id"],
                         target_step=target_step["step_id"],
                         mapping={
-                            "source_output": str(output.get("name")),
+                            "source_output": output_name,
                             "target_input": str(input_spec.get("name")),
                             "schema": str(input_spec.get("semantic_type") or "value"),
                             "transform": "identity",

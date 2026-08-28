@@ -11,7 +11,8 @@ import time
 from typing import Any
 
 from .adapters.benchmark import BenchmarkAdapter, EnvRunResult, Task
-from .core.binding_ir import is_concrete_binding
+from .core.binding_ir import (BindingKind, BindingProvenance,
+                              BindingResolutionState, is_concrete_binding)
 from .atomicizer.trace_atomicizer import TraceAtomicizer
 from .core.config import SystemConfig
 from .core.llm import LLM
@@ -19,12 +20,16 @@ from .core.status import EdgeType, ExecutionMode, SkillNodeKind, SkillStatus, To
 from .core.trace_ir import (
     ActionRecord,
     AttemptRecord,
+    NodeExecutionStatus,
     NodeValidationResult,
+    RuntimeSpan,
+    TaskGapAnalysis,
     TaskExecutionInstance,
     TraceRecord,
 )
 from .evolution.failure_processor import FailureProcessor
 from .evolution.branch_repair import FailureBranchManager
+from .evolution.composite_lifecycle import apply_self_sufficient_evidence
 from .evolution.proposal_replayer import ProposalReplayer
 from .evolution.success_processor import SuccessProcessor
 from .graph.registry import SkillGraphRegistry
@@ -35,7 +40,9 @@ from .runtime.execution_bridge import ExecutionBridge
 from .runtime.implementation_selector import ImplementationSelector
 from .runtime.runtime_graph import RuntimeGraph
 from .runtime.budget import BudgetLedger
-from .runtime.plan_validator import semantic_required_slots
+from .runtime.plan_validator import (semantic_required_slots,
+                                     slot_requirements_for)
+from .runtime.output_materializer import materialize_atomic_outputs
 from .tools.resolver import ToolResolver
 from .tools.registry import ToolRegistry
 from .validation.composite_validator import CompositeValidator
@@ -175,7 +182,11 @@ class AtomicSkillGraphSystem:
             self.success_count += 1
         node_mode_counts: dict[str, int] = {}
         executed_node_count = 0
+        already_satisfied_node_count = 0
         for node in runtime_graph.nodes:
+            if node.execution_status == NodeExecutionStatus.ALREADY_SATISFIED:
+                already_satisfied_node_count += 1
+                continue
             if not node.attempts and node.validation is None and not node.impl_ref:
                 continue
             executed_node_count += 1
@@ -224,6 +235,7 @@ class AtomicSkillGraphSystem:
             "node_mode_counts": node_mode_counts,
             "planned_node_count": len(runtime_graph.nodes),
             "executed_node_count": executed_node_count,
+            "already_satisfied_node_count": already_satisfied_node_count,
             # The benchmark may legally terminate before every retrieved node is
             # needed.  Keep this separate from a runtime/tool failure.  This is
             # observable in ALFWorld games whose initial PDDL state already
@@ -359,6 +371,10 @@ class AtomicSkillGraphSystem:
                 node.after = after
                 node.attempt_started = True
                 node.executed_action_count = 1
+                node.outputs = (materialize_atomic_outputs(
+                    atomic, node.params, task.state, after,
+                    tool_result=_execution_output_payload(direct_result))
+                    if validation.passed else {})
                 node.attempts.append({
                     "mode": ExecutionMode.DIRECT.value, "started": True,
                     "passed": validation.passed,
@@ -551,9 +567,9 @@ class AtomicSkillGraphSystem:
                     runtime_graph.record_usage(ExecutionMode.DIRECT)
                     if node.passed:
                         runtime_graph.record_direct_success()
-                if node.tool_refs:
+                if node.tool_refs and node.attempt_started:
                     self._record_tool_feedback(node.tool_refs, node.passed, "direct")
-                if node.impl_ref:
+                if node.impl_ref and node.attempt_started:
                     self._record_impl_feedback([node.impl_ref], node.passed)
             if result.success:
                 self._fill_env_trace(trace, result, runtime_graph)
@@ -630,10 +646,43 @@ class AtomicSkillGraphSystem:
             # or by framework discovery; otherwise node_results records the
             # stale class-valued planning input rather than the executed one.
             node.params = dict(planned.params)
+            node.binding_provenance = _runtime_binding_provenance(
+                task, planned, runtime_graph, before)
             atomic = None if planned.dynamic else self.registry.get(planned.ref)
             effects = list(planned.target_effects or getattr(atomic, "effects", []) or [])
             candidates: list[tuple[ExecutionMode, str, list[dict[str, Any]]]] = []
             location_discovered = False
+
+            # A state that already satisfies this exact, grounded occurrence
+            # advances control flow without pretending that a Tool/LLM ran.
+            # Cardinality branches require a concrete unused instance; a
+            # class-valued slot may not let occurrence two reuse occurrence one.
+            if (effects and _can_mark_already_satisfied(
+                    task, planned, effects, before, runtime_graph, index)):
+                validation = NodeValidationResult(
+                    node_ref=str(planned.ref), level="atomic", passed=True,
+                    step_id=node.step_id, occurrence_id=node.occurrence_id,
+                    attempt_index=-1, mode=NodeExecutionStatus.ALREADY_SATISFIED.value,
+                    checks={"effects_already_satisfied": True},
+                    before=before, after=before,
+                    messages=["occurrence effect already satisfied before execution"],
+                )
+                node.validation = validation
+                node.before = dict(before)
+                node.after = dict(before)
+                node.passed = True
+                node.execution_status = NodeExecutionStatus.ALREADY_SATISFIED
+                node.satisfied_without_execution = True
+                node.outputs = materialize_atomic_outputs(
+                    atomic, planned.params, before, before)
+                trace.node_validators.append(validation)
+                _update_verified_runtime_bindings(
+                    task, planned, runtime_graph, shared_bindings, index)
+                routing_audit["candidate_modes"] = []
+                routing_audit["already_satisfied"] = True
+                routing_audit["final_passed"] = True
+                routing_audit["attempts"] = []
+                continue
 
             if atomic is not None:
                 produces_possession = any(
@@ -646,6 +695,8 @@ class AtomicSkillGraphSystem:
                 planned.params = _bind_known_location_slots(
                     planned.params, atomic, before)
                 node.params = dict(planned.params)
+                node.binding_provenance = _runtime_binding_provenance(
+                    task, planned, runtime_graph, before)
                 location_slots = self.selector.discoverable_location_slots(
                     atomic.ref, {"inputs": planned.params, "harness": "env"})
                 location_slots |= {
@@ -720,6 +771,16 @@ class AtomicSkillGraphSystem:
                         if remapped:
                             planned.params.update(remapped)
                             node.params = dict(planned.params)
+                            for role, value in remapped.items():
+                                node.binding_provenance[str(role)] = (
+                                    BindingProvenance(
+                                        source="runtime",
+                                        role=str(role),
+                                        evidence=(
+                                            "framework_discovery",
+                                            f"value={value}",
+                                        ),
+                                    ).to_dict())
                             location_discovered = True
                         else:
                             node.fallback_reason = (
@@ -813,11 +874,25 @@ class AtomicSkillGraphSystem:
             routing_audit["location_discovered"] = bool(location_discovered)
 
             required_slots = semantic_required_slots(effects)
+            runtime_resolvable = _runtime_resolvable_semantic_slots(
+                atomic, effects, planned.params)
             unresolved_core = sorted(
                 slot for slot in required_slots
-                if not is_concrete_binding(planned.params.get(slot)))
+                if (not is_concrete_binding(planned.params.get(slot))
+                    and slot not in runtime_resolvable))
             routing_audit["semantic_required_slots"] = sorted(required_slots)
+            routing_audit["runtime_resolvable_semantic_slots"] = sorted(
+                runtime_resolvable)
             routing_audit["unresolved_semantic_slots"] = unresolved_core
+            if runtime_resolvable:
+                # Runtime-resolvable semantic values are a valid source-closed
+                # Seeded/Dynamic route, but cannot be sent to Direct as an
+                # unresolved Tool argument.  The executed action/state Effect
+                # must ground them before node validation and output materialization.
+                candidates = [item for item in candidates
+                              if item[0] != ExecutionMode.DIRECT]
+                routing_audit["candidate_modes"] = [
+                    mode.value for mode, _, _ in candidates]
             if unresolved_core:
                 cause = "plan_binding_unresolved"
                 node.fallback_reason = cause
@@ -914,6 +989,14 @@ class AtomicSkillGraphSystem:
                 planned.params = grounded
                 node.params = dict(grounded)
                 if binding_evidence:
+                    for item in binding_evidence:
+                        role = str(item.get("parameter") or "")
+                        if not role:
+                            continue
+                        node.binding_provenance[role] = BindingProvenance(
+                            source="runtime", role=role,
+                            evidence=(str(item.get("source") or "runtime"),),
+                        ).to_dict()
                     trace.metrics.setdefault("runtime_param_bindings", []).append({
                         "node_ref": str(planned.ref),
                         "mode": mode.value,
@@ -967,6 +1050,9 @@ class AtomicSkillGraphSystem:
                                       "after": after})
                 node.validation = validation
                 node.before, node.after, node.passed = before, after, passed
+                node.execution_status = (
+                    NodeExecutionStatus.EXECUTED_SUCCESS if passed
+                    else NodeExecutionStatus.EXECUTED_FAILURE)
                 resume = after_payload
                 # Executable 证据必须按实际 attempt 记账。后续 Seeded/Dynamic
                 # 是否救回节点，都不能覆盖本次 Direct Tool 的真实结果。
@@ -977,8 +1063,10 @@ class AtomicSkillGraphSystem:
                 if mode == ExecutionMode.DIRECT and node.impl_ref:
                     self._record_impl_feedback([node.impl_ref], passed)
                 if passed:
-                    node.outputs = _materialize_atomic_outputs(
-                        atomic, planned.params, after)
+                    node.outputs = materialize_atomic_outputs(
+                        atomic, planned.params, attempt_before, after,
+                        tool_result=(_execution_output_payload(result)
+                                     if mode == ExecutionMode.DIRECT else None))
                     _update_verified_runtime_bindings(
                         task, planned, runtime_graph, shared_bindings, index)
                     node_succeeded = True
@@ -999,27 +1087,147 @@ class AtomicSkillGraphSystem:
             if not node_succeeded:
                 break
 
-        # 所有原子目标已满足但 benchmark 尚未发出 won 时，让动态 Agent 收尾；
-        # 这是任务级验证，不改变已完成节点的归因。
-        all_nodes_passed = bool(runtime_graph.nodes) and all(n.passed for n in runtime_graph.nodes)
-        if last_result is not None and not last_result.success and all_nodes_passed:
-            final_actions = len((resume or {}).get("actions") or [])
-            if final_actions < int(self.config.max_steps):
-                runtime_graph.record_usage(ExecutionMode.DYNAMIC)
-                last_result = self.adapter.run_env_episode(
-                    task, self.llm, seed_context="", max_steps=self.config.max_steps,
-                    resume=resume,
-                )
-            else:
-                trace.failure_stage = "budget"
-                trace.failure_cause = "episode_budget_exhausted"
+        # Freeze the self-sufficiency boundary before any task-level rescue.
+        # A selected Composite is validated only against this state.  Missing
+        # formal target Effects become one explicit task-gap occurrence;
+        # protocol completion after all Effects hold is non-learnable.
+        pre_gap_payload = dict(resume or {})
+        pre_gap_state = dict(pre_gap_payload.get("state") or task.state or {})
+        pre_gap_action_index = len(pre_gap_payload.get("actions") or [])
+        trace.pre_gap_state = copy.deepcopy(pre_gap_state)
+        trace.pre_gap_action_index = pre_gap_action_index
+        trace.provenance["pre_gap_bindings"] = copy.deepcopy(shared_bindings)
+        gap_analysis = analyze_task_gap(task, pre_gap_state, shared_bindings)
+        trace.task_gap_analysis = gap_analysis
+
+        planned_node_count = len(runtime_graph.nodes)
+        all_nodes_passed = bool(planned_node_count) and all(
+            node.passed for node in runtime_graph.nodes[:planned_node_count])
+        benchmark_pending = last_result is None or not last_result.success
+        if benchmark_pending and all_nodes_passed:
+            if gap_analysis.missing_effects:
+                final_actions = pre_gap_action_index
+                if final_actions < int(self.config.max_steps):
+                    runtime_graph.record_usage(ExecutionMode.DYNAMIC)
+                    gap_index = runtime_graph.append_dynamic_gap(
+                        gap_analysis.missing_effects, shared_bindings)
+                    gap_node = runtime_graph.nodes[gap_index]
+                    gap_plan = runtime_graph.plan.nodes[gap_index]
+                    gap_result = self.adapter.run_env_episode(
+                        task, self.llm, seed_context="",
+                        max_steps=self.config.max_steps, resume=resume,
+                        stop_effects=gap_analysis.missing_effects,
+                        effect_inputs=dict(shared_bindings),
+                        node_ref=str(gap_plan.ref),
+                        phase_goal=_phase_goal_of(
+                            None, gap_analysis.missing_effects,
+                            shared_bindings),
+                    )
+                    gap_end = len(gap_result.actions or [])
+                    _mark_result_action_origin(
+                        gap_result, final_actions, gap_end,
+                        origin="task_gap_agent", node_ref=str(gap_plan.ref))
+                    gap_after_payload = _env_resume_payload(gap_result)
+                    gap_after = dict(gap_after_payload.get("state") or pre_gap_state)
+                    from .core.predicates import StateSnapshot, check_effects
+                    gap_passed, gap_missing = check_effects(
+                        StateSnapshot(gap_after), shared_bindings,
+                        gap_analysis.missing_effects, {"harness": "env"})
+                    gap_validation = NodeValidationResult(
+                        node_ref=str(gap_plan.ref), level="task_gap",
+                        passed=gap_passed, step_id=gap_node.step_id,
+                        occurrence_id=gap_node.occurrence_id,
+                        attempt_index=0, mode=ExecutionMode.DYNAMIC.value,
+                        failure_stage="validation",
+                        checks={"missing_target_effects": gap_passed},
+                        before=pre_gap_state, after=gap_after,
+                        messages=[] if gap_passed else [
+                            f"task gap effects not satisfied: {gap_missing}"],
+                    )
+                    gap_node.validation = gap_validation
+                    gap_node.before, gap_node.after = pre_gap_state, gap_after
+                    gap_node.passed = gap_passed
+                    gap_node.attempt_started = gap_end > final_actions
+                    gap_node.executed_action_count = max(
+                        0, gap_end - final_actions)
+                    gap_node.execution_status = (
+                        NodeExecutionStatus.EXECUTED_SUCCESS if gap_passed
+                        else NodeExecutionStatus.EXECUTED_FAILURE)
+                    gap_node.attempts.append({
+                        "mode": ExecutionMode.DYNAMIC.value,
+                        "started": gap_node.attempt_started,
+                        "passed": gap_passed,
+                        "failure_type": str(gap_result.failure_type or ""),
+                        "failure_stage": "execution",
+                        "failure_cause": str(gap_result.failure_type or ""),
+                        "params": dict(shared_bindings), "tool_refs": [],
+                        "action_start": final_actions, "action_end": gap_end,
+                        "action_count": gap_node.executed_action_count,
+                        "step_id": gap_node.step_id,
+                        "occurrence_id": gap_node.occurrence_id,
+                        "before": pre_gap_state, "after": gap_after,
+                    })
+                    trace.node_validators.append(gap_validation)
+                    trace.runtime_spans.append(RuntimeSpan(
+                        kind="task_gap", occurrence_id=gap_node.occurrence_id,
+                        action_start=final_actions, action_end=gap_end,
+                        node_ref=str(gap_plan.ref),
+                        missing_effects=copy.deepcopy(
+                            gap_analysis.missing_effects), learnable=True,
+                    ))
+                    trace.metrics["task_gap_required_count"] = 1
+                    resume = gap_after_payload
+                    last_result = gap_result
+                    # Some harnesses require a final protocol action after the
+                    # formal target state is reached.  Keep that separate from
+                    # the learnable task-gap occurrence.
+                    if (gap_passed and not gap_result.success
+                            and gap_end < int(self.config.max_steps)):
+                        last_result = self._run_benchmark_finalization(
+                            task, resume, trace, gap_end)
+                        resume = _env_resume_payload(last_result)
+                else:
+                    trace.failure_stage = "budget"
+                    trace.failure_cause = "episode_budget_exhausted"
+            elif gap_analysis.benchmark_only_finalization:
+                final_actions = pre_gap_action_index
+                if final_actions < int(self.config.max_steps):
+                    last_result = self._run_benchmark_finalization(
+                        task, resume, trace, final_actions)
+                    resume = _env_resume_payload(last_result)
+                else:
+                    trace.failure_stage = "budget"
+                    trace.failure_cause = "episode_budget_exhausted"
         if last_result is None:
             last_result = self.adapter.run_env_episode(task, self.llm,
                                                        max_steps=self.config.max_steps)
+        _append_planned_runtime_spans(trace, runtime_graph)
         self._fill_env_trace(trace, last_result, runtime_graph)
         if trace.failure_cause and trace.failure_stage in {"planning", "budget"}:
             trace.failure_type = trace.failure_cause
         return trace
+
+    def _run_benchmark_finalization(
+            self, task: Task, resume: dict[str, Any] | None,
+            trace: TraceRecord, action_start: int) -> Any:
+        """Finish a benchmark protocol without generating learnable evidence."""
+        result = self.adapter.run_env_episode(
+            task, self.llm, seed_context="", max_steps=self.config.max_steps,
+            resume=resume)
+        action_end = len(result.actions or [])
+        _mark_result_action_origin(
+            result, action_start, action_end,
+            origin="benchmark_finalization",
+            node_ref="runtime.benchmark_finalization@0.0.0")
+        trace.runtime_spans.append(RuntimeSpan(
+            kind="benchmark_finalization",
+            occurrence_id="benchmark_finalization_000",
+            action_start=action_start, action_end=action_end,
+            node_ref="runtime.benchmark_finalization@0.0.0",
+            learnable=False,
+        ))
+        trace.metrics["benchmark_finalization_count"] = 1
+        return result
 
     def _finalize_validation(self, trace: TraceRecord, task: Task) -> None:
         """持久化四层验证结果；各层独立记录，不用上层成功掩盖下层失败。"""
@@ -1040,13 +1248,62 @@ class AtomicSkillGraphSystem:
             except (ValueError, TypeError):
                 composite = None
             if composite is not None:
-                result = self.composite_validator.validate_composite(
+                runtime_graph = getattr(self, "_last_runtime_graph", None)
+                runtime_edges = ([edge.to_dict() for edge in runtime_graph.edges]
+                                 if runtime_graph is not None else None)
+                common_context = {
+                    "harness": "env" if _is_env_task(task) else "code_math",
+                    "realized_nodes": copy.deepcopy(trace.realized_atomic_nodes),
+                    "runtime_edges": runtime_edges,
+                    "require_realized_data_flow": runtime_edges is not None,
+                }
+                planned_results = [
+                    item for item in trace.node_validators
+                    if item.level == "atomic"
+                    and not str(item.node_ref).startswith(
+                        "runtime.dynamic.task_gap")
+                ]
+                self_result = self.composite_validator.validate_composite(
                     composite,
-                    [item for item in trace.node_validators if item.level == "atomic"],
-                    trace.final_state(), inputs=realized_inputs,
-                    context={"harness": "env" if _is_env_task(task) else "code_math"},
+                    planned_results,
+                    trace.pre_gap_state or trace.final_state(),
+                    inputs=realized_inputs,
+                    context={
+                        **common_context,
+                        "task_gap_required": bool(
+                            trace.task_gap_analysis is not None
+                            and trace.task_gap_analysis.missing_effects),
+                        "task_gap_analysis": trace.task_gap_analysis,
+                    },
+                    registry=self.registry,
                 )
-                trace.validation_layers["composite"] = result.to_dict()
+                if (trace.task_gap_analysis is not None
+                        and trace.task_gap_analysis.missing_effects):
+                    self_result.checks["task_gap_not_required"] = False
+                    if "task_gap_required" not in self_result.failure_codes:
+                        self_result.failure_codes.append("task_gap_required")
+                    self_result.messages.append(
+                        "selected Composite required a task-gap rescue")
+                    self_result.passed = False
+                full_result = self.composite_validator.validate_composite(
+                    composite, planned_results, trace.final_state(),
+                    inputs=realized_inputs,
+                    context=common_context,
+                    registry=self.registry,
+                )
+                gap_results = [item for item in trace.node_validators
+                               if item.level == "task_gap"]
+                if gap_results:
+                    full_result.checks["task_gap_effects_passed"] = all(
+                        item.passed for item in gap_results)
+                    full_result.passed = all(full_result.checks.values())
+                trace.validation_layers["selected_composite_self"] = (
+                    self_result.to_dict())
+                trace.validation_layers["full_runtime_graph"] = (
+                    full_result.to_dict())
+                # Backward-compatible key now deliberately means self-
+                # sufficient validation, never post-gap task success.
+                trace.validation_layers["composite"] = self_result.to_dict()
         trace.validation_layers["benchmark"] = {
             "passed": bool(trace.success),
             "result": dict(trace.benchmark_result),
@@ -1083,6 +1340,13 @@ class AtomicSkillGraphSystem:
             spec["inputs"].update(grounded)
             node.params = dict(grounded)
             if binding_evidence:
+                for item in binding_evidence:
+                    role = str(item.get("parameter") or "")
+                    if role:
+                        node.binding_provenance[role] = BindingProvenance(
+                            source="runtime", role=role,
+                            evidence=(str(item.get("source") or "runtime"),),
+                        ).to_dict()
                 trace.metrics.setdefault("runtime_param_bindings", []).append({
                     "node_ref": spec["node_ref"],
                     "mode": ExecutionMode.DIRECT.value,
@@ -1103,6 +1367,13 @@ class AtomicSkillGraphSystem:
             node.passed = validation.passed
             node.attempt_started = after_index > action_start
             node.executed_action_count = max(0, after_index - action_start)
+            node.satisfied_without_execution = bool(
+                validation.passed and not node.attempt_started)
+            node.execution_status = (
+                NodeExecutionStatus.ALREADY_SATISFIED
+                if node.satisfied_without_execution else
+                (NodeExecutionStatus.EXECUTED_SUCCESS if validation.passed
+                 else NodeExecutionStatus.EXECUTED_FAILURE))
             node.attempts.append({
                 "mode": ExecutionMode.DIRECT.value,
                 "started": node.attempt_started,
@@ -1118,7 +1389,9 @@ class AtomicSkillGraphSystem:
                 "step_id": node.step_id,
                 "occurrence_id": node.occurrence_id,
             })
-            node.outputs = (_materialize_atomic_outputs(atomic, grounded, after)
+            node.outputs = (materialize_atomic_outputs(
+                                atomic, grounded, before, after,
+                                tool_result=_execution_output_payload(result))
                             if validation.passed else {})
             trace.node_validators.append(validation)
 
@@ -1274,6 +1547,15 @@ class AtomicSkillGraphSystem:
             core_bound = all(is_concrete_binding(
                 dict(realized.get("params") or {}).get(slot))
                 for slot in required_slots)
+            if (str(realized.get("execution_status") or "")
+                    == NodeExecutionStatus.ALREADY_SATISFIED.value):
+                stats["selection_count"] = int(
+                    stats.get("selection_count", 0)) + 1
+                stats["already_satisfied_count"] = int(
+                    stats.get("already_satisfied_count", 0)) + 1
+                obj.metadata["statistics"] = stats
+                self.registry.update_runtime_state(obj)
+                continue
             if not started or not core_bound:
                 stats["selection_count"] = int(
                     stats.get("selection_count", 0)) + 1
@@ -1354,36 +1636,53 @@ class AtomicSkillGraphSystem:
                 stats["selection_count"] = int(
                     stats.get("selection_count", 0)) + 1
                 composite_validation = dict(
-                    trace.validation_layers.get("composite") or {})
-                validated = bool(composite_validation)
+                    trace.validation_layers.get("selected_composite_self")
+                    or trace.validation_layers.get("composite") or {})
+                task_gap_missing = bool(
+                    trace.task_gap_analysis is not None
+                    and trace.task_gap_analysis.missing_effects)
+                strong_task_gap_proof = _task_gap_is_strong_proof(trace)
+                inconclusive_gap = bool(
+                    task_gap_missing and not strong_task_gap_proof)
+                validated = bool(composite_validation) and not inconclusive_gap
                 composite_passed = bool(
                     composite_validation.get("passed")) if validated else False
                 stats["validation_count"] = int(
                     stats.get("validation_count", 0)) + int(validated)
                 stats["use_count"] = int(stats.get("use_count", 0)) + 1
-                key = ("execution_success_count" if composite_passed
-                       else "execution_failure_count")
-                stats[key] = int(stats.get(key, 0)) + 1
+                if validated:
+                    key = ("execution_success_count" if composite_passed
+                           else "execution_failure_count")
+                    stats[key] = int(stats.get(key, 0)) + 1
+                elif inconclusive_gap:
+                    stats["unproven_task_gap_count"] = int(
+                        stats.get("unproven_task_gap_count", 0)) + 1
+                if int(trace.metrics.get("benchmark_finalization_count", 0)):
+                    stats["benchmark_finalization_count"] = int(
+                        stats.get("benchmark_finalization_count", 0)) + 1
                 benchmark_key = ("benchmark_success_count" if success
                                  else "benchmark_failure_count")
                 stats[benchmark_key] = int(stats.get(benchmark_key, 0)) + 1
-                total = int(stats["use_count"])
-                empirical = int(stats.get(
-                    "execution_success_count", 0)) / max(total, 1)
-                stats["utility"] = round(
-                    0.5 * float(stats.get("utility", 0.5))
-                    + 0.5 * empirical, 4)
+                execution_total = (
+                    int(stats.get("execution_success_count", 0))
+                    + int(stats.get("execution_failure_count", 0)))
+                if validated and execution_total:
+                    empirical = int(stats.get(
+                        "execution_success_count", 0)) / execution_total
+                    stats["utility"] = round(
+                        0.5 * float(stats.get("utility", 0.5))
+                        + 0.5 * empirical, 4)
                 obj.metadata["statistics"] = stats
-                messages = [str(value).lower() for value in
-                            composite_validation.get("messages") or []]
-                if any("binding" in value or "data_flow" in value
-                       or "edge" in value for value in messages):
-                    # Structural failure is deterministic for this exact
-                    # version; remove it from normal planning immediately.
-                    obj.status = SkillStatus.SUPPRESSED
-                    obj.metadata["suppression_reason"] = (
-                        "runtime_composite_structural_validation_failed")
+                failure_codes = {
+                    str(value) for value in
+                    (composite_validation.get("failure_codes") or [])}
                 self.registry.update_runtime_state(obj)
+                if validated:
+                    apply_self_sufficient_evidence(
+                        obj, self.registry, passed=composite_passed,
+                        failure_codes=failure_codes,
+                        task_gap_proved_missing_effect=strong_task_gap_proof,
+                    )
 
     # ------------------------------------------------------------------
     def _get_recommended(self, logical_id: str):
@@ -1464,6 +1763,148 @@ def _build_planning_audit(task: Task, plan: Any,
     }
 
 
+def analyze_task_gap(task: Task, state: dict[str, Any],
+                     bindings: dict[str, Any]) -> TaskGapAnalysis:
+    """Compute the formal target delta at the exact planned-graph boundary."""
+    from .core.predicates import StateSnapshot, check_effects
+
+    missing: list[dict[str, Any]] = []
+    snapshot = StateSnapshot(state or {})
+    for raw in task.target_effects or []:
+        if not isinstance(raw, dict) or not raw.get("predicate"):
+            continue
+        effect = copy.deepcopy(raw)
+        passed, _messages = check_effects(
+            snapshot, bindings, [effect], {"harness": "env"})
+        if not passed:
+            missing.append(effect)
+    targets_satisfied = not missing
+    reasons = (["formal_target_effects_missing_at_pre_gap_boundary"]
+               if missing else
+               ["formal_target_effects_satisfied_but_benchmark_not_terminal"])
+    return TaskGapAnalysis(
+        missing_effects=missing,
+        targets_already_satisfied=targets_satisfied,
+        benchmark_only_finalization=targets_satisfied,
+        reasons=reasons,
+    )
+
+
+def _task_gap_is_strong_proof(trace: TraceRecord) -> bool:
+    """Require executed, code-validated gap evidence before suppression."""
+    analysis = trace.task_gap_analysis
+    if (not trace.success or not trace.selected_composite
+            or analysis is None or not analysis.missing_effects):
+        return False
+    proof = dict((trace.provenance or {}).get("task_gap_effect_proof") or {})
+    if (not bool(proof.get("passed"))
+            or not list(proof.get("action_caused_effects") or [])):
+        return False
+    spans = [span for span in trace.runtime_spans if span.kind == "task_gap"]
+    if not spans or not any(span.action_end > span.action_start for span in spans):
+        return False
+    gap_ids = {span.occurrence_id for span in spans}
+    proved_occurrences = {
+        str(value) for value in (proof.get("inserted_occurrence_ids") or [])
+        if str(value)}
+    if not proved_occurrences or not proved_occurrences.issubset(gap_ids):
+        return False
+    planned = [
+        node for node in trace.realized_atomic_nodes
+        if str(node.get("occurrence_id") or "") not in gap_ids
+        and not str(node.get("ref") or "").endswith(
+            "runtime.dynamic.task_gap@0.0.0")
+    ]
+    if not planned or not all(bool(node.get("passed")) for node in planned):
+        return False
+    return any(
+        item.level == "task_gap" and item.passed
+        and item.occurrence_id in gap_ids
+        for item in trace.node_validators
+    )
+
+
+def _mark_result_action_origin(result: Any, start: int, end: int, *,
+                               origin: str, node_ref: str) -> None:
+    actions = list(getattr(result, "actions", None) or [])
+    for index in range(max(0, start), min(max(start, end), len(actions))):
+        actions[index]["origin"] = origin
+        actions[index]["node_ref"] = node_ref
+        if origin != "tool":
+            actions[index]["tool_ref"] = ""
+    result.actions = actions
+
+
+def _append_planned_runtime_spans(trace: TraceRecord,
+                                  runtime_graph: RuntimeGraph) -> None:
+    """Persist final occurrence boundaries without merging task-gap spans."""
+    existing = {(span.kind, span.occurrence_id) for span in trace.runtime_spans}
+    for planned, node in zip(runtime_graph.plan.nodes, runtime_graph.nodes):
+        if planned.source == "task_gap":
+            continue
+        attempts = [dict(item) for item in node.attempts
+                    if bool(item.get("started"))]
+        if not attempts:
+            continue
+        successful = [item for item in attempts if bool(item.get("passed"))]
+        chosen = successful[-1] if successful else attempts[-1]
+        key = ("planned_node", node.occurrence_id)
+        if key in existing:
+            continue
+        trace.runtime_spans.append(RuntimeSpan(
+            kind="planned_node", occurrence_id=node.occurrence_id,
+            action_start=int(chosen.get("action_start", 0)),
+            action_end=int(chosen.get("action_end", 0)),
+            node_ref=node.ref, learnable=True,
+            metadata={"step_id": node.step_id,
+                      "execution_status": node.execution_status.value},
+        ))
+    trace.runtime_spans.sort(
+        key=lambda span: (span.action_start, span.action_end, span.kind))
+
+
+def _can_mark_already_satisfied(
+        task: Task, planned: Any, effects: list[dict[str, Any]],
+        state: dict[str, Any], runtime_graph: RuntimeGraph, index: int) -> bool:
+    from .core.predicates import StateSnapshot, check_effects
+
+    required = semantic_required_slots(effects)
+    if any(not is_concrete_binding(planned.params.get(slot))
+           for slot in required):
+        return False
+    passed, _missing = check_effects(
+        StateSnapshot(state or {}), planned.params, effects,
+        {"harness": "env"})
+    if not passed:
+        return False
+
+    max_cardinality = max(
+        [max(1, int(effect.get("cardinality", 1) or 1))
+         for effect in task.target_effects if isinstance(effect, dict)] or [1])
+    if max_cardinality <= 1:
+        return True
+
+    # In a repeated branch, a prior occurrence with the same contract and the
+    # same semantic binding consumes that witness.  This is role/cardinality
+    # based and contains no benchmark operation or entity vocabulary.
+    current_values = tuple(sorted(
+        (slot, str(planned.params.get(slot))) for slot in required))
+    current_predicates = tuple(sorted(
+        str(effect.get("predicate") or "") for effect in effects))
+    for prior_index in range(index):
+        prior_plan = runtime_graph.plan.nodes[prior_index]
+        prior_state = runtime_graph.nodes[prior_index]
+        prior_predicates = tuple(sorted(
+            str(effect.get("predicate") or "")
+            for effect in prior_plan.target_effects))
+        prior_values = tuple(sorted(
+            (slot, str(prior_plan.params.get(slot))) for slot in required))
+        if (prior_state.passed and prior_predicates == current_predicates
+                and prior_values == current_values):
+            return False
+    return True
+
+
 def _env_resume_payload(result: Any) -> dict[str, Any]:
     """从 EnvRunResult 提取原地续跑载荷（observation/admissible/actions/states）。
 
@@ -1481,6 +1922,19 @@ def _env_resume_payload(result: Any) -> dict[str, Any]:
     }
 
 
+def _execution_output_payload(result: Any) -> Any:
+    """Expose a Direct executor's structured return to output materializers."""
+    if isinstance(result, dict):
+        return (result.get("tool_result") or result.get("outputs") or
+                result.get("result") or result)
+    diagnostics = getattr(result, "diagnostics", None)
+    if isinstance(diagnostics, dict):
+        return (diagnostics.get("tool_result") or
+                diagnostics.get("direct_tool_result") or
+                diagnostics.get("outputs") or diagnostics)
+    return result
+
+
 def _not_started_env_result(resume: dict[str, Any] | None,
                             failure_type: str) -> EnvRunResult:
     payload = dict(resume or {})
@@ -1493,31 +1947,6 @@ def _not_started_env_result(resume: dict[str, Any] | None,
         current_admissible=list(payload.get("admissible") or []),
         final_observation=str(payload.get("observation") or ""),
     )
-
-
-def _materialize_atomic_outputs(atomic: Any, params: dict[str, Any],
-                                after: dict[str, Any]) -> dict[str, Any]:
-    """Expose only concrete values after the Atomic Effect validates."""
-    if atomic is None:
-        return {}
-    outputs: dict[str, Any] = {}
-    for spec in (getattr(atomic, "outputs", []) or []):
-        name = str(spec.get("name") or "")
-        value = params.get(name)
-        if name and is_concrete_binding(value):
-            outputs[name] = value
-    # Output contracts often reuse Effect roles without duplicating values in
-    # an explicit result object. The validated grounded parameters are the
-    # authoritative materialization in that case.
-    for effect in (getattr(atomic, "effects", []) or []):
-        for value in (effect.get("args") or {}).values():
-            if not isinstance(value, str) or not value.startswith("$"):
-                continue
-            role = value.rsplit(".", 1)[-1]
-            grounded = params.get(role)
-            if is_concrete_binding(grounded):
-                outputs.setdefault(role, grounded)
-    return outputs
 
 
 def _is_env_task(task: Task) -> bool:
@@ -1680,6 +2109,100 @@ def _apply_runtime_data_bindings(params: dict[str, Any], step_id: str,
         if _runtime_binding_can_refine(refined.get(role), value):
             refined[role] = value
     return refined
+
+
+def _runtime_resolvable_semantic_slots(
+        atomic: Any, effects: list[dict[str, Any]],
+        params: dict[str, Any]) -> set[str]:
+    """Return unresolved semantic slots with an explicit runtime anchor.
+
+    This mirrors the plan-validator contract at execution time.  Merely adding
+    ``runtime_resolvable`` is insufficient: every declared anchor role must be
+    concrete, otherwise a node-level agent would receive an ungrounded local
+    goal and the whole task must be recompiled/fail closed instead.
+    """
+    if atomic is None:
+        return set()
+    requirements = slot_requirements_for(atomic, effects)
+    result: set[str] = set()
+    for name, requirement in requirements.items():
+        if (not requirement.semantic_required
+                or not requirement.runtime_resolvable
+                or is_concrete_binding(params.get(name))):
+            continue
+        if (requirement.anchor_roles and all(
+                is_concrete_binding(params.get(role))
+                for role in requirement.anchor_roles)):
+            result.add(name)
+    return result
+
+
+def _runtime_binding_provenance(
+        task: Task, planned: Any, runtime_graph: RuntimeGraph,
+        state: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Persist the concrete source used by each current occurrence input."""
+    params = dict(getattr(planned, "params", {}) or {})
+    specs = dict(getattr(planned, "binding_specs", {}) or {})
+    task_params = dict(task.context.get("params") or {})
+    by_step = {item.step_id: item for item in runtime_graph.nodes}
+    result: dict[str, dict[str, Any]] = {}
+    for role, value in params.items():
+        if not is_concrete_binding(value):
+            continue
+        spec = specs.get(role)
+        if spec is not None and not hasattr(spec, "kind"):
+            from .core.binding_ir import BindingSpec
+            spec = BindingSpec.from_value(spec)
+        incoming = next((
+            edge for edge in runtime_graph.edges
+            if edge.type == EdgeType.DATA_FLOW
+            and edge.target_step == getattr(planned, "step_id", "")
+            and str((edge.mapping or {}).get("target_input") or "") == str(role)
+            and (by_step.get(edge.source_step) is not None)
+            and by_step[edge.source_step].passed
+            and by_step[edge.source_step].outputs.get(str(
+                (edge.mapping or {}).get("source_output") or "")) == value
+        ), None)
+        if incoming is not None:
+            source_output = str((incoming.mapping or {}).get(
+                "source_output") or "")
+            provenance = BindingProvenance(
+                source="data_flow", role=str(role),
+                source_step=str(incoming.source_step),
+                source_output=source_output,
+                evidence=("validated_source_output",),
+            )
+        elif (spec is not None and spec.kind == BindingKind.TASK
+              and task_params.get(spec.task_role) == value):
+            provenance = BindingProvenance(
+                source="task", role=str(role),
+                evidence=(f"task_role={spec.task_role}",),
+            )
+        elif role in task_params and task_params.get(role) == value:
+            provenance = BindingProvenance(
+                source="task", role=str(role),
+                evidence=(f"task_role={role}",),
+            )
+        elif spec is not None and spec.kind == BindingKind.LITERAL:
+            provenance = BindingProvenance(
+                source="literal", role=str(role),
+                evidence=("persisted_literal",),
+            )
+        elif spec is not None and spec.kind == BindingKind.STATE:
+            provenance = BindingProvenance(
+                source="state", role=str(role),
+                evidence=(spec.state_predicate or "structured_state",),
+            )
+        else:
+            # The value was refined from the current structured state/shared
+            # verified occurrence context.  This is auditable but deliberately
+            # weaker than an explicit DATA_FLOW producer.
+            provenance = BindingProvenance(
+                source="state", role=str(role),
+                evidence=("runtime_state_or_verified_shared_binding",),
+            )
+        result[str(role)] = provenance.to_dict()
+    return result
 
 
 def _update_verified_runtime_bindings(task: Task, planned: Any,

@@ -73,6 +73,44 @@ from experiments.report import (  # noqa: E402
 OUR_CONDITIONS = ["atomic_graph_only", "tool_repo_only", "atomic_skillgraph_full"]
 
 
+def _validate_complete_online_conditions(
+        run_dir: Path, conditions: list[str],
+        source_manifest: dict) -> None:
+    """Fail closed unless every frozen ours bank completed the same train set."""
+    source_tasks = list(source_manifest.get("tasks") or [])
+    signature = [{
+        "task_id": str(item.get("task_id") or ""),
+        "task_type": str(item.get("task_type") or ""),
+        "game_file": str(item.get("game_file") or ""),
+    } for item in source_tasks]
+    failures: list[str] = []
+    for condition in conditions:
+        progress_path = run_dir / condition / "online_progress.json"
+        if not progress_path.is_file():
+            failures.append(f"{condition}:missing_online_progress")
+            continue
+        try:
+            progress = json.loads(progress_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            failures.append(f"{condition}:invalid_online_progress:{exc}")
+            continue
+        completed = int(progress.get("completed", -1))
+        episodes = list(progress.get("episodes") or [])
+        actual_signature = list(progress.get("task_signature") or [])
+        if completed != len(signature):
+            failures.append(
+                f"{condition}:completed={completed}:expected={len(signature)}")
+        if len(episodes) != len(signature):
+            failures.append(
+                f"{condition}:episodes={len(episodes)}:expected={len(signature)}")
+        if actual_signature != signature:
+            failures.append(f"{condition}:task_signature_mismatch")
+    if failures:
+        raise RuntimeError(
+            "heldout evaluation requires complete, identical online conditions: "
+            + ";".join(failures))
+
+
 def _infer_online_limit(run_dir: Path, condition: str) -> int | None:
     """从在线运行的结果推断任务数。"""
     results_path = run_dir / "results.json"
@@ -327,6 +365,9 @@ def main() -> int:
     conditions = [c for c in args.conditions if (run_dir / c / "data").exists()]
     missing = [c for c in args.conditions if c not in conditions]
     if missing:
+        if args.split == "heldout":
+            print(f"[错误] 正式 heldout 缺少在线条件产物，拒绝部分评估：{missing}")
+            return 1
         print(f"[提示] 以下条件无在线进化产物，跳过：{missing}")
     if not conditions:
         print("[错误] 没有任何条件存在在线进化产物")
@@ -398,6 +439,12 @@ def main() -> int:
             return 1
         source_manifest = json.loads(
             source_manifest_path.read_text(encoding="utf-8"))
+        try:
+            _validate_complete_online_conditions(
+                run_dir, conditions, source_manifest)
+        except RuntimeError as exc:
+            print(f"[错误] {exc}")
+            return 1
         if args.benchmark == "alfworld":
             source_split = str(source_manifest.get("split"))
             if source_split != "train":

@@ -51,6 +51,15 @@ def match_effect_contract(producer_effect: dict[str, Any],
                                 and bindings.get(source_role)
                                 == bindings.get(_placeholder_role(target)))
                             or (is_concrete_binding(source)
+                                and _placeholder_role(target)
+                                and is_concrete_binding(
+                                    bindings.get(_placeholder_role(target)))
+                                and source
+                                == bindings.get(_placeholder_role(target)))
+                            or (source_role and is_concrete_binding(target)
+                                and is_concrete_binding(bindings.get(source_role))
+                                and bindings.get(source_role) == target)
+                            or (is_concrete_binding(source)
                                 and is_concrete_binding(target)
                                 and source == target)), None)
         if match_index is None:

@@ -187,8 +187,9 @@ class SemanticExtractorAgent:
                 input_text=json.dumps(payload, ensure_ascii=False),
                 temperature=0.1, thinking=self.thinking,
                 structured_output=True)
-            proposal = _split_overmerged_phase_proposals(
-                events, _parse_json_object(response.text))
+            proposal = split_proposal_by_runtime_spans(
+                _parse_json_object(response.text), events)
+            proposal = _split_overmerged_phase_proposals(events, proposal)
             result.proposal = proposal
             phases, errors = validate_phase_proposal(trace, events, proposal)
             result.validated_phases = phases
@@ -277,10 +278,14 @@ def build_structured_events(trace: TraceRecord) -> list[dict[str, Any]]:
         causal_positive = [item for item in positive
                            if repr(item) not in observed_keys]
         origin = str(action.get("origin") or "agent")
-        capability_positive = (causal_positive if origin in {"agent", "tool"}
+        capability_origins = {"agent", "tool", "task_gap_agent"}
+        capability_positive = (causal_positive if origin in capability_origins
                                else [])
-        capability_negative = (negative if origin in {"agent", "tool"}
+        capability_negative = (negative if origin in capability_origins
                                else [])
+        runtime_span = next((
+            span for span in trace.runtime_spans
+            if span.action_start <= index < span.action_end), None)
         events.append({
             "event_index": index,
             "step": int(action.get("step", index)),
@@ -292,19 +297,83 @@ def build_structured_events(trace: TraceRecord) -> list[dict[str, Any]]:
             "node_ref": str(action.get("node_ref") or ""),
             "tool_ref": str(action.get("tool_ref") or ""),
             "origin": origin,
+            "runtime_span_kind": (runtime_span.kind if runtime_span else ""),
+            "runtime_occurrence_id": (
+                runtime_span.occurrence_id if runtime_span else ""),
+            "runtime_span_learnable": (
+                runtime_span.learnable if runtime_span else
+                origin not in {"benchmark_finalization", "framework_discovery"}),
             "before": before,
             "after": after,
             "state_positive_effects": causal_positive,
             "state_negative_effects": negative,
             "positive_effects": capability_positive,
             "terminal_verified_effects": (terminal_by_event.get(index, [])
-                                           if origin in {"agent", "tool"} else []),
+                                           if origin in capability_origins else []),
             "observed_effects": observed_predicates,
             "negative_effects": capability_negative,
             "state_changed": bool(causal_positive or negative),
             "observation_changed": bool(observed_predicates),
         })
     return events
+
+
+def split_proposal_by_runtime_spans(
+        proposal: dict[str, Any], events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Prevent an LLM phase from crossing runtime occurrence boundaries."""
+    normalized = dict(proposal or {})
+    phases: list[dict[str, Any]] = []
+    for ordinal, raw in enumerate(normalized.get("phases") or []):
+        if not isinstance(raw, dict):
+            phases.append(raw)
+            continue
+        try:
+            start, end = int(raw["event_start"]), int(raw["event_end"])
+        except (KeyError, TypeError, ValueError):
+            phases.append(dict(raw))
+            continue
+        if start < 0 or end < start or end >= len(events):
+            phases.append(dict(raw))
+            continue
+        groups: list[tuple[int, int, tuple[str, str]]] = []
+        group_start = start
+        prior = (str(events[start].get("runtime_span_kind") or "unscoped"),
+                 str(events[start].get("runtime_occurrence_id") or ""))
+        for index in range(start + 1, end + 1):
+            current = (str(events[index].get("runtime_span_kind") or "unscoped"),
+                       str(events[index].get("runtime_occurrence_id") or ""))
+            if current != prior:
+                groups.append((group_start, index - 1, prior))
+                group_start, prior = index, current
+        groups.append((group_start, end, prior))
+        if len(groups) == 1:
+            phases.append(dict(raw))
+            continue
+        base_id = str(raw.get("phase_id") or f"phase_{ordinal:03d}")
+        for offset, (part_start, part_end, key) in enumerate(groups):
+            effects = sorted({
+                str(effect.get("predicate") or "")
+                for event in events[part_start:part_end + 1]
+                for effect in _event_capability_effects(event)
+                if effect.get("predicate")})
+            if not effects:
+                continue
+            item = dict(raw)
+            item.update({
+                "phase_id": f"{base_id}_span_{offset:02d}",
+                "event_start": part_start,
+                "event_end": part_end,
+                "effect_predicates": effects,
+                "rationale": (f"Code split at runtime span {key[0]}:{key[1]}; "
+                              f"{str(raw.get('rationale') or '')}")[:500],
+            })
+            phases.append(item)
+    normalized["phases"] = phases
+    normalized["runtime_span_normalization"] = {
+        "raw_phase_count": len((proposal or {}).get("phases") or []),
+        "normalized_phase_count": len(phases),
+    }
+    return normalized
 
 
 def _extract_origin_aware_effect(events: list[dict[str, Any]], start: int,
@@ -325,7 +394,8 @@ def _extract_origin_aware_effect(events: list[dict[str, Any]], start: int,
     for event in events[start:end + 1]:
         if not bool(event.get("accepted", True)):
             continue
-        if str(event.get("origin") or "agent") not in {"agent", "tool"}:
+        if str(event.get("origin") or "agent") not in {
+                "agent", "tool", "task_gap_agent"}:
             continue
         for raw in event.get("negative_effects") or []:
             if not isinstance(raw, dict):
@@ -432,6 +502,19 @@ def validate_phase_proposal(trace: TraceRecord, events: list[dict[str, Any]],
         if start < 0 or end < start or end >= len(events) or occupied & indices:
             errors.append(f"phase_{ordinal}:range_out_of_bounds_or_overlap")
             continue
+        span_keys = {
+            (str(events[index].get("runtime_span_kind") or "unscoped"),
+             str(events[index].get("runtime_occurrence_id") or ""))
+            for index in indices
+        }
+        if len(span_keys) > 1:
+            errors.append(f"phase_{ordinal}:crosses_runtime_span_boundary")
+            continue
+        span_kind, runtime_occurrence_id = next(iter(span_keys))
+        if any(not bool(events[index].get("runtime_span_learnable", True))
+               for index in indices):
+            errors.append(f"phase_{ordinal}:non_learnable_runtime_span")
+            continue
         declared = {_declared_predicate_name(item)
                     for item in (raw.get("effect_predicates") or [])}
         declared.discard("")
@@ -510,7 +593,19 @@ def validate_phase_proposal(trace: TraceRecord, events: list[dict[str, Any]],
             _canonical_phase_params(params, effect.primary_family),
             effect.positive, events[start:end + 1],
             core_event=events[trimmed_end if trimmed_end is not None else end])
-        causal_window_start = max(0, previous_core_end + 1)
+        span_window_start = start
+        while span_window_start > 0:
+            prior_key = (
+                str(events[span_window_start - 1].get(
+                    "runtime_span_kind") or "unscoped"),
+                str(events[span_window_start - 1].get(
+                    "runtime_occurrence_id") or ""),
+            )
+            if prior_key != (span_kind, runtime_occurrence_id):
+                break
+            span_window_start -= 1
+        causal_window_start = max(
+            0, previous_core_end + 1, span_window_start)
         causal_event_indices, slice_diagnostics = _minimal_causal_event_indices(
             events, causal_window_start, end, core_names, params,
             core_effects=effect.positive)
@@ -564,6 +659,10 @@ def validate_phase_proposal(trace: TraceRecord, events: list[dict[str, Any]],
         intent = _safe_name(str(effect.suggested_name or proposed_intent))
         phases.append({
             "phase_id": str(raw.get("phase_id") or f"phase_{ordinal:03d}"),
+            "source_kind": span_kind,
+            "runtime_occurrence_id": runtime_occurrence_id,
+            "task_gap_id": (runtime_occurrence_id
+                            if span_kind == "task_gap" else ""),
             "name": intent,
             "proposed_intent": proposed_intent,
             "kind": "env",
@@ -742,6 +841,9 @@ def _phase_audit_view(phase: dict[str, Any]) -> dict[str, Any]:
     """Persist the evidence-bearing phase fields without duplicating full events."""
     return {
         "phase_id": phase.get("phase_id"), "name": phase.get("name"),
+        "source_kind": phase.get("source_kind"),
+        "runtime_occurrence_id": phase.get("runtime_occurrence_id"),
+        "task_gap_id": phase.get("task_gap_id"),
         "proposed_intent": phase.get("proposed_intent"),
         "event_start": phase.get("event_start"), "event_end": phase.get("event_end"),
         "causal_event_indices": list(phase.get("causal_event_indices") or []),
@@ -878,6 +980,11 @@ def _compact_event(event: dict[str, Any]) -> dict[str, Any]:
         "event_index": event["event_index"], "action": event["action"],
         "params": event["params"], "accepted": event["accepted"],
         "mode": event["mode"], "positive_effects": event["positive_effects"],
+        "origin": event.get("origin") or "agent",
+        "runtime_span_kind": event.get("runtime_span_kind") or "",
+        "runtime_occurrence_id": event.get("runtime_occurrence_id") or "",
+        "runtime_span_learnable": bool(
+            event.get("runtime_span_learnable", True)),
         "terminal_verified_effects": event.get("terminal_verified_effects") or [],
         "observed_effects": event.get("observed_effects") or [],
         "negative_effects": event["negative_effects"],
@@ -1320,7 +1427,8 @@ def _event_capability_effects(event: dict[str, Any]) -> list[dict[str, Any]]:
     Certificate audit metadata is stripped before predicate comparison and
     parameterization.  ``observed_effects`` remain excluded.
     """
-    if str(event.get("origin") or "agent") not in {"agent", "tool"}:
+    if str(event.get("origin") or "agent") not in {
+            "agent", "tool", "task_gap_agent"}:
         return []
     effects: list[dict[str, Any]] = []
     seen: set[tuple[str, tuple[tuple[str, str], ...]]] = set()

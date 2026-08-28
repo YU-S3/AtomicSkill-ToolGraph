@@ -9,9 +9,91 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 from .status import ErrorKind, ExecutionMode
+
+
+class NodeExecutionStatus(str, Enum):
+    """Whether an occurrence actually executed, or was already satisfied."""
+
+    NOT_STARTED = "not_started"
+    ALREADY_SATISFIED = "already_satisfied"
+    EXECUTED_SUCCESS = "executed_success"
+    EXECUTED_FAILURE = "executed_failure"
+
+
+@dataclass
+class RuntimeSpan:
+    """Auditable action boundary for one runtime occurrence."""
+
+    kind: str = "planned_node"       # planned_node | task_gap | benchmark_finalization
+    occurrence_id: str = ""
+    action_start: int = 0
+    action_end: int = 0               # exclusive
+    node_ref: str = ""
+    missing_effects: list[dict[str, Any]] = field(default_factory=list)
+    learnable: bool = True
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "occurrence_id": self.occurrence_id,
+            "action_start": self.action_start,
+            "action_end": self.action_end,
+            "node_ref": self.node_ref,
+            "missing_effects": self.missing_effects,
+            "learnable": self.learnable,
+            "metadata": self.metadata,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "RuntimeSpan":
+        return cls(
+            kind=str(data.get("kind") or "planned_node"),
+            occurrence_id=str(data.get("occurrence_id") or ""),
+            action_start=int(data.get("action_start", 0)),
+            action_end=int(data.get("action_end", 0)),
+            node_ref=str(data.get("node_ref") or ""),
+            missing_effects=[dict(item) for item in
+                             (data.get("missing_effects") or [])
+                             if isinstance(item, dict)],
+            learnable=bool(data.get("learnable", True)),
+            metadata=dict(data.get("metadata") or {}),
+        )
+
+
+@dataclass
+class TaskGapAnalysis:
+    """Code-derived difference between the planned boundary and task goal."""
+
+    missing_effects: list[dict[str, Any]] = field(default_factory=list)
+    targets_already_satisfied: bool = False
+    benchmark_only_finalization: bool = False
+    reasons: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "missing_effects": self.missing_effects,
+            "targets_already_satisfied": self.targets_already_satisfied,
+            "benchmark_only_finalization": self.benchmark_only_finalization,
+            "reasons": self.reasons,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "TaskGapAnalysis":
+        return cls(
+            missing_effects=[dict(item) for item in
+                             (data.get("missing_effects") or [])
+                             if isinstance(item, dict)],
+            targets_already_satisfied=bool(
+                data.get("targets_already_satisfied", False)),
+            benchmark_only_finalization=bool(
+                data.get("benchmark_only_finalization", False)),
+            reasons=[str(item) for item in (data.get("reasons") or [])],
+        )
 
 
 def new_id(prefix: str) -> str:
@@ -30,7 +112,7 @@ class ActionRecord:
     mode: ExecutionMode = ExecutionMode.DYNAMIC
     node_ref: str = ""                # 所属原子节点
     tool_ref: str = ""                # 使用的 Tool 引用（可为空）
-    origin: str = "agent"             # agent | tool | framework_discovery
+    origin: str = "agent"             # agent | tool | task_gap_agent | benchmark_finalization | framework_discovery
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -86,6 +168,7 @@ class NodeValidationResult:
     attempt_index: int = -1
     mode: str = ""
     failure_stage: str = ""
+    failure_codes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -101,6 +184,7 @@ class NodeValidationResult:
             "attempt_index": self.attempt_index,
             "mode": self.mode,
             "failure_stage": self.failure_stage,
+            "failure_codes": self.failure_codes,
         }
 
 
@@ -128,6 +212,10 @@ class TraceRecord:
     state_snapshots: list[dict[str, Any]] = field(default_factory=list)
     node_validators: list[NodeValidationResult] = field(default_factory=list)
     validation_layers: dict[str, Any] = field(default_factory=dict)
+    runtime_spans: list[RuntimeSpan] = field(default_factory=list)
+    pre_gap_state: dict[str, Any] = field(default_factory=dict)
+    pre_gap_action_index: int = -1
+    task_gap_analysis: TaskGapAnalysis | None = None
     candidate_code: str = ""
     benchmark_result: dict[str, Any] = field(default_factory=dict)
     success: bool = False
@@ -182,6 +270,11 @@ class TraceRecord:
             "state_snapshots": self.state_snapshots,
             "node_validators": [v.to_dict() for v in self.node_validators],
             "validation_layers": self.validation_layers,
+            "runtime_spans": [span.to_dict() for span in self.runtime_spans],
+            "pre_gap_state": self.pre_gap_state,
+            "pre_gap_action_index": self.pre_gap_action_index,
+            "task_gap_analysis": (self.task_gap_analysis.to_dict()
+                                  if self.task_gap_analysis else None),
             "candidate_code": self.candidate_code,
             "benchmark_result": self.benchmark_result,
             "success": self.success,
@@ -218,6 +311,14 @@ class TraceRecord:
             state_snapshots=list(data.get("state_snapshots") or []),
             node_validators=[NodeValidationResult(**v) for v in (data.get("node_validators") or [])],
             validation_layers=dict(data.get("validation_layers") or {}),
+            runtime_spans=[RuntimeSpan.from_dict(item) for item in
+                           (data.get("runtime_spans") or [])
+                           if isinstance(item, dict)],
+            pre_gap_state=dict(data.get("pre_gap_state") or {}),
+            pre_gap_action_index=int(data.get("pre_gap_action_index", -1)),
+            task_gap_analysis=(TaskGapAnalysis.from_dict(
+                data.get("task_gap_analysis") or {})
+                if data.get("task_gap_analysis") is not None else None),
             candidate_code=str(data.get("candidate_code", "")),
             benchmark_result=dict(data.get("benchmark_result") or {}),
             success=bool(data.get("success", False)),

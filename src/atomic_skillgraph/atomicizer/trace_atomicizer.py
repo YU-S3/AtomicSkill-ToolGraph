@@ -186,6 +186,11 @@ class TraceAtomicizer:
             metadata={
                 "task_type_labels": [trace.task_type] if trace.task_type else [],
                 "source_trace_ids": [trace.trace_id],
+                "source_kinds": [str(segment.get("source_kind") or "unscoped")],
+                "runtime_occurrence_ids": [str(
+                    segment.get("runtime_occurrence_id") or "")],
+                "task_gap_ids": ([str(segment.get("task_gap_id"))]
+                                 if segment.get("task_gap_id") else []),
                 "statistics": {
                     "use_count": 0,
                     "success_count": 1,
@@ -319,6 +324,17 @@ class TraceAtomicizer:
             if effect not in negative_evidence:
                 negative_evidence.append(effect)
         existing.metadata["observed_negative_effects"] = negative_evidence
+        # Provenance is occurrence evidence as well.  Reusing a generalized
+        # Atomic must not erase the fact that one support occurrence came from
+        # an explicit TaskGap (or which Runtime occurrence supplied it).
+        for key in ("source_kinds", "runtime_occurrence_ids", "task_gap_ids"):
+            merged = [str(value) for value in
+                      (existing.metadata.get(key) or []) if str(value)]
+            for value in incoming.metadata.get(key) or []:
+                text = str(value)
+                if text and text not in merged:
+                    merged.append(text)
+            existing.metadata[key] = merged
         if independent:
             # A necessary Precondition should recur.  Intersecting grounded,
             # parameterized contracts removes incidental earlier state such as
@@ -398,8 +414,20 @@ def _materialize_segment_effect(segment: dict[str, Any]) -> ExtractedEffect:
         for name in (item.get("args") or {}):
             if name not in output_names:
                 output_names.append(str(name))
-    effect.outputs = [{"name": name, "semantic_type": _semantic_type_of(name)}
-                      for name in output_names]
+    effect.outputs = []
+    for name in output_names:
+        producer = next((
+            item for item in effect.positive
+            if name in (item.get("args") or {})), {})
+        effect.outputs.append({
+            "name": name,
+            "semantic_type": _semantic_type_of(name),
+            "materializer": {
+                "kind": "effect_arg",
+                "predicate": str(producer.get("predicate") or ""),
+                "arg": name,
+            },
+        })
     effect.validator = {
         "pre_checks": sorted({str(item.get("predicate"))
                               for item in effect.preconditions if item.get("predicate")}),
@@ -418,8 +446,13 @@ def _split_effect(effect: ExtractedEffect) -> list[ExtractedEffect]:
         output_names = list((positive.get("args") or {}).keys())
         children.append(ExtractedEffect(
             positive=[positive], negative=[], inputs=list(effect.inputs),
-            outputs=[{"name": name, "semantic_type": "value"}
-                     for name in output_names],
+            outputs=[{
+                "name": name, "semantic_type": "value",
+                "materializer": {
+                    "kind": "effect_arg", "predicate": predicate,
+                    "arg": name,
+                },
+            } for name in output_names],
             preconditions=list(effect.preconditions),
             validator={
                 "pre_checks": list(effect.validator.get("pre_checks") or []),

@@ -24,7 +24,10 @@ from experiments.common import (  # noqa: E402
     run_our_condition,
     run_balanced_baseline_condition,
 )
-from experiments.run_evolve_eval import _snapshot_frozen_bank  # noqa: E402
+from experiments.run_evolve_eval import (  # noqa: E402
+    _snapshot_frozen_bank,
+    _validate_complete_online_conditions,
+)
 from experiments.run_small import (  # noqa: E402
     _clone_online_run,
     _condition_bank_digests,
@@ -111,6 +114,29 @@ def test_frozen_snapshot_rejects_later_online_milestone(workspace_tmp):
     import pytest
     with pytest.raises(RuntimeError, match="另一在线里程碑"):
         _snapshot_frozen_bank(source, target)
+
+
+def test_heldout_gate_requires_every_online_condition_complete(workspace_tmp):
+    tasks = [{"task_id": "t1", "task_type": "kind", "game_file": "g1"}]
+    manifest = {"tasks": tasks}
+    for condition in ("atomic_graph_only", "tool_repo_only"):
+        root = workspace_tmp / condition
+        root.mkdir(parents=True)
+        (root / "online_progress.json").write_text(json.dumps({
+            "completed": 1,
+            "task_signature": tasks,
+            "episodes": [{"success": True}],
+        }), encoding="utf-8")
+    _validate_complete_online_conditions(
+        workspace_tmp, ["atomic_graph_only", "tool_repo_only"], manifest)
+
+    (workspace_tmp / "tool_repo_only" / "online_progress.json").write_text(
+        json.dumps({"completed": 0, "task_signature": tasks, "episodes": []}),
+        encoding="utf-8")
+    import pytest
+    with pytest.raises(RuntimeError, match="tool_repo_only:completed=0"):
+        _validate_complete_online_conditions(
+            workspace_tmp, ["atomic_graph_only", "tool_repo_only"], manifest)
 
 
 def test_online_milestone_clone_is_independent_and_writable(workspace_tmp):

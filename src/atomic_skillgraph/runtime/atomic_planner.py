@@ -24,8 +24,10 @@ from ..core.skill_ir import AbstractAtomicSkill, CompositeSkill
 from ..core.status import EdgeType, SkillNodeKind, SkillStatus
 from ..graph.graph import composite_step_order
 from ..graph.registry import RetrievalHit, SkillGraphRegistry
+from .data_flow_synthesizer import RuntimeDataFlowSynthesizer
 from .runtime_graph import PlannedNode, RuntimePlan
-from .plan_validator import validate_plan_bindings
+from .plan_validator import (semantic_required_slots, validate_plan_bindings,
+                             validate_plan_source_closure)
 from .contract_matcher import match_effect_contract
 
 
@@ -50,6 +52,7 @@ class AtomicPlanner:
         self.config = config
         self.llm = llm
         self.composite_min_score = 0.45
+        self.data_flow_synthesizer = RuntimeDataFlowSynthesizer()
 
     def compile_runtime_graph(self, task) -> RuntimePlan:
         features = self.config.features
@@ -83,7 +86,8 @@ class AtomicPlanner:
             retrieved = [h for h in retrieved
                          if h.score >= self.config.planning_min_score]
         if not retrieved:
-            return RuntimePlan(start_mode="cold", notes=["no_capability_retrieved"])
+            return self._task_dynamic_plan(
+                task, [], reason="no_capability_retrieved")
 
         # 1. Composite 优先，但先做目标 Effect 充分性硬过滤。summary/utility
         # 只能在同等充分的候选之间重排，不能让两步链压过完整三步链。
@@ -139,46 +143,278 @@ class AtomicPlanner:
                             and self._composite_goal_relevant(
                                 h.obj, task.target_effects))]
             if eligible:
-                # 没有完整 Composite 时才允许用 partial + dynamic gap。若 gap
-                # 参数无法完全绑定，则继续走 Atomic greedy，而不是执行占位符。
-                partial = max(
-                    eligible,
-                    key=lambda h: (self._composite_target_coverage(
-                        h.obj, task.target_effects), h.score),
-                )
-                try:
-                    partial_plan = self._plan_from_composite(task, partial, retrieved)
-                except PlanCompilationError:
-                    partial_plan = None
-                report = (validate_plan_bindings(
-                    partial_plan, self.registry, task) if partial_plan else None)
-                if (partial_plan and report and report.passed
-                        and not self._has_unbound_dynamic_gap(partial_plan.nodes)):
-                    partial_plan.notes.append("composite_partial_with_bound_gap")
-                    return partial_plan
+                # A relevant partial Composite may execute its verified
+                # occurrences, but missing task Effects are never pre-inserted
+                # as anonymous planner nodes.  System.run_task freezes the
+                # pre-gap boundary first and appends exactly one explicit
+                # ``runtime.dynamic.task_gap`` occurrence from the measured
+                # state delta.
+                for partial in sorted(
+                        eligible,
+                        key=lambda h: (self._composite_target_coverage(
+                            h.obj, task.target_effects), h.score),
+                        reverse=True):
+                    # The future explicit Task Gap must itself have a closed
+                    # semantic source.  Otherwise executing the partial plan
+                    # would merely postpone an ungrounded local goal.
+                    if not self._partial_task_gap_source_closed(task, partial.obj):
+                        continue
+                    try:
+                        partial_plan = self._plan_from_composite(
+                            task, partial, retrieved)
+                    except PlanCompilationError:
+                        continue
+                    report = validate_plan_bindings(
+                        partial_plan, self.registry, task)
+                    if partial_plan and report.passed:
+                        partial_plan.notes.append(
+                            "composite_partial_explicit_task_gap_pending")
+                        partial_plan.audit = {
+                            "retrieved_candidates": [str(h.ref)
+                                                     for h in composites],
+                            "selected_plan": str(partial.ref),
+                            "partial_target_coverage": (
+                                self._composite_target_coverage(
+                                    partial.obj, task.target_effects)),
+                        }
+                        return partial_plan
 
         # 2. Abstract Atomic 直接规划
         atomics = [h for h in retrieved if h.kind == SkillNodeKind.ABSTRACT_ATOMIC]
         if self.config.freeze_skills:
             atomics = [h for h in atomics if h.obj.status == SkillStatus.ACTIVE]
         if not atomics:
-            dynamic = self._append_dynamic_gaps(task, [])
-            return RuntimePlan(
-                start_mode="cold", nodes=dynamic,
-                edges=self._runtime_edges(dynamic),
-                retrieved=[h.to_dict() for h in retrieved],
-                notes=["no_reusable_target_producer_dynamic_only"],
-            )
+            return self._task_dynamic_plan(
+                task, retrieved,
+                reason="no_reusable_target_producer_dynamic_only")
 
+        return self._compile_atomic_runtime_plan(task, atomics, retrieved)
+
+    # ------------------------------------------------------------------
+    def _compile_atomic_runtime_plan(
+            self, task, atomics: list[RetrievalHit],
+            retrieved: list[RetrievalHit]) -> RuntimePlan:
+        """Compile retrieved Atomics into an occurrence-aware temporary DAG.
+
+        The persistent Composite ablation must remove only stored workflow
+        knowledge.  Basic value transfer is a runtime invariant, so the Atomic
+        fallback still receives explicit dependency and DATA_FLOW edges.
+        """
         nodes = self._plan_from_atomics(task, atomics)
-        nodes = self._append_dynamic_gaps(task, nodes)
+        if not nodes or not self._atomic_nodes_cover_targets(task, nodes):
+            return self._task_dynamic_plan(
+                task, retrieved, reason="atomic_target_closure_incomplete")
+
+        plan = self._build_atomic_runtime_plan(task, nodes, retrieved)
+        report = validate_plan_source_closure(plan, self.registry, task)
+        plan.audit["source_closure"] = report.to_dict()
+        if report.passed:
+            return plan
+
+        # A helper occurrence without a semantic anchor is not a meaningful
+        # local LLM goal.  Remove it and let the anchored consumer's
+        # Seeded/Dynamic implementation perform such setup internally.  A
+        # target-producing occurrence is never removed this way.
+        repaired_nodes, removed = self._remove_unanchored_auxiliary_nodes(
+            task, nodes, report)
+        if removed and repaired_nodes:
+            repaired = self._build_atomic_runtime_plan(
+                task, repaired_nodes, retrieved)
+            repaired_report = validate_plan_source_closure(
+                repaired, self.registry, task)
+            repaired.audit.update({
+                "source_closure": repaired_report.to_dict(),
+                "initial_source_closure": report.to_dict(),
+                "removed_unanchored_auxiliary_steps": removed,
+            })
+            if (repaired_report.passed
+                    and self._atomic_nodes_cover_targets(task, repaired.nodes)):
+                repaired.notes.append("unanchored_auxiliary_removed")
+                return repaired
+
+        fallback = self._task_dynamic_plan(
+            task, retrieved, reason="atomic_source_closure_failed")
+        fallback.audit["atomic_compilation_rejection"] = {
+            "source_closure": report.to_dict(),
+            "removed_unanchored_auxiliary_steps": removed,
+        }
+        return fallback
+
+    def _build_atomic_runtime_plan(
+            self, task, nodes: list[PlannedNode],
+            retrieved: list[RetrievalHit]) -> RuntimePlan:
+        self._renumber_atomic_occurrences(nodes)
+        # Synthesis mutates target binding_specs with the exact producer.  A
+        # repaired graph must not retain a source_step that was removed from an
+        # earlier candidate graph.
+        for node in nodes:
+            if node.source != "atomic_compilation":
+                continue
+            for role, spec in list(node.binding_specs.items()):
+                if spec.kind == BindingKind.DATA_FLOW:
+                    task_value = dict(task.context.get("params") or {}).get(role)
+                    node.binding_specs[role] = (
+                        BindingSpec(BindingKind.TASK, task_role=role,
+                                    symbol=f"$task.{role}")
+                        if is_concrete_binding(task_value)
+                        else BindingSpec.from_value(f"$inputs.{role}"))
+        edges = self._runtime_edges(nodes)
+        edges.extend(self._atomic_dependency_edges(nodes))
+        edges.extend(self.data_flow_synthesizer.synthesize(
+            task, nodes, self.registry))
         return RuntimePlan(
             start_mode="warm",
             nodes=nodes,
-            edges=self._runtime_edges(nodes),
-            retrieved=[h.to_dict() for h in retrieved],
-            notes=["atomic_only_plan", "partial_composite_rejected_if_unbound"],
+            edges=_deduplicate_runtime_edges(edges),
+            retrieved=[hit.to_dict() for hit in retrieved],
+            notes=[
+                "atomic_only_plan",
+                "atomic_occurrence_dag_compiled",
+                "partial_composite_rejected_if_unbound",
+            ],
+            audit={"plan_source": "atomic_compilation"},
         )
+
+    def _task_dynamic_plan(self, task, retrieved: list[RetrievalHit], *,
+                           reason: str) -> RuntimePlan:
+        """Return one full-task Dynamic node, never an unanchored local gap."""
+        effects = [dict(item) for item in (task.target_effects or [])
+                   if isinstance(item, dict)]
+        params = dict(task.context.get("params") or {})
+        for effect in effects:
+            discovered = self._bind_dynamic_effect_params(task, effect)
+            for role, value in discovered.items():
+                if is_concrete_binding(value):
+                    params.setdefault(role, value)
+        binding_specs = {
+            str(role): BindingSpec.from_value(value)
+            for role, value in params.items()
+        }
+        node = PlannedNode(
+            ref=SkillRef("runtime.dynamic.task_level", "0.0.0"),
+            step_id="step_000", occurrence_id="task_dynamic_000",
+            branch_id="task", binding_specs=binding_specs,
+            params=params, source="task_dynamic", target_effects=effects,
+            dynamic=True,
+        )
+        return RuntimePlan(
+            start_mode="cold", nodes=[node], edges=[],
+            retrieved=[hit.to_dict() for hit in retrieved],
+            notes=[reason, "task_level_dynamic_fallback"],
+            audit={"plan_source": "task_dynamic", "fallback_reason": reason},
+        )
+
+    def _remove_unanchored_auxiliary_nodes(
+            self, task, nodes: list[PlannedNode], report
+            ) -> tuple[list[PlannedNode], list[str]]:
+        unclosed_steps: set[str] = set()
+        for node_report in list(getattr(report, "node_reports", []) or []):
+            unresolved = list(getattr(
+                node_report, "unresolved_semantic_slots", []) or [])
+            states = dict(getattr(node_report, "resolution_states", {}) or {})
+            if unresolved or any(str(value).lower().endswith("unresolvable")
+                                 for value in states.values()):
+                unclosed_steps.add(str(getattr(node_report, "step_id", "")))
+        for error in list(getattr(report, "errors", []) or []):
+            match = re.search(r"(?:step|step_id)=([^:;]+)", str(error))
+            if match:
+                unclosed_steps.add(match.group(1))
+
+        removed: list[str] = []
+        kept: list[PlannedNode] = []
+        for node in nodes:
+            if (node.step_id in unclosed_steps
+                    and not self._node_produces_task_target(task, node)):
+                removed.append(node.step_id)
+                continue
+            kept.append(node)
+        return kept, removed
+
+    def _atomic_nodes_cover_targets(self, task,
+                                    nodes: list[PlannedNode]) -> bool:
+        for target in list(task.target_effects or []):
+            if not isinstance(target, dict):
+                continue
+            required = max(1, int(target.get("cardinality", 1) or 1))
+            single = {**target, "cardinality": 1, "distinct_by": ""}
+            produced = 0
+            for node in nodes:
+                atomic = self.registry.get(node.ref)
+                if atomic is None:
+                    continue
+                bindings = {
+                    **dict(task.context.get("params") or {}),
+                    **dict(node.params or {}),
+                }
+                if any(match_effect_contract(effect, single, bindings).passed
+                       for effect in (getattr(atomic, "effects", []) or [])):
+                    produced += 1
+            if produced < required:
+                return False
+        return True
+
+    def _node_produces_task_target(self, task, node: PlannedNode) -> bool:
+        atomic = self.registry.get(node.ref)
+        if atomic is None:
+            return False
+        bindings = {
+            **dict(task.context.get("params") or {}),
+            **dict(node.params or {}),
+        }
+        return any(
+            match_effect_contract(
+                effect, {**target, "cardinality": 1, "distinct_by": ""},
+                bindings).passed
+            for effect in (getattr(atomic, "effects", []) or [])
+            for target in (task.target_effects or [])
+            if isinstance(target, dict)
+        )
+
+    def _atomic_dependency_edges(
+            self, nodes: list[PlannedNode]) -> list[GraphEdge]:
+        """Materialize nearest Effect→Precondition dependencies per branch."""
+        edges: list[GraphEdge] = []
+        for target_index, target_node in enumerate(nodes):
+            target = self.registry.get(target_node.ref)
+            if target is None:
+                continue
+            for precondition in (getattr(target, "preconditions", []) or []):
+                producer: PlannedNode | None = None
+                for source_node in reversed(nodes[:target_index]):
+                    if (target_node.branch_id and source_node.branch_id
+                            and target_node.branch_id != source_node.branch_id):
+                        continue
+                    source = self.registry.get(source_node.ref)
+                    if source is None:
+                        continue
+                    bindings = {**dict(source_node.params or {}),
+                                **dict(target_node.params or {})}
+                    if any(match_effect_contract(
+                            effect, precondition, bindings).passed
+                           for effect in (getattr(source, "effects", []) or [])):
+                        producer = source_node
+                        break
+                if producer is None:
+                    continue
+                edges.append(GraphEdge(
+                    source=str(producer.ref), target=str(target_node.ref),
+                    type=EdgeType.REQUIRES_SKILL, scope="runtime",
+                    source_step=producer.step_id,
+                    target_step=target_node.step_id,
+                    metadata={"requirement": dict(precondition)},
+                ))
+        return edges
+
+    @staticmethod
+    def _renumber_atomic_occurrences(nodes: list[PlannedNode]) -> None:
+        per_branch: dict[str, int] = {}
+        for index, node in enumerate(nodes):
+            branch = node.branch_id or "branch_000"
+            node.branch_id = branch
+            ordinal = per_branch.get(branch, 0)
+            per_branch[branch] = ordinal + 1
+            node.step_id = f"step_{index:03d}"
+            node.occurrence_id = f"{branch}_occ_{ordinal:03d}"
 
     # ------------------------------------------------------------------
     def _plan_from_composite(self, task, hit: RetrievalHit,
@@ -231,7 +467,6 @@ class AtomicPlanner:
         # required producer; it is the strongest reason to retain the node,
         # never a reason to drop it.  Unbound occurrence parameters are
         # resolved from state/data-flow or bounded runtime discovery.
-        nodes = self._append_dynamic_gaps(task, nodes)
         return RuntimePlan(
             start_mode="warm",
             composite_ref=str(composite.ref),
@@ -270,22 +505,44 @@ class AtomicPlanner:
     def _plan_from_atomics(self, task, hits: list[RetrievalHit]) -> list[PlannedNode]:
         # 最小充分：greedy 覆盖 target_effects（若提供），否则取 top-k 中得分 > 阈值的
         if task.target_effects:
-            selected = self._cover_target_effects(
+            base_branch = self._cover_target_effects(
                 task.target_effects, hits,
                 dict(task.context.get("params") or {}))
-            selected = self._close_and_order_dependencies(selected, hits,
-                                                          task.target_effects)
+            base_branch = self._close_and_order_dependencies(
+                base_branch, hits, task.target_effects)
             selected = self._expand_cardinality_workflow(
-                selected, task.target_effects)
+                base_branch, task.target_effects)
         else:
-            selected = self._llm_plan(task, hits) or hits[:3]
+            base_branch = self._llm_plan(task, hits) or hits[:3]
+            selected = list(base_branch)
         nodes: list[PlannedNode] = []
+        branch_width = max(1, len(base_branch))
         for index, hit in enumerate(selected):
             atomic = hit.obj
             params = self._bind_params(task, atomic)
-            nodes.append(PlannedNode(ref=atomic.ref, step_id=f"step_{index:03d}",
-                                     params=params, source="retrieval",
-                                     target_effects=list(getattr(atomic, "effects", []))))
+            branch_index = index // branch_width
+            branch_id = f"branch_{branch_index:03d}"
+            task_params = dict(task.context.get("params") or {})
+            binding_specs: dict[str, BindingSpec] = {}
+            for declaration in (getattr(atomic, "inputs", []) or []):
+                role = str(declaration.get("name") or "")
+                if not role:
+                    continue
+                if role in task_params and is_concrete_binding(task_params[role]):
+                    binding_specs[role] = BindingSpec(
+                        BindingKind.TASK, task_role=role,
+                        symbol=f"$task.{role}")
+                elif is_concrete_binding(params.get(role)):
+                    binding_specs[role] = BindingSpec.from_value(params[role])
+                else:
+                    binding_specs[role] = BindingSpec.from_value(
+                        f"$inputs.{role}")
+            nodes.append(PlannedNode(
+                ref=atomic.ref, step_id=f"step_{index:03d}",
+                occurrence_id=f"{branch_id}_occ_{index % branch_width:03d}",
+                branch_id=branch_id, binding_specs=binding_specs,
+                params=params, source="atomic_compilation",
+                target_effects=list(getattr(atomic, "effects", []))))
         return nodes
 
     @staticmethod
@@ -395,62 +652,6 @@ class AtomicPlanner:
                                   key=lambda hit: rank(hit.obj.ref.logical_id)))
         return ordered
 
-    def _append_dynamic_gaps(self, task, nodes: list[PlannedNode]) -> list[PlannedNode]:
-        """把未被检索能力覆盖的目标效果显式化，供逐节点动态执行。"""
-        if not task.target_effects:
-            return nodes
-        covered_counts: dict[str, int] = {}
-        for node in nodes:
-            for effect in node.target_effects:
-                if not isinstance(effect, dict) or not effect.get("predicate"):
-                    continue
-                key = _canonical_predicate(str(effect["predicate"]))
-                covered_counts[key] = covered_counts.get(key, 0) + max(
-                    1, int(effect.get("cardinality", 1) or 1))
-        for effect in task.target_effects:
-            predicate = str(effect.get("predicate") or "unknown")
-            canonical = _canonical_predicate(predicate)
-            required = max(1, int(effect.get("cardinality", 1) or 1))
-            missing = max(0, required - covered_counts.get(canonical, 0))
-            if missing <= 0:
-                continue
-            slug = re.sub(r"[^a-z0-9_.]+", "_", predicate.lower()).strip("_") or "effect"
-            # Missing target Effects participate in the same declared goal
-            # order as learned producers.  Appending every gap at the end made
-            # transformation goals execute after final delivery.
-            target_order = {
-                _canonical_predicate(str(item.get("predicate") or "")): rank
-                for rank, item in enumerate(task.target_effects)
-                if isinstance(item, dict) and item.get("predicate")
-            }
-            gap_rank = target_order.get(canonical, len(target_order))
-            insert_at = len(nodes)
-            for index, node in enumerate(nodes):
-                ranks = [target_order.get(
-                    _canonical_predicate(str(item.get("predicate") or "")),
-                    -1)
-                    for item in node.target_effects if isinstance(item, dict)]
-                ranks = [rank for rank in ranks if rank >= 0]
-                if ranks and min(ranks) > gap_rank:
-                    insert_at = index
-                    break
-            for occurrence in range(missing):
-                gap_effect = dict(effect)
-                gap_effect["cardinality"] = 1
-                gap = PlannedNode(
-                    ref=SkillRef(f"runtime.dynamic.{slug}", "0.0.0"),
-                    source="dynamic_gap",
-                    occurrence_id=f"dynamic_{slug}_{occurrence:03d}",
-                    params=self._bind_dynamic_effect_params(task, gap_effect),
-                    target_effects=[gap_effect], dynamic=True,
-                )
-                nodes.insert(insert_at + occurrence, gap)
-            covered_counts[canonical] = covered_counts.get(canonical, 0) + missing
-        for index, node in enumerate(nodes):
-            node.step_id = f"step_{index:03d}"
-            node.occurrence_id = node.occurrence_id or node.step_id
-        return nodes
-
     def _composite_effect_keys(self, composite: CompositeSkill) -> set[str]:
         """Composite Effect 闭包：由有序子 Atomic 的核心 Effect 合并得到。"""
         keys: set[str] = set()
@@ -543,6 +744,37 @@ class AtomicPlanner:
                       for predicate, required in target.items())
         return covered / max(sum(target.values()), 1)
 
+    def _partial_task_gap_source_closed(self, task,
+                                        composite: CompositeSkill) -> bool:
+        """Require every future TaskGap target to have concrete task anchors.
+
+        A partial Composite is useful only when the missing terminal contract
+        can be stated as a grounded task-level goal.  We deliberately do not
+        invent a local ``runtime.dynamic.<effect>`` occurrence here: the
+        system measures the real pre-gap state and appends one explicit TaskGap
+        occurrence after the verified parent occurrences finish.
+        """
+        actual = self._composite_effect_counts(composite)
+        consumed: dict[str, int] = {}
+        for target in list(task.target_effects or []):
+            if not isinstance(target, dict):
+                continue
+            predicate = _canonical_predicate(
+                str(target.get("predicate") or ""))
+            required = max(1, int(target.get("cardinality", 1) or 1))
+            available = max(0, int(actual.get(predicate, 0)))
+            already_consumed = consumed.get(predicate, 0)
+            covered = max(0, min(required, available - already_consumed))
+            consumed[predicate] = already_consumed + covered
+            for _ in range(required - covered):
+                missing = dict(target)
+                missing["cardinality"] = 1
+                params = self._bind_dynamic_effect_params(task, missing)
+                if any(not is_concrete_binding(params.get(slot))
+                       for slot in semantic_required_slots([missing])):
+                    return False
+        return True
+
     @staticmethod
     def _bind_dynamic_effect_params(task, effect: dict[str, Any]) -> dict[str, Any]:
         """用规范任务参数绑定 dynamic gap，不把 `$name` 留给 Runtime。"""
@@ -558,20 +790,6 @@ class AtomicPlanner:
         for name, value in parse_goal_params(task.goal, placeholder_names).items():
             params.setdefault(name, value)
         return params
-
-    @staticmethod
-    def _has_unbound_dynamic_gap(nodes: list[PlannedNode]) -> bool:
-        from ..core.predicates import bind_args
-        for node in nodes:
-            if not node.dynamic:
-                continue
-            for effect in node.target_effects:
-                bound = bind_args(dict(effect.get("args") or {}), node.params,
-                                  node.params)
-                if any(isinstance(value, str) and value.startswith("$")
-                       for value in bound.values()):
-                    return True
-        return False
 
     @staticmethod
     def _runtime_edges(nodes: list[PlannedNode],
@@ -766,6 +984,26 @@ def _parse_plan_json(text: str) -> list[str] | None:
         return None
     ids = [str(s.get("logical_id")) for s in skills if isinstance(s, dict) and s.get("logical_id")]
     return ids or None
+
+
+def _deduplicate_runtime_edges(edges: list[GraphEdge]) -> list[GraphEdge]:
+    """Keep edge semantics exact while removing duplicate synthesis results."""
+    unique: list[GraphEdge] = []
+    seen: set[tuple[str, str, str, str, str]] = set()
+    for edge in edges:
+        requirement = dict((edge.metadata or {}).get("requirement") or {})
+        key = (
+            edge.type.value,
+            str(edge.source_step),
+            str(edge.target_step),
+            json.dumps(edge.mapping or {}, sort_keys=True, ensure_ascii=False),
+            json.dumps(requirement, sort_keys=True, ensure_ascii=False),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(edge)
+    return unique
 
 
 def _canonical_predicate(name: str) -> str:

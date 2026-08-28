@@ -193,19 +193,26 @@ def align_composite(candidate: CompositeSkill, registry: SkillGraphRegistry) -> 
 def _composite_occurrence_signature(
         composite: CompositeSkill, registry: SkillGraphRegistry
         ) -> tuple[Any, ...]:
-    """Canonical semantic contract + causal partial-order identity.
+    """Canonical ordered occurrence contract plus causal/data-flow identity.
 
     Versioned/hashed Atomic refs with the same verified Effect contract share a
-    label.  Pure temporal NEXT edges are intentionally excluded: independent
-    occurrences observed in a different order are the same partial-order DAG.
-    Multiplicity is retained through the sorted step-label and edge multisets.
+    semantic label, while each occurrence retains its ordered position.  This
+    prevents two opposite workflows from merging and keeps repeated occurrences
+    distinct even when they reference the same logical Atomic node.
     """
     step_objects = composite.step_instances()
-    labels = {
+    contract_labels = {
         str(step["step_id"]): _atomic_contract_label(step, registry)
         for step in step_objects
     }
-    steps = tuple(sorted(labels.values()))
+    # Occurrence order and multiplicity are identity.  A→B and B→A are not the
+    # same reusable workflow merely because their node multiset is equal.
+    occurrence_labels = {
+        str(step["step_id"]): (index, contract_labels[str(step["step_id"])])
+        for index, step in enumerate(step_objects)
+    }
+    steps = tuple(contract_labels[str(step["step_id"])]
+                  for step in step_objects)
     # Binding origin is part of identity. A task-bound destination and an
     # unresolved legacy flow symbol must never accumulate shared support.
     binding_members: dict[str, list[tuple[Any, ...]]] = {}
@@ -216,25 +223,35 @@ def _composite_occurrence_signature(
         for role, value in relevant.items():
             spec = BindingSpec.from_value(value)
             binding_contracts.append((
-                labels[step_id], str(role), spec.kind.value,
+                occurrence_labels[step_id], str(role), spec.kind.value,
                 spec.task_role, spec.source_step, spec.source_output,
                 str(spec.value) if spec.kind.value == "literal" else "",
             ))
             binding_members.setdefault(str(value), []).append(
-                (labels[step_id], str(role)))
+                (occurrence_labels[step_id], str(role)))
     bindings = tuple(sorted(
         tuple(sorted(members)) for members in binding_members.values()))
+    control = tuple(sorted(
+        (occurrence_labels.get(str(edge.source_step), ("missing",)),
+         occurrence_labels.get(str(edge.target_step), ("missing",)),
+         edge.type.value, str(edge.subtype or ""),
+         json.dumps(edge.condition or {}, sort_keys=True, ensure_ascii=False,
+                    separators=(",", ":")),
+         json.dumps(edge.policy or {}, sort_keys=True, ensure_ascii=False,
+                    separators=(",", ":")))
+        for edge in composite.edge_objects() if edge.category == "control"
+    ))
     data = tuple(sorted(
-        (labels.get(str(edge.source_step), ("missing",)),
-         labels.get(str(edge.target_step), ("missing",)),
+        (occurrence_labels.get(str(edge.source_step), ("missing",)),
+         occurrence_labels.get(str(edge.target_step), ("missing",)),
          str((edge.mapping or {}).get("source_output") or ""),
          str((edge.mapping or {}).get("target_input") or ""),
          str((edge.mapping or {}).get("transform") or "identity"))
         for edge in composite.edge_objects() if edge.category == "data"
     ))
     dependencies = tuple(sorted(
-        (labels.get(str(edge.source_step), ("missing",)),
-         labels.get(str(edge.target_step), ("missing",)),
+        (occurrence_labels.get(str(edge.source_step), ("missing",)),
+         occurrence_labels.get(str(edge.target_step), ("missing",)),
          str((edge.metadata or {}).get("predicate") or ""))
         for edge in composite.edge_objects()
         if edge.category == "dependency"
@@ -246,8 +263,12 @@ def _composite_occurrence_signature(
         for item in (composite.validator.get("target_effects") or [])
         if isinstance(item, dict) and item.get("predicate")
     ))
-    return (steps, tuple(sorted(binding_contracts)), bindings,
-            data, dependencies, targets)
+    distinctness = json.dumps({
+        "validator_distinctness": composite.validator.get("distinctness") or [],
+        "graph_constraints": composite.graph.get("constraints") or [],
+    }, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return (steps, tuple(sorted(binding_contracts)), bindings, control,
+            data, dependencies, targets, distinctness)
 
 
 def _atomic_contract_label(step: dict[str, Any],
@@ -293,6 +314,7 @@ def _predicate_contract(predicate: dict[str, Any]) -> str:
         "args": {str(key): str(value)
                  for key, value in sorted((predicate.get("args") or {}).items())},
         "cardinality": int(predicate.get("cardinality", 1) or 1),
+        "distinct_by": str(predicate.get("distinct_by") or ""),
     }
     return json.dumps(payload, sort_keys=True, ensure_ascii=False,
                       separators=(",", ":"))

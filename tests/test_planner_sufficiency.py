@@ -137,18 +137,19 @@ def test_complete_composite_retains_unbound_causal_producer(workspace_tmp):
     assert "object_location" not in plan.nodes[0].params
 
 
-def test_partial_composite_dynamic_gap_binds_task_params(workspace_tmp):
+def test_partial_composite_defers_missing_effect_to_explicit_task_gap(
+        workspace_tmp):
     registry = _registry(workspace_tmp, include_complete=False)
     planner = AtomicPlanner(registry, SystemConfig())
     plan = planner.compile_runtime_graph(_task(params={
         "object": "mug", "target_location": "cabinet 1",
         "heating_station": "microwave 1"}))
-    gaps = [node for node in plan.nodes if node.dynamic]
-    assert len(gaps) == 1
-    assert gaps[0].params["object"] == "mug"
-    assert gaps[0].params["target_location"] == "cabinet 1"
-    assert gaps[0].params["heating_station"] == "microwave 1"
-    assert "composite_partial_with_bound_gap" in plan.notes
+    assert plan.composite_ref.endswith(
+        "composite.alfworld.acquire-heat@1.0.0")
+    assert not any(node.dynamic for node in plan.nodes)
+    assert [node.ref.logical_id for node in plan.nodes] == [
+        "alfworld.acquire_object", "alfworld.heat_object"]
+    assert "composite_partial_explicit_task_gap_pending" in plan.notes
 
 
 def test_irrelevant_broader_composite_is_not_selected_for_simple_goal(workspace_tmp):
@@ -190,23 +191,31 @@ def test_frozen_replay_never_selects_single_trace_draft_composite(workspace_tmp)
     assert "controlled_candidate_exploration" not in plan.notes
 
 
-def test_dynamic_transformation_gap_is_inserted_before_delivery(workspace_tmp):
+def test_partial_composite_never_preinserts_anonymous_dynamic_gap(workspace_tmp):
     registry = _registry(workspace_tmp, include_complete=False)
     acquire = registry.get_recommended("alfworld.acquire_object")
     place = registry.get_recommended("alfworld.place_object")
     registry.register(_composite(
         "composite.alfworld.acquire-place",
-        [str(acquire.ref), str(place.ref)], "acquire then place", 0.99,
+        [str(acquire.ref), str(place.ref)], "acquire then place", 2.0,
         target_effects=[_task().target_effects[-1]],
     ))
     plan = AtomicPlanner(registry, SystemConfig()).compile_runtime_graph(
         _task(params={"object": "mug", "target_location": "cabinet 1",
                       "heating_station": "microwave 1"}))
-    predicates = [
-        next(iter(node.target_effects), {}).get("predicate")
-        for node in plan.nodes
-    ]
-    assert predicates.index("object.heated") < predicates.index("object.at_location")
+    assert plan.composite_ref
+    assert not any(node.dynamic for node in plan.nodes)
+    predicates = [next(iter(node.target_effects), {}).get("predicate")
+                  for node in plan.nodes]
+    task_predicates = {
+        str(item.get("predicate") or "") for item in _task().target_effects}
+    # Whichever relevant partial Composite wins retrieval, at least one formal
+    # target remains outside the pre-gap graph and no anonymous effect node is
+    # allowed to stand in for it.
+    assert task_predicates - set(predicates)
+    assert all(not node.ref.logical_id.startswith("runtime.dynamic")
+               for node in plan.nodes)
+    assert "composite_partial_explicit_task_gap_pending" in plan.notes
 
 
 def test_no_target_producer_never_executes_unrelated_top_hits(workspace_tmp):
@@ -225,14 +234,16 @@ def test_no_target_producer_never_executes_unrelated_top_hits(workspace_tmp):
     assert plan.nodes[0].target_effects[0]["predicate"] == "object.at_location"
 
 
-def test_unbound_partial_composite_falls_back_to_atomic_plan(workspace_tmp):
+def test_unbound_target_atomic_falls_back_to_one_task_dynamic_node(workspace_tmp):
     registry = _registry(workspace_tmp, include_complete=False)
     planner = AtomicPlanner(registry, SystemConfig())
     plan = planner.compile_runtime_graph(_task(
         goal="heat an object", params={"object": "mug"}))
     assert plan.composite_ref == ""
-    assert "atomic_only_plan" in plan.notes
-    assert all(node.source != "dynamic_gap" for node in plan.nodes)
+    assert "task_level_dynamic_fallback" in plan.notes
+    assert len(plan.nodes) == 1
+    assert plan.nodes[0].source == "task_dynamic"
+    assert plan.nodes[0].target_effects == _task().target_effects
 
 
 def test_atomic_plan_closes_dependencies_and_orders_acquire_heat_place(workspace_tmp):

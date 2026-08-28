@@ -29,7 +29,9 @@ from ..tools.generalizer import ToolGeneralizer
 from ..tools.lifecycle import ToolLifecycleManager
 from ..tools.registry import ToolRegistry
 from .composite_builder import CompositeBuilder
+from .composite_lifecycle import reevaluate_waiting_composites
 from .insight_updater import InsightUpdater
+from .trace_graph_reconstructor import TraceGraphReconstructor
 from ..atomicizer.semantic_extractor import SemanticExtractorAgent
 
 
@@ -46,6 +48,7 @@ class SuccessProcessingResult:
     notes: list[str] = field(default_factory=list)
     extraction: dict[str, Any] = field(default_factory=dict)
     graph_proposal: dict[str, Any] = field(default_factory=dict)
+    graph_revision: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -60,6 +63,7 @@ class SuccessProcessingResult:
             "notes": self.notes,
             "extraction": self.extraction,
             "graph_proposal": self.graph_proposal,
+            "graph_revision": self.graph_revision,
         }
 
 
@@ -86,6 +90,7 @@ class SuccessProcessor:
             # real experiment (mock=False) always fails closed.
             allow_legacy_fallback=bool(config.llm.mock or extractor_llm is None))
         self.composite_builder = CompositeBuilder(registry, config)
+        self.graph_reconstructor = TraceGraphReconstructor(registry)
         self.insight_updater = InsightUpdater(registry, trace_store, config)
         self.admission = AdmissionEngine(
             sandbox=sandbox,
@@ -114,11 +119,59 @@ class SuccessProcessor:
         result.extraction = dict(getattr(atomic_result, "semantic_extraction", {}) or {})
         atomic_refs = [candidate.skill.ref for candidate in atomic_result.candidates]
         result.atomic_refs = [str(ref) for ref in atomic_refs]
+        selected_composite = None
+        if trace.selected_composite:
+            try:
+                selected_composite = self.registry.get(
+                    SkillRef.parse(trace.selected_composite))
+            except ValueError:
+                selected_composite = None
+        graph_reconstructor = getattr(self, "graph_reconstructor", None)
+        if graph_reconstructor is None:
+            # Compatibility for lightweight test/embedding fixtures that
+            # construct the processor without calling __init__.
+            graph_reconstructor = TraceGraphReconstructor(self.registry)
+        revision = graph_reconstructor.reconstruct(
+            trace=trace, atomic_result=atomic_result,
+            selected_composite=selected_composite)
+        result.graph_revision = revision.to_dict()
+        trace.provenance["task_gap_effect_proof"] = {
+            "passed": bool(revision.task_gap_proved_missing_effect),
+            "revision_kind": revision.revision_kind,
+            "inserted_occurrence_ids": [
+                str(item.get("runtime_occurrence_id") or "")
+                for item in revision.inserted_occurrences],
+            "action_caused_effects": [
+                dict(effect)
+                for item in revision.inserted_occurrences
+                for effect in (item.get("effect") or [])
+                if isinstance(effect, dict)],
+            "source": "origin_aware_extractor_code_validation",
+        }
+        lifecycle_events = (reevaluate_waiting_composites(
+            self.registry,
+            min_support=max(2, int(
+                self.config.thresholds.composite_min_support)))
+            if hasattr(self.registry, "list_all_versions") else [])
+        for event in lifecycle_events:
+            result.notes.append(
+                "composite_lifecycle_reevaluated:"
+                f"{event['composite_ref']}:{event['from']}->{event['to']}")
 
         # 4. Tool Skeleton → admission → candidate → Implementation 绑定
         segments = atomic_result.segments
         tools_by_phase: dict[str, list[str]] = {}
         for segment, atomic_ref in zip(segments, atomic_refs):
+            source_kind = str(segment.get("source_kind") or "")
+            if source_kind == "benchmark_finalization":
+                result.notes.append(
+                    f"tool_mining_blocked_benchmark_finalization:{atomic_ref.logical_id}")
+                continue
+            if (source_kind == "task_gap"
+                    and revision.revision_kind == "implementation_repair"):
+                result.notes.append(
+                    f"tool_mining_deferred_to_implementation_repair:{atomic_ref.logical_id}")
+                continue
             is_env_segment = (str(segment.get("kind") or "") == "env"
                               or trace.benchmark in ("alfworld", "toy_env"))
             safe_event_slice = (bool(segment.get("event_slice_validated"))
@@ -163,10 +216,29 @@ class SuccessProcessor:
         semantic_valid = (result.extraction.get("method")
                           == "llm_proposal_code_validated")
         allow_mock_fallback = bool(self.config.llm.mock)
+        revision_blocks_composite = revision.revision_kind in {
+            "implementation_repair", "benchmark_finalization_only",
+            "observation_only_gap"}
+        build_atomic_refs = list(atomic_refs)
+        build_segments = list(segments)
+        if revision.revision_kind in {
+                "new_capability_insert", "existing_capability_insert",
+                "repeated_occurrence_insert"}:
+            revised_inputs = _revision_build_inputs(revision, self.registry)
+            if revised_inputs is not None:
+                build_atomic_refs, build_segments = revised_inputs
+                result.notes.append(
+                    "composite_built_from_complete_runtime_occurrence_sequence")
+            else:
+                revision_blocks_composite = True
+                result.notes.append(
+                    "composite_revision_blocked_incomplete_runtime_occurrences")
         if (self.config.features.enable_composite and atomic_refs
+                and not revision_blocks_composite
                 and (semantic_valid or allow_mock_fallback)):
             occurrences = []
-            for index, (segment, atomic_ref) in enumerate(zip(segments, atomic_refs)):
+            for index, (segment, atomic_ref) in enumerate(
+                    zip(build_segments, build_atomic_refs)):
                 atomic = self.registry.get(atomic_ref) or self.registry.get_recommended(
                     atomic_ref.logical_id)
                 phase_id = str(segment.get("phase_id") or f"phase_{index:03d}")
@@ -183,8 +255,8 @@ class SuccessProcessor:
                               if hasattr(self, "extractor_agent") else {})
             result.graph_proposal = graph_proposal
             build = self.composite_builder.build_or_align(
-                atomic_refs, trace, segments=segments,
-                graph_proposal=graph_proposal)
+                build_atomic_refs, trace, segments=build_segments,
+                graph_proposal=graph_proposal, revision=revision)
             result.composite = build.to_dict()
             # 7. Layer-3 insight
             if build.composite is not None:
@@ -205,8 +277,25 @@ class SuccessProcessor:
                         "reason": "deferred_until_threshold_or_maintenance",
                         "sample_count": support,
                     }
+        elif revision_blocks_composite:
+            result.composite = {
+                "composite": None, "decision": "skipped",
+                "reason": revision.revision_kind,
+            }
+            result.notes.append(
+                f"composite_revision_routed:{revision.revision_kind}")
         elif self.config.features.enable_composite and atomic_refs:
             result.notes.append("composite_skipped:semantic_extraction_not_validated")
+
+        if (revision.task_gap_proved_missing_effect
+                and revision.revision_kind != "implementation_repair"
+                and not result.composite.get("composite")):
+            suppressed = self.composite_builder.revision_builder \
+                .suppress_proven_incomplete_parent(
+                    revision, trace_id=trace.trace_id)
+            if suppressed:
+                result.notes.append(
+                    f"selected_composite_suppressed_without_replacement:{suppressed}")
 
         # 6. 语义证据已在 apply（Abstract statistics）与 record 中更新
 
@@ -404,6 +493,38 @@ class SuccessProcessor:
                                    metadata={"reason": "tool_generalization_binding"})
             return str(evolved.ref)
         return ""
+
+def _revision_build_inputs(revision, registry) \
+        -> tuple[list[SkillRef], list[dict[str, Any]]] | None:
+    """Materialize the complete validated occurrence sequence for revision.
+
+    Parent steps may be absent from Extractor output when they required zero
+    actions.  The reconstructor preserves their exact immutable child refs;
+    this helper fails closed if any occurrence cannot be resolved.
+    """
+    refs: list[SkillRef] = []
+    segments: list[dict[str, Any]] = []
+    occurrences = list(getattr(revision, "realized_occurrences", None) or [])
+    if len(occurrences) < 2:
+        return None
+    for index, occurrence in enumerate(occurrences):
+        try:
+            ref = SkillRef.parse(str(occurrence.get("skill_ref") or ""))
+        except ValueError:
+            return None
+        if registry.get(ref) is None:
+            return None
+        refs.append(ref)
+        segment = dict(occurrence)
+        segment.setdefault("phase_id", f"phase_{index:03d}")
+        segment.setdefault("source_kind", "planned_node")
+        segment.setdefault("runtime_occurrence_id", "")
+        segment.setdefault("params", {})
+        segment.setdefault("effect", [])
+        segment.setdefault("negative_effect", [])
+        segment.setdefault("preconditions", [])
+        segments.append(segment)
+    return refs, segments
 
 
 def _harness_of(benchmark: str) -> str:

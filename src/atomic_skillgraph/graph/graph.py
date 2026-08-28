@@ -132,7 +132,8 @@ def composite_node_order(composite: CompositeSkill, registry) -> tuple[list[str]
     return [_logical_of(by_step[step_id]) for step_id in order], report
 
 
-def composite_step_order(composite: CompositeSkill, registry
+def composite_step_order(composite: CompositeSkill, registry, *,
+                         allow_draft_children: bool = False
                          ) -> tuple[list[dict[str, Any]], GraphCheckReport]:
     """Return exact versioned occurrence steps in executable order.
 
@@ -155,7 +156,9 @@ def composite_step_order(composite: CompositeSkill, registry
         child = registry.get(ref)
         if child is None:
             report.add("exact_child_ref", False, f"missing exact child: {ref}")
-        elif str(getattr(child, "status", "").value) != "active":
+        elif (str(getattr(child, "status", "").value) != "active"
+              and not (allow_draft_children
+                       and str(getattr(child, "status", "").value) == "draft")):
             report.add("exact_child_status", False,
                        f"child not active: {ref} status={child.status.value}")
     unsupported = [edge for edge in composite.edge_objects()

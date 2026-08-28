@@ -116,16 +116,17 @@ class FailureBranchManager:
             source_ref = SkillRef.parse(str(incident.get("node_ref") or ""))
         except ValueError:
             return self._record_unverified_branch(incident, "invalid_skill_ref")
-        original = self.registry.get(source_ref) or self.registry.get_recommended(
-            source_ref.logical_id)
+        original = self.registry.get(source_ref)
         if not isinstance(original, AbstractAtomicSkill):
             return self._record_unverified_branch(incident, "atomic_missing")
         base_main_digest = _bank_digest(self.data_dir)
         branch_dir, branch_registry, branch_tools = self._branch_snapshot(incident)
-        parent = (self.registry.get_recommended(original.ref.logical_id)
-                  or self.registry.get_latest(original.ref.logical_id) or original)
-        latest = branch_registry.get_latest(original.ref.logical_id) or parent
-        payload = parent.to_dict()
+        # The failed occurrence is versioned evidence.  A newer recommended
+        # contract must not silently become the repair parent; latest is used
+        # only to allocate a collision-free child version.
+        parent = original
+        latest = branch_registry.get_latest(original.ref.logical_id) or original
+        payload = original.to_dict()
         payload["version"] = bump_version(latest.ref.version, "patch")
         payload["status"] = SkillStatus.ACTIVE.value
         rescue = dict(incident.get("rescue") or {})
@@ -151,6 +152,28 @@ class FailureBranchManager:
                        "使用经原任务严格重放验证的参数化补救模板："
                        + " -> ".join(guideline_steps))
         duplicate_rule = repair_rule in parent.guideline_rules()
+        if not duplicate_rule:
+            # A later failure trace still names the exact version that failed.
+            # Reuse only a previously verified descendant of that *same*
+            # version; never substitute an unrelated recommended/latest node.
+            # This preserves exact causal lineage while allowing repeated
+            # evidence to accumulate without creating version churn.
+            linked_repairs = [
+                item for item in self.registry.list_all_versions(
+                    SkillNodeKind.ABSTRACT_ATOMIC)
+                if (isinstance(item, AbstractAtomicSkill)
+                    and item.ref.logical_id == original.ref.logical_id
+                    and str((item.metadata or {}).get("repair_parent_ref") or "")
+                    == str(original.ref)
+                    and repair_rule in item.guideline_rules())
+            ]
+            if linked_repairs:
+                parent = max(
+                    linked_repairs,
+                    key=lambda item: int(
+                        (item.metadata or {}).get("repair_replay_count") or 0),
+                )
+                duplicate_rule = True
         if not duplicate_rule and repair_rule not in rules:
             rules.append(repair_rule)
         guideline["rules"] = rules
@@ -379,7 +402,8 @@ class FailureBranchManager:
         branch_tools.register(candidate)
         branch_tools.recommend(candidate.ref)
         evolved_impls = self._bind_candidate_implementations(
-            branch_registry, source_ref, candidate.ref, incident["branch_id"])
+            branch_registry, source_ref, candidate.ref, incident["branch_id"],
+            exact_impl_ref=str(incident.get("implementation_ref") or ""))
         branch_report = validate_graph(branch_registry, branch_tools)
         manifest["branch_graph_validation"] = branch_report.to_dict()
         manifest["candidate_implementation_refs"] = [str(item.ref)
@@ -439,6 +463,8 @@ class FailureBranchManager:
             "task_type": trace.task_type,
             "benchmark": trace.benchmark,
             "node_ref": ref,
+            "occurrence_id": str(node.get("occurrence_id") or ""),
+            "implementation_ref": str(node.get("impl_ref") or ""),
             "node_index": node_index,
             "attempt_index": attempt_index,
             "mode": str(attempt.get("mode") or "unknown"),
@@ -531,7 +557,8 @@ class FailureBranchManager:
         branch_tools.register(candidate)
         branch_tools.recommend(candidate.ref)
         evolved_impls = self._bind_candidate_implementations(
-            branch_registry, source_ref, candidate.ref, incident["branch_id"])
+            branch_registry, source_ref, candidate.ref, incident["branch_id"],
+            exact_impl_ref=str(incident.get("implementation_ref") or ""))
         graph_report = validate_graph(branch_registry, branch_tools)
         manifest["branch_graph_validation"] = graph_report.to_dict()
         manifest["candidate_implementation_refs"] = [str(item.ref)
@@ -637,9 +664,24 @@ class FailureBranchManager:
     @staticmethod
     def _bind_candidate_implementations(registry: SkillGraphRegistry,
                                         old_tool: ToolRef, new_tool: ToolRef,
-                                        branch_id: str) -> list[ImplementationAtom]:
+                                        branch_id: str, *,
+                                        exact_impl_ref: str = ""
+                                        ) -> list[ImplementationAtom]:
         evolved: list[ImplementationAtom] = []
-        for impl in registry.list_by_kind(SkillNodeKind.IMPLEMENTATION_ATOMIC):
+        implementations: list[ImplementationAtom] = []
+        if exact_impl_ref:
+            try:
+                exact = registry.get(SkillRef.parse(exact_impl_ref))
+            except ValueError:
+                exact = None
+            if isinstance(exact, ImplementationAtom):
+                implementations = [exact]
+        else:
+            # Legacy code-task incidents did not persist an Implementation ref.
+            # Environment runtime incidents always take the exact branch above.
+            implementations = registry.list_by_kind(
+                SkillNodeKind.IMPLEMENTATION_ATOMIC)
+        for impl in implementations:
             if not any(binding.tool_ref == old_tool for binding in impl.tool_bindings):
                 continue
             latest = registry.get_latest(impl.ref.logical_id) or impl

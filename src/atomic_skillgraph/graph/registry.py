@@ -316,7 +316,12 @@ class SkillGraphRegistry:
         if status == SkillStatus.ACTIVE:
             entry["recommended_version"] = ref.version
         elif entry.get("recommended_version") == ref.version:
-            entry.pop("recommended_version", None)
+            fallback = self._best_active_version(
+                entry, ref.logical_id, exclude={ref.version})
+            if fallback:
+                entry["recommended_version"] = fallback
+            else:
+                entry.pop("recommended_version", None)
         self._write_graph(graph)
 
     def update_runtime_state(self, obj) -> SkillRef:
@@ -336,7 +341,12 @@ class SkillGraphRegistry:
         if obj.status == SkillStatus.ACTIVE:
             entry["recommended_version"] = obj.ref.version
         elif entry.get("recommended_version") == obj.ref.version:
-            entry.pop("recommended_version", None)
+            fallback = self._best_active_version(
+                entry, obj.ref.logical_id, exclude={obj.ref.version})
+            if fallback:
+                entry["recommended_version"] = fallback
+            else:
+                entry.pop("recommended_version", None)
         self._write_graph(graph)
         return obj.ref
 
@@ -352,6 +362,53 @@ class SkillGraphRegistry:
             raise ValueError(f"only_active_may_be_recommended:{ref}")
         entry["recommended_version"] = ref.version
         self._write_graph(graph)
+
+    def fallback_to_best_active(self, logical_id: str, *,
+                                exclude_versions: set[str] | None = None
+                                ) -> SkillRef | None:
+        """Move recommendation to the strongest historical Active version.
+
+        Suppressing the currently recommended version must not make an older
+        healthy asset disappear from retrieval.  The choice is deterministic:
+        utility, support/success evidence, then semantic version.
+        """
+        graph = self._read_graph()
+        entry = graph["nodes"].get(logical_id)
+        if entry is None:
+            return None
+        version = self._best_active_version(
+            entry, logical_id, exclude=set(exclude_versions or set()))
+        if version:
+            entry["recommended_version"] = version
+            self._write_graph(graph)
+            return SkillRef(logical_id, version)
+        entry.pop("recommended_version", None)
+        self._write_graph(graph)
+        return None
+
+    def _best_active_version(self, entry: dict[str, Any], logical_id: str, *,
+                             exclude: set[str]) -> str:
+        kind = SkillNodeKind(entry["kind"])
+        ranked: list[tuple[float, int, int, tuple[int, int, int], str]] = []
+        for version in entry.get("versions") or []:
+            if version in exclude:
+                continue
+            obj = self._load_obj(kind, logical_id, str(version))
+            if obj is None or obj.status != SkillStatus.ACTIVE:
+                continue
+            metadata = dict(getattr(obj, "metadata", None) or {})
+            stats = dict(metadata.get("statistics") or {})
+            quality = dict(getattr(obj, "quality", None) or {})
+            utility = float(quality.get("utility", stats.get("utility", 0.5)) or 0.0)
+            support = int(stats.get("support_count", 0) or 0)
+            successes = int(quality.get(
+                "success_count", stats.get(
+                    "self_sufficient_success_count",
+                    stats.get("execution_success_count",
+                              stats.get("success_count", 0)))) or 0)
+            ranked.append((utility, support, successes,
+                           _semver_key(str(version)), str(version)))
+        return max(ranked)[-1] if ranked else ""
 
     def rollback(self, logical_id: str, version: str) -> SkillRef:
         """将推荐指针恢复到历史版本（物理上不删除任何文件）。"""

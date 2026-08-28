@@ -712,7 +712,7 @@ def test_terminal_certificate_survives_extraction_but_is_not_single_action_tool(
     assert processed.composite["composite"] is not None
 
 
-def test_composite_alignment_uses_effect_contract_and_causal_partial_order(
+def test_composite_alignment_preserves_validated_occurrence_order(
         workspace_tmp):
     registry = SkillGraphRegistry(workspace_tmp / "partial_order_composite")
     open_a = _atomic(
@@ -757,8 +757,10 @@ def test_composite_alignment_uses_effect_contract_and_causal_partial_order(
     second = composite("composite.env.second", [acquire, open_b])
     registry.register(first)
     decision = align_composite(second, registry)
-    assert decision.matched is True
-    assert decision.matched_ref == str(first.ref)
+    # The second-round protocol treats ordered occurrences as part of the
+    # Composite identity.  Equal effect contracts do not make A→B and B→A
+    # the same executable graph.
+    assert decision.matched is False
 
 
 def test_duplicate_same_value_role_prefers_verified_effect_argument():

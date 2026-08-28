@@ -12,7 +12,8 @@ from ..core.binding_ir import BindingSpec
 from ..core.edge_ir import GraphEdge
 from ..core.refs import SkillRef
 from ..core.status import EdgeType, ExecutionMode
-from ..core.trace_ir import NodeValidationResult, TaskExecutionInstance, TraceRecord
+from ..core.trace_ir import (NodeExecutionStatus, NodeValidationResult,
+                             TaskExecutionInstance, TraceRecord)
 
 
 @dataclass
@@ -28,6 +29,7 @@ class PlannedNode:
     occurrence_id: str = ""
     origin_step_id: str = ""
     binding_specs: dict[str, BindingSpec] = field(default_factory=dict)
+    branch_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {"ref": str(self.ref), "step_id": self.step_id,
@@ -35,6 +37,7 @@ class PlannedNode:
                 "origin_step_id": self.origin_step_id,
                 "binding_specs": {key: value.to_dict()
                                   for key, value in self.binding_specs.items()},
+                "branch_id": self.branch_id,
                 "params": self.params, "source": self.source,
                 "target_effects": self.target_effects, "dynamic": self.dynamic}
 
@@ -85,6 +88,9 @@ class RuntimeNodeState:
     outputs: dict[str, Any] = field(default_factory=dict)
     attempt_started: bool = False
     executed_action_count: int = 0
+    execution_status: NodeExecutionStatus = NodeExecutionStatus.NOT_STARTED
+    satisfied_without_execution: bool = False
+    binding_provenance: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -106,6 +112,9 @@ class RuntimeNodeState:
             "outputs": self.outputs,
             "attempt_started": self.attempt_started,
             "executed_action_count": self.executed_action_count,
+            "execution_status": self.execution_status.value,
+            "satisfied_without_execution": self.satisfied_without_execution,
+            "binding_provenance": self.binding_provenance,
         }
 
 
@@ -135,6 +144,39 @@ class RuntimeGraph:
             "tool_calls": 0,
             "llm_tokens": 0,
         }
+
+    def append_dynamic_gap(self, missing_effects: list[dict[str, Any]],
+                           params: dict[str, Any], *,
+                           occurrence_id: str = "task_gap_000") -> int:
+        """Append one explicit, auditable task-level Dynamic occurrence."""
+        index = len(self.plan.nodes)
+        step_id = f"step_{index:03d}"
+        planned = PlannedNode(
+            ref=SkillRef("runtime.dynamic.task_gap", "0.0.0"),
+            step_id=step_id, occurrence_id=occurrence_id,
+            params=dict(params), source="task_gap",
+            target_effects=[dict(item) for item in missing_effects],
+            dynamic=True,
+        )
+        previous = self.plan.nodes[-1] if self.plan.nodes else None
+        self.plan.nodes.append(planned)
+        state = RuntimeNodeState(
+            ref=str(planned.ref), step_id=step_id,
+            occurrence_id=occurrence_id, params=dict(params),
+            target_effects=list(planned.target_effects),
+        )
+        self.nodes.append(state)
+        if previous is not None:
+            edge = GraphEdge(
+                source=str(previous.ref), target=str(planned.ref),
+                type=EdgeType.NEXT, scope="runtime",
+                source_step=previous.step_id, target_step=step_id,
+                metadata={"task_id": self.task_id,
+                          "reason": "explicit_task_gap"},
+            )
+            self.plan.edges.append(edge)
+            self.edges.append(edge)
+        return index
 
     def mark_fallback(self, index: int, mode: ExecutionMode, reason: str) -> None:
         node = self.nodes[index]

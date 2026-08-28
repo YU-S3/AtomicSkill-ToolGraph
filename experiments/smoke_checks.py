@@ -194,8 +194,33 @@ def check_registry_and_graph(tmp_path: Path) -> None:
     composite = CompositeSkill(
         ref=SkillRef("composite.test.pick-place", "1.0.0"),
         summary="获取后放置",
-        graph={"nodes": ["test.acquire-object@1.0.0", "test.place-object@1.0.0"],
-               "control": build_control_edges(["test.acquire-object", "test.place-object"])},
+        graph={
+            "nodes": ["test.acquire-object@1.0.0",
+                      "test.place-object@1.0.0"],
+            "steps": [
+                {"step_id": "acquire_000",
+                 "node_ref": "test.acquire-object@1.0.0",
+                 "params": {"object": "$task.object"}},
+                {"step_id": "place_000",
+                 "node_ref": "test.place-object@1.0.0",
+                 "params": {"object": "$flow.held_object",
+                            "location": "$task.location"}},
+            ],
+            "control": [{
+                "source": "test.acquire-object@1.0.0",
+                "target": "test.place-object@1.0.0",
+                "source_step": "acquire_000", "target_step": "place_000",
+                "type": EdgeType.NEXT.value, "scope": "composite",
+            }],
+            "data": [{
+                "source": "test.acquire-object@1.0.0",
+                "target": "test.place-object@1.0.0",
+                "source_step": "acquire_000", "target_step": "place_000",
+                "type": EdgeType.DATA_FLOW.value, "scope": "composite",
+                "mapping": {"source_output": "held_object",
+                            "target_input": "object"},
+            }],
+        },
         validator={}, metadata={"task_type_labels": ["pick_and_place_simple"]},
     )
     registry.register(composite)
