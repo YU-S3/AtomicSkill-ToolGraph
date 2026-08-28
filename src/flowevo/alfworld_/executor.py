@@ -399,9 +399,11 @@ class AlfWorldExecutor:
             trace.llm_prompt_tokens_total += step_out.prompt_tokens
             trace.llm_completion_tokens_total += step_out.completion_tokens
             trace.llm_total_tokens_total += (
-                step_out.prompt_tokens + step_out.completion_tokens
+                step_out.total_tokens
+                or step_out.prompt_tokens + step_out.completion_tokens
             )
             trace.llm_call_count += 1
+            trace.llm_latency_ms_total += step_out.latency_ms
 
             result = self.env.step(step_out.action)
 

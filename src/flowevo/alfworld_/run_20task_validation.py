@@ -293,6 +293,9 @@ def run_condition(
         library.advance_episode()
         task, obs, admissible = env.reset()
         t0 = time.time()
+        usage_before = (
+            llm.usage_snapshot() if hasattr(llm, "usage_snapshot") else None
+        )
 
         try:
             # Layered retrieval, masked by condition flags.
@@ -342,6 +345,14 @@ def run_condition(
 
             infrastructure_attempts: list[dict[str, Any]] = []
             trace = None
+            # Keep all LLM usage incurred by task-level infrastructure retries.
+            # Only the final trace is retained, so without these accumulators a
+            # failed attempt's already-completed calls silently disappear.
+            retry_prompt_tokens = 0
+            retry_completion_tokens = 0
+            retry_total_tokens = 0
+            retry_call_count = 0
+            retry_latency_ms = 0.0
             # 与 ours 相同：最多 2 次 task-level 基础设施重试，并从该任务
             # 初始状态 reset；不能从 API 出错时的中间环境继续。
             for infrastructure_try in range(3):
@@ -353,6 +364,11 @@ def run_condition(
                     skill_bindings=bindings,
                     policy_directives=static_dirs,
                 )
+                retry_prompt_tokens += int(trace.llm_prompt_tokens_total or 0)
+                retry_completion_tokens += int(trace.llm_completion_tokens_total or 0)
+                retry_total_tokens += int(trace.llm_total_tokens_total or 0)
+                retry_call_count += int(trace.llm_call_count or 0)
+                retry_latency_ms += float(trace.llm_latency_ms_total or 0.0)
                 if trace.failure_type != "llm_error":
                     break
                 infrastructure_attempts.append({
@@ -371,6 +387,11 @@ def run_condition(
                         bindings = param_extractor.extract(
                             task.task_type, task.goal, obs, admissible)
             assert trace is not None
+            trace.llm_prompt_tokens_total = retry_prompt_tokens
+            trace.llm_completion_tokens_total = retry_completion_tokens
+            trace.llm_total_tokens_total = retry_total_tokens
+            trace.llm_call_count = retry_call_count
+            trace.llm_latency_ms_total = retry_latency_ms
             infrastructure_failure = trace.failure_type == "llm_error"
 
             wall = time.time() - t0
@@ -404,6 +425,28 @@ def run_condition(
                     if compile_result.exemplar is not None:
                         library.add_exemplar(compile_result.exemplar)
                 library.record_trace_stats(trace)
+
+            # Authoritative all-in episode accounting.  This delta includes
+            # every successful Runtime call across infrastructure retries and
+            # every post-runtime Compiler call.  Frozen evaluation naturally
+            # excludes compiler cost because cfg["compile"] is disabled.
+            if usage_before is not None and hasattr(llm, "usage_snapshot"):
+                usage_after = llm.usage_snapshot()
+                trace.llm_prompt_tokens_total = max(
+                    0, int(usage_after["prompt_tokens"])
+                    - int(usage_before["prompt_tokens"]))
+                trace.llm_completion_tokens_total = max(
+                    0, int(usage_after["completion_tokens"])
+                    - int(usage_before["completion_tokens"]))
+                trace.llm_total_tokens_total = max(
+                    0, int(usage_after["total_tokens"])
+                    - int(usage_before["total_tokens"]))
+                trace.llm_call_count = max(
+                    0, int(usage_after["call_count"])
+                    - int(usage_before["call_count"]))
+                trace.llm_latency_ms_total = max(
+                    0.0, float(usage_after["latency_ms"])
+                    - float(usage_before["latency_ms"]))
 
             cum_success += int(trace.success)
             snap = library.snapshot()

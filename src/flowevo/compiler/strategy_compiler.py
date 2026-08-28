@@ -147,6 +147,20 @@ class StrategyCompiler:
                 input_text=prompt,
                 settings=self._llm_settings,
             )
+            # Strategy extraction happens after runtime execution but is still
+            # an online-evolution cost of this episode.
+            prompt_tokens = int(getattr(response, "prompt_tokens", 0) or 0)
+            completion_tokens = int(getattr(response, "completion_tokens", 0) or 0)
+            total_tokens = int(
+                getattr(response, "total_tokens", 0)
+                or prompt_tokens + completion_tokens
+            )
+            trace.llm_prompt_tokens_total += prompt_tokens
+            trace.llm_completion_tokens_total += completion_tokens
+            trace.llm_total_tokens_total += total_tokens
+            trace.llm_call_count += 1
+            trace.llm_latency_ms_total += float(
+                getattr(response, "latency_ms", 0.0) or 0.0)
             text = response.text if hasattr(response, "text") else str(response)
         except Exception:
             return None

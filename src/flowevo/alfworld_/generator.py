@@ -20,6 +20,10 @@ class AlfWorldStepOutput:
     action: str
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # Prefer the provider's authoritative total because it may include token
+    # classes that are not reconstructible from the two legacy counters.
+    total_tokens: int = 0
+    latency_ms: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -99,8 +103,14 @@ class AlfWorldGenerator:
         action = _parse_single_action(resp.text, admissible_commands)
         return AlfWorldStepOutput(
             action=action,
-            prompt_tokens=resp.prompt_tokens,
-            completion_tokens=resp.completion_tokens,
+            prompt_tokens=int(getattr(resp, "prompt_tokens", 0) or 0),
+            completion_tokens=int(getattr(resp, "completion_tokens", 0) or 0),
+            total_tokens=int(
+                getattr(resp, "total_tokens", 0)
+                or (getattr(resp, "prompt_tokens", 0) or 0)
+                + (getattr(resp, "completion_tokens", 0) or 0)
+            ),
+            latency_ms=float(getattr(resp, "latency_ms", 0.0) or 0.0),
         )
 
 

@@ -77,6 +77,29 @@ def test_fullchain_smoke(workspace_tmp):
     assert by_kind.get("implementation_atomic", 0) >= 3
     assert by_kind.get("composite", 0) >= 2
 
+    # Every online LLM call is attributed to a stable agent bucket.  Composite
+    # construction itself is deterministic; composite_agent is specifically
+    # the semantic graph-proposal call that precedes code validation/building.
+    required_buckets = {
+        "planner_agent", "runtime_agent", "extractor_agent",
+        "composite_agent", "evolution_repair_agent", "episode_total",
+    }
+    for episode in episodes:
+        usage = episode["llm_usage_by_agent"]
+        assert required_buckets <= set(usage)
+        attributed = sum(
+            int(details.get("total_tokens", 0) or 0)
+            for name, details in usage.items()
+            if name not in {"episode_total"})
+        assert attributed == int(usage["episode_total"]["total_tokens"])
+        assert episode["tokens"] == int(usage["episode_total"]["total_tokens"])
+    assert any(e["llm_usage_by_agent"]["runtime_agent"]["call_count"] > 0
+               for e in episodes)
+    assert any(e["llm_usage_by_agent"]["extractor_agent"]["call_count"] > 0
+               for e in episodes)
+    assert any(e["llm_usage_by_agent"]["composite_agent"]["call_count"] > 0
+               for e in episodes)
+
 
 def test_toy_world_protocol():
     tasks = toy_tasks(("env",))

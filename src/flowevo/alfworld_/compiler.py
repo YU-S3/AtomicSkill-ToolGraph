@@ -236,6 +236,23 @@ Rules:"""
                 input_text=prompt,
                 settings=settings,
             )
+            # Compilation is part of online evolution.  Charge its LLM call to
+            # the same episode immediately after the response arrives, even if
+            # the response later fails semantic parsing and we use a fallback.
+            prompt_tokens = int(getattr(response, "prompt_tokens", 0) or 0)
+            completion_tokens = int(getattr(response, "completion_tokens", 0) or 0)
+            total_tokens = int(
+                getattr(response, "total_tokens", 0)
+                or prompt_tokens + completion_tokens
+            )
+            trace.llm_prompt_tokens_total += prompt_tokens
+            trace.llm_completion_tokens_total += completion_tokens
+            trace.llm_total_tokens_total += int(
+                total_tokens
+            )
+            trace.llm_call_count += 1
+            trace.llm_latency_ms_total += float(
+                getattr(response, "latency_ms", 0.0) or 0.0)
 
             # Parse LLM output into a flat list of rules
             rules: list[str] = []
@@ -255,7 +272,7 @@ Rules:"""
                 return None
 
             rules = rules[:5]
-            extraction_tokens = (response.prompt_tokens or 0) + (response.completion_tokens or 0)
+            extraction_tokens = total_tokens
 
             return AlfWorldExemplar(
                 exemplar_id="guide_%s_%s" % (trace.task_type, uuid.uuid4().hex[:8]),

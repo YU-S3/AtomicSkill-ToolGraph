@@ -12,6 +12,9 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from ..core.llm import (diff_llm_usage, record_llm_usage_bucket,
+                        snapshot_llm_usage)
+
 from ..core.predicates import (
     _fact_to_predicate,
     StateSnapshot,
@@ -171,6 +174,7 @@ class SemanticExtractorAgent:
         if not events or self.llm is None:
             result.errors.append("no_events_or_llm")
             return result
+        usage_before = snapshot_llm_usage(self.llm)
         payload = {
             "task": {
                 "goal": trace.task_goal,
@@ -219,12 +223,17 @@ class SemanticExtractorAgent:
                     result.errors.append("causal_slice_missing_goal_or_capability_dependency")
         except Exception as exc:  # extraction failure must not turn task success into infra failure
             result.errors.append(f"extractor_error:{type(exc).__name__}:{exc}")
+        finally:
+            record_llm_usage_bucket(
+                trace.metrics, "extractor_agent",
+                diff_llm_usage(usage_before, snapshot_llm_usage(self.llm)))
         return result
 
     def propose_graph(self, trace: TraceRecord,
                       occurrences: list[dict[str, Any]]) -> dict[str, Any]:
         if self.llm is None or len(occurrences) < 2:
             return {}
+        usage_before = snapshot_llm_usage(self.llm)
         payload = {
             "task": {"goal": trace.task_goal},
             "validated_occurrences": occurrences,
@@ -239,6 +248,10 @@ class SemanticExtractorAgent:
             return validate_graph_proposal(proposal, occurrences)
         except Exception:
             return {}
+        finally:
+            record_llm_usage_bucket(
+                trace.metrics, "composite_agent",
+                diff_llm_usage(usage_before, snapshot_llm_usage(self.llm)))
 
 
 def build_structured_events(trace: TraceRecord) -> list[dict[str, Any]]:

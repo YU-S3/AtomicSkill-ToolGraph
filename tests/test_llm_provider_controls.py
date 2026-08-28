@@ -176,3 +176,36 @@ def test_streaming_preserves_complete_reasoning_and_final_content(monkeypatch):
     assert result.finish_reason == "stop"
     assert payloads[0]["stream"] is True
     assert payloads[0]["max_tokens"] == 384000
+
+
+def test_client_usage_snapshot_supports_episode_before_after_deltas(monkeypatch):
+    responses = iter([
+        {
+            "choices": [{"message": {"content": "first"},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 4,
+                      "total_tokens": 17},
+        },
+        {
+            "choices": [{"message": {"content": "compiled"},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3,
+                      "total_tokens": 12},
+        },
+    ])
+
+    def post(_url, *, headers, json, timeout):
+        return _Response(next(responses))
+
+    monkeypatch.setattr("runtime.llm_client.requests.post", post)
+    client = LLMClient(_config())
+    before = client.usage_snapshot()
+    settings = GenerationSettings(temperature=0.0, max_output_tokens=64)
+    client.generate(instructions="runtime", input_text="task", settings=settings)
+    client.generate(instructions="compiler", input_text="trace", settings=settings)
+    after = client.usage_snapshot()
+
+    assert int(after["prompt_tokens"]) - int(before["prompt_tokens"]) == 17
+    assert int(after["completion_tokens"]) - int(before["completion_tokens"]) == 7
+    assert int(after["total_tokens"]) - int(before["total_tokens"]) == 29
+    assert int(after["call_count"]) - int(before["call_count"]) == 2

@@ -6,6 +6,7 @@ import json
 import random
 import re
 import sys
+import threading
 import time
 from dataclasses import dataclass
 
@@ -47,11 +48,40 @@ class LLMClient:
 
     def __init__(self, config: RuntimeLLMConfig) -> None:
         self.config = config
+        self._usage_lock = threading.Lock()
+        self._usage_totals = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "call_count": 0,
+            "latency_ms": 0.0,
+        }
         from runtime.config import SUPPORTED_PROVIDERS
         if config.provider not in SUPPORTED_PROVIDERS:
             raise LLMClientError(
                 "Unsupported provider `%s`. Must be one of %s." % (config.provider, sorted(SUPPORTED_PROVIDERS))
             )
+
+    def usage_snapshot(self) -> dict[str, int | float]:
+        """Return a process-local cumulative usage snapshot.
+
+        Runners use before/after deltas so post-runtime compiler calls and
+        successful calls made before a task-level retry cannot disappear from
+        the episode record.
+        """
+        with self._usage_lock:
+            return dict(self._usage_totals)
+
+    def _record_response_usage(self, response: LLMResponse) -> None:
+        with self._usage_lock:
+            self._usage_totals["prompt_tokens"] += int(response.prompt_tokens or 0)
+            self._usage_totals["completion_tokens"] += int(response.completion_tokens or 0)
+            self._usage_totals["total_tokens"] += int(
+                response.total_tokens
+                or response.prompt_tokens + response.completion_tokens
+            )
+            self._usage_totals["call_count"] += 1
+            self._usage_totals["latency_ms"] += float(response.latency_ms or 0.0)
 
     def _sanitize(self, text: str) -> str:
         sanitized = re.sub(r"sk-[A-Za-z0-9_-]+", "[REDACTED_API_KEY]", text)
@@ -258,7 +288,7 @@ class LLMClient:
             usage_details = (usage.get("completion_tokens_details") or {}
                              if isinstance(usage, dict) else {})
             latency_ms = (time.perf_counter() - started) * 1000.0
-            return LLMResponse(
+            llm_response = LLMResponse(
                 text=text,
                 provider=self.config.provider,
                 model=self.config.model,
@@ -270,6 +300,8 @@ class LLMClient:
                 reasoning_tokens=self._usage_int(usage_details, "reasoning_tokens"),
                 finish_reason=finish_reason,
             )
+            self._record_response_usage(llm_response)
+            return llm_response
 
         raise LLMClientError(
             self._sanitize(

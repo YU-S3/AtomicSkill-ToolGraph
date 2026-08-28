@@ -15,7 +15,8 @@ from .core.binding_ir import (BindingKind, BindingProvenance,
                               BindingResolutionState, is_concrete_binding)
 from .atomicizer.trace_atomicizer import TraceAtomicizer
 from .core.config import SystemConfig
-from .core.llm import LLM
+from .core.llm import (LLM, LLM_USAGE_FIELDS, diff_llm_usage,
+                       record_llm_usage_bucket, snapshot_llm_usage)
 from .core.status import EdgeType, ExecutionMode, SkillNodeKind, SkillStatus, ToolLifecycle
 from .core.trace_ir import (
     ActionRecord,
@@ -103,8 +104,11 @@ class AtomicSkillGraphSystem:
     def run_task(self, task: Task) -> dict[str, Any]:
         """运行单个任务（§43）。返回 episode 摘要 dict。"""
         started = time.perf_counter()
-        usage_baseline = self._combined_llm_tokens()
+        episode_usage_before = self._combined_llm_usage_snapshot()
+        planner_usage_before = snapshot_llm_usage(self.llm)
         plan = self.planner.compile_runtime_graph(task)
+        planner_usage_after = snapshot_llm_usage(self.llm)
+        runtime_usage_before = planner_usage_after
 
         is_env = _is_env_task(task)
         if is_env:
@@ -147,8 +151,18 @@ class AtomicSkillGraphSystem:
         else:
             trace = self._run_code_task(task, plan)
 
+        runtime_usage_after = snapshot_llm_usage(self.llm)
+        record_llm_usage_bucket(
+            trace.metrics, "planner_agent",
+            diff_llm_usage(planner_usage_before, planner_usage_after))
+        record_llm_usage_bucket(
+            trace.metrics, "runtime_agent",
+            diff_llm_usage(runtime_usage_before, runtime_usage_after))
+
         trace.latency_ms = (time.perf_counter() - started) * 1000.0
-        trace.token_cost = max(0, self._combined_llm_tokens() - usage_baseline)
+        trace.token_cost = float(diff_llm_usage(
+            episode_usage_before,
+            self._combined_llm_usage_snapshot())["total_tokens"])
         if trace.success:
             trace.metrics.setdefault("task_success", 1)
         trace.provenance.setdefault("target_effects", copy.deepcopy(task.target_effects))
@@ -160,11 +174,65 @@ class AtomicSkillGraphSystem:
         self._finalize_validation(trace, task)
         # 保存 trace（成功与失败都保存）
         self.trace_store.save(trace)
+        evolution_runtime_usage_before = snapshot_llm_usage(self.llm)
         evolution = self._process_trace(trace, task)
+        evolution_runtime_usage_after = snapshot_llm_usage(self.llm)
+        evolution_runtime_delta = diff_llm_usage(
+            evolution_runtime_usage_before, evolution_runtime_usage_after)
+        if self.extractor_llm is self.llm:
+            # A compatibility client without fork() serves all agents.  The
+            # enclosing evolution delta therefore contains the two explicitly
+            # metered Extractor/Composite calls; subtract them to avoid double
+            # attribution while retaining any branch-repair Runtime calls.
+            usage_by_agent = trace.metrics.get("llm_usage_by_agent") or {}
+            for field_name in LLM_USAGE_FIELDS:
+                nested = sum(float((usage_by_agent.get(bucket) or {}).get(
+                    field_name, 0) or 0)
+                    for bucket in ("extractor_agent", "composite_agent"))
+                remaining = max(0.0, float(evolution_runtime_delta.get(
+                    field_name, 0) or 0) - nested)
+                evolution_runtime_delta[field_name] = (
+                    remaining if field_name == "latency_ms" else int(remaining))
+        record_llm_usage_bucket(
+            trace.metrics, "evolution_repair_agent",
+            evolution_runtime_delta)
         # Failure-branch strict replay may itself call the LLM. Include that
         # learning cost in the online episode rather than hiding it.
         trace.latency_ms = (time.perf_counter() - started) * 1000.0
-        trace.token_cost = max(0, self._combined_llm_tokens() - usage_baseline)
+        episode_usage_after = self._combined_llm_usage_snapshot()
+        episode_usage = diff_llm_usage(
+            episode_usage_before, episode_usage_after)
+        trace.token_cost = float(episode_usage["total_tokens"])
+        usage_by_agent = trace.metrics.setdefault("llm_usage_by_agent", {})
+        for bucket in (
+                "planner_agent", "runtime_agent", "extractor_agent",
+                "composite_agent", "evolution_repair_agent"):
+            if bucket not in usage_by_agent:
+                record_llm_usage_bucket(trace.metrics, bucket, {})
+        accounted: dict[str, int | float] = {}
+        unattributed: dict[str, int | float] = {}
+        for field_name in LLM_USAGE_FIELDS:
+            accounted_value = sum(
+                float((usage or {}).get(field_name, 0) or 0)
+                for name, usage in usage_by_agent.items()
+                if name not in {"episode_total", "unattributed"}
+                and isinstance(usage, dict))
+            total_value = float(episode_usage.get(field_name, 0) or 0)
+            missing_value = max(0.0, total_value - accounted_value)
+            accounted[field_name] = (accounted_value
+                                      if field_name == "latency_ms"
+                                      else int(accounted_value))
+            unattributed[field_name] = (missing_value
+                                        if field_name == "latency_ms"
+                                        else int(missing_value))
+        if any(float(value or 0) > 0 for value in unattributed.values()):
+            record_llm_usage_bucket(
+                trace.metrics, "unattributed", unattributed)
+        usage_by_agent["episode_total"] = {
+            **episode_usage,
+            "accounted_total_tokens": int(accounted["total_tokens"]),
+            "unattributed_total_tokens": int(unattributed["total_tokens"]),
+        }
         graph_report = validate_graph(self.registry, self.tool_registry)
         trace.metrics["skill_graph_valid"] = int(graph_report.passed)
         trace.metrics["skill_graph_error_count"] = len(graph_report.errors)
@@ -221,6 +289,8 @@ class AtomicSkillGraphSystem:
                 trace.metrics.get("infrastructure_errors") or []),
             "retries": trace.retries,
             "tokens": int(trace.token_cost),
+            "llm_usage_by_agent": copy.deepcopy(
+                trace.metrics.get("llm_usage_by_agent") or {}),
             "latency_ms": round(trace.latency_ms, 1),
             "direct_reuse_count": trace.direct_use_count(),
             "seeded_generation_count": trace.seeded_use_count(),
@@ -275,9 +345,24 @@ class AtomicSkillGraphSystem:
 
     def _combined_llm_tokens(self) -> int:
         """Runtime and Extractor are independent clients but one episode cost."""
+        return int(self._combined_llm_usage_snapshot()["total_tokens"])
+
+    def _combined_llm_usage_snapshot(self) -> dict[str, int | float]:
+        """Sum distinct Runtime and Extractor client usage counters."""
         clients = {id(self.llm): self.llm, id(self.extractor_llm): self.extractor_llm}
-        return sum(int(getattr(client.usage, "total_tokens", 0) or 0)
-                   for client in clients.values())
+        combined: dict[str, int | float] = {
+            field_name: 0.0 if field_name == "latency_ms" else 0
+            for field_name in LLM_USAGE_FIELDS
+        }
+        for client in clients.values():
+            snapshot = snapshot_llm_usage(client)
+            for field_name in LLM_USAGE_FIELDS:
+                combined[field_name] = (float(combined[field_name])
+                                        + float(snapshot[field_name]))
+        for field_name in LLM_USAGE_FIELDS:
+            if field_name != "latency_ms":
+                combined[field_name] = int(combined[field_name])
+        return combined
 
     def _cross_task_type_reuse(
             self, task: Task, trace: TraceRecord,
