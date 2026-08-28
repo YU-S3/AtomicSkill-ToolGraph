@@ -156,6 +156,7 @@ def test_atomic_only_runs_controlled_location_discovery(workspace_tmp):
     config = SystemConfig(data_dir=workspace_tmp / "atomic_only")
     config.llm.mock = True
     config.features.enable_tool_evolution = False
+    config.features.enable_framework_discovery = True
     adapter = _Adapter()
     system = AtomicSkillGraphSystem(config, adapter, MockLLM(script={}))
     acquire = AbstractAtomicSkill(

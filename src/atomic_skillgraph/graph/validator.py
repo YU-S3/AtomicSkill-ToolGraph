@@ -16,7 +16,8 @@ from ..core.edge_ir import DEPENDENCY, GraphEdge
 from ..core.refs import SkillRef, ToolRef
 from ..core.skill_ir import CompositeSkill, ImplementationAtom
 from ..core.status import EdgeType, SkillNodeKind, SkillStatus
-from .graph import GraphCheckReport, composite_node_order
+from .graph import composite_step_order
+from ..runtime.plan_validator import validate_composite_binding_closure
 from .registry import SkillGraphRegistry
 
 
@@ -57,7 +58,7 @@ def validate_graph(registry: SkillGraphRegistry, tool_registry=None) -> GraphVal
             report.errors.append(f"implements 边 source 不是 ImplementationAtom：{edge['source']}")
             implements_ok = False
             continue
-        abstract = registry.get_recommended(impl.abstract_ref.logical_id)
+        abstract = registry.get(impl.abstract_ref)
         if abstract is None:
             report.errors.append(f"Implementation {impl.ref} 的 Abstract 目标不存在：{impl.abstract_ref}")
             implements_ok = False
@@ -89,7 +90,9 @@ def validate_graph(registry: SkillGraphRegistry, tool_registry=None) -> GraphVal
     report.checks["edge_schema_valid"] = edge_schema_ok
 
     # 2. contains 边 + Composite 结构
-    for composite in registry.list_by_kind(SkillNodeKind.COMPOSITE):
+    for composite in registry.list_all_versions(SkillNodeKind.COMPOSITE):
+        if composite.status != SkillStatus.ACTIVE:
+            continue
         report = _check_composite(composite, registry, report)
 
     # 3. Tool binding 合法性（N:M 绑定检查）
@@ -116,19 +119,23 @@ def _check_composite(composite: CompositeSkill, registry: SkillGraphRegistry,
     for ref_text in node_refs:
         try:
             ref = SkillRef.parse(str(ref_text))
-            obj = registry.get(ref) or registry.get_recommended(ref.logical_id)
+            obj = registry.get(ref)
         except ValueError:
             obj = None
         if obj is None:
             report.errors.append(f"Composite {composite.ref} 引用不存在节点：{ref_text}")
             continue
-        if obj.status == SkillStatus.RETIRED:
-            report.errors.append(f"Composite {composite.ref} 引用已退役节点：{ref_text}")
+        if obj.status != SkillStatus.ACTIVE:
+            report.errors.append(f"Composite {composite.ref} 引用非 Active 节点：{ref_text}")
 
-    order, sub_report = composite_node_order(composite, registry)
+    _steps, sub_report = composite_step_order(composite, registry)
     for err in sub_report.errors:
         report.errors.append(f"Composite {composite.ref}: {err}")
     for warn in sub_report.warnings:
         report.warnings.append(f"Composite {composite.ref}: {warn}")
     report.checks[f"composite_{composite.ref.logical_id}_order"] = not sub_report.errors
+    closure = validate_composite_binding_closure(composite, registry)
+    report.checks[f"composite_{composite.ref.logical_id}_binding_closure"] = closure.passed
+    report.errors.extend(
+        f"Composite {composite.ref}: {error}" for error in closure.errors)
     return report

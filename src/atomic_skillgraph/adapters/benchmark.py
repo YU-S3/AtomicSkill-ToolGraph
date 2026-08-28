@@ -180,6 +180,7 @@ class EnvRunResult:
     # Non-error runtime interventions (cycle recovery, bounded discovery, etc.)
     # are persisted separately so failures remain attributable.
     diagnostics: dict[str, Any] = field(default_factory=dict)
+    node_spans: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -198,6 +199,7 @@ class EnvRunResult:
             "atomic_complete": self.atomic_complete,
             "infrastructure_errors": self.infrastructure_errors,
             "diagnostics": self.diagnostics,
+            "node_spans": self.node_spans,
         }
 
 

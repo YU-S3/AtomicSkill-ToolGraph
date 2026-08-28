@@ -128,11 +128,17 @@ class SkillGraphRegistry:
         entry.update({
             "kind": obj.kind.value,
             "current_version": obj.ref.version,
+            "latest_version": obj.ref.version,
             "status": obj.status.value,
             "versions": versions,
         })
-        # 默认推荐指针跟随最新注册版本（rollback 显式恢复历史指针）
-        entry["recommended_version"] = obj.ref.version
+        version_statuses = dict(entry.get("version_statuses") or {})
+        version_statuses[obj.ref.version] = obj.status.value
+        entry["version_statuses"] = version_statuses
+        # Draft/Shadow merely advance latest.  They must never displace an
+        # executable Active recommendation.
+        if obj.status == SkillStatus.ACTIVE:
+            entry["recommended_version"] = obj.ref.version
         nodes[obj.ref.logical_id] = entry
         # 结构边
         if isinstance(obj, ImplementationAtom):
@@ -214,14 +220,18 @@ class SkillGraphRegistry:
         index = self.index_entry(logical_id)
         if index is None:
             return None
-        return self._load_obj(SkillNodeKind(index["kind"]), logical_id, index["current_version"])
+        return self._load_obj(SkillNodeKind(index["kind"]), logical_id,
+                              index.get("latest_version") or index["current_version"])
 
     def get_recommended(self, logical_id: str):
         index = self.index_entry(logical_id)
         if index is None:
             return None
-        return self._load_obj(SkillNodeKind(index["kind"]), logical_id,
-                              index.get("recommended_version") or index["current_version"])
+        version = str(index.get("recommended_version") or "")
+        if not version:
+            return None
+        obj = self._load_obj(SkillNodeKind(index["kind"]), logical_id, version)
+        return obj if obj is not None and obj.status == SkillStatus.ACTIVE else None
 
     def index_entry(self, logical_id: str) -> dict[str, Any] | None:
         return self._read_graph()["nodes"].get(logical_id)
@@ -236,11 +246,10 @@ class SkillGraphRegistry:
         for logical_id, entry in graph["nodes"].items():
             if entry.get("kind") != kind.value:
                 continue
-            status = SkillStatus(str(entry.get("status", "active")))
-            if statuses is not None and status not in statuses:
+            version = str(entry.get("recommended_version") or "")
+            obj = self._load_obj(kind, logical_id, version) if version else None
+            if obj is not None and statuses is not None and obj.status not in statuses:
                 continue
-            obj = self._load_obj(kind, logical_id,
-                                 entry.get("recommended_version") or entry.get("current_version"))
             if obj is not None:
                 result.append(obj)
         return result
@@ -263,8 +272,9 @@ class SkillGraphRegistry:
         graph = self._read_graph()
         result = []
         for logical_id, entry in graph["nodes"].items():
-            obj = self._load_obj(SkillNodeKind(entry["kind"]), logical_id,
-                                 entry.get("recommended_version") or entry.get("current_version"))
+            version = str(entry.get("recommended_version") or "")
+            obj = (self._load_obj(SkillNodeKind(entry["kind"]), logical_id, version)
+                   if version else None)
             if obj is not None:
                 result.append(obj)
         return result
@@ -300,7 +310,13 @@ class SkillGraphRegistry:
             raise KeyError(str(ref))
         obj.status = status
         self._save_obj(obj)
-        entry["status"] = status.value
+        entry.setdefault("version_statuses", {})[ref.version] = status.value
+        if ref.version == (entry.get("latest_version") or entry.get("current_version")):
+            entry["status"] = status.value
+        if status == SkillStatus.ACTIVE:
+            entry["recommended_version"] = ref.version
+        elif entry.get("recommended_version") == ref.version:
+            entry.pop("recommended_version", None)
         self._write_graph(graph)
 
     def update_runtime_state(self, obj) -> SkillRef:
@@ -313,7 +329,14 @@ class SkillGraphRegistry:
             raise ValueError(f"{obj.ref.logical_id} 校验失败：{errors}")
         self._save_obj(obj)
         graph = self._read_graph()
-        graph["nodes"][obj.ref.logical_id]["status"] = obj.status.value
+        entry = graph["nodes"][obj.ref.logical_id]
+        entry.setdefault("version_statuses", {})[obj.ref.version] = obj.status.value
+        if obj.ref.version == (entry.get("latest_version") or entry.get("current_version")):
+            entry["status"] = obj.status.value
+        if obj.status == SkillStatus.ACTIVE:
+            entry["recommended_version"] = obj.ref.version
+        elif entry.get("recommended_version") == obj.ref.version:
+            entry.pop("recommended_version", None)
         self._write_graph(graph)
         return obj.ref
 
@@ -324,6 +347,9 @@ class SkillGraphRegistry:
             raise KeyError(ref.logical_id)
         if ref.version not in (entry.get("versions") or []):
             raise KeyError(ref.version)
+        obj = self.get(ref)
+        if obj is None or obj.status != SkillStatus.ACTIVE:
+            raise ValueError(f"only_active_may_be_recommended:{ref}")
         entry["recommended_version"] = ref.version
         self._write_graph(graph)
 
@@ -338,7 +364,8 @@ class SkillGraphRegistry:
     # ------------------------------------------------------------------
     def retrieve(self, query: dict[str, Any], *, top_k: int = 5,
                  hard_restrict_task_type: bool = False,
-                 task_type_bonus: float = 0.3) -> list[RetrievalHit]:
+                 task_type_bonus: float = 0.3,
+                 statuses: set[SkillStatus] | None = None) -> list[RetrievalHit]:
         goal_text = str(query.get("goal_text", "")).lower()
         task_type = str(query.get("task_type", ""))
         state = query.get("state") or {}
@@ -347,8 +374,12 @@ class SkillGraphRegistry:
 
         goal_tokens = _tokenize(goal_text)
         hits: list[RetrievalHit] = []
-        for obj in self.list_all():
-            if obj.status not in (SkillStatus.ACTIVE, SkillStatus.DRAFT):
+        allowed = statuses or {SkillStatus.ACTIVE}
+        pool = (self.list_all() if allowed == {SkillStatus.ACTIVE}
+                else [obj for obj in self.list_all_versions()
+                      if obj.status in allowed])
+        for obj in pool:
+            if obj.status not in allowed:
                 continue
             labels = {str(t) for t in (getattr(obj, "task_type_labels", None) or [])}
             labels |= {str(t) for t in ((getattr(obj, "metadata", None) or {}).get("task_type_labels") or [])}

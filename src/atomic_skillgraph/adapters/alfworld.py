@@ -271,6 +271,7 @@ class AlfWorldAdapter:
                                  node_ref: str = "", tool_ref: str = "",
                                  excluded_objects: set[str] | None = None,
                                  allow_passive_navigable: bool = False,
+                                 action_deadline: int | None = None,
                                  ) -> tuple[dict[str, str], EnvRunResult]:
         """Bounded location discovery for a learned entity/location contract.
 
@@ -381,6 +382,15 @@ class AlfWorldAdapter:
 
         def execute(action: str) -> Any:
             nonlocal obs, admissible
+            if (action_deadline is not None
+                    and len(result.actions) >= int(action_deadline)):
+                # Discovery is preparation, not an Agent attempt.  Stop before
+                # touching the environment and preserve the specific cause.
+                result.failure_type = "discovery_budget_exhausted"
+                return type("BudgetStop", (), {
+                    "done": True, "won": False,
+                    "observation": obs, "admissible_commands": admissible,
+                })()
             env_result = self._current_env.step(action)
             obs = env_result.observation
             admissible = list(env_result.admissible_commands)
@@ -539,7 +549,21 @@ class AlfWorldAdapter:
         if direct_steps:
             result.direct_used = True
             for step_spec in direct_steps:
+                span_start = len(result.actions)
+                skipped = 0
                 for step in step_spec.get("steps") or []:
+                    if len(result.actions) >= int(max_steps):
+                        result.failure_type = "direct_budget_exhausted"
+                        result.steps = len(result.actions)
+                        result.final_observation = obs
+                        result.node_spans.append({
+                            "step_id": str(step_spec.get("step_id") or
+                                           step_spec.get("node_ref") or ""),
+                            "action_start": span_start,
+                            "action_end": len(result.actions),
+                            "skipped_template_steps": skipped,
+                        })
+                        return result
                     template, params = _split_step(step, step_spec.get("params") or {})
                     filled = _fill_template(template, params)
                     # Location discovery may already have established a Tool's
@@ -547,6 +571,7 @@ class AlfWorldAdapter:
                     # as satisfied avoids sending an invalid same-location
                     # command while keeping that step in the reusable artifact.
                     if _navigation_already_satisfied(filled, tracker):
+                        skipped += 1
                         continue
                     env_result = self._current_env.step(filled)
                     obs = env_result.observation
@@ -580,17 +605,45 @@ class AlfWorldAdapter:
                             tracker.state(), stop_effects, effect_inputs)
                         result.steps = len(result.actions)
                         result.final_observation = env_result.observation
+                        result.node_spans.append({
+                            "step_id": str(step_spec.get("step_id") or
+                                           step_spec.get("node_ref") or ""),
+                            "action_start": span_start,
+                            "action_end": len(result.actions),
+                            "skipped_template_steps": skipped,
+                        })
                         return result
                     if _effects_met(tracker.state(), stop_effects, effect_inputs):
                         result.atomic_complete = True
                         result.steps = len(result.actions)
                         result.final_observation = obs
+                        result.node_spans.append({
+                            "step_id": str(step_spec.get("step_id") or
+                                           step_spec.get("node_ref") or ""),
+                            "action_start": span_start,
+                            "action_end": len(result.actions),
+                            "skipped_template_steps": skipped,
+                        })
                         return result
                     if env_result.done:
                         result.failure_type = "direct_template_failed"
                         result.steps = len(result.actions)
                         result.final_observation = env_result.observation
+                        result.node_spans.append({
+                            "step_id": str(step_spec.get("step_id") or
+                                           step_spec.get("node_ref") or ""),
+                            "action_start": span_start,
+                            "action_end": len(result.actions),
+                            "skipped_template_steps": skipped,
+                        })
                         return result
+                result.node_spans.append({
+                    "step_id": str(step_spec.get("step_id") or
+                                   step_spec.get("node_ref") or ""),
+                    "action_start": span_start,
+                    "action_end": len(result.actions),
+                    "skipped_template_steps": skipped,
+                })
             result.failure_type = "direct_template_goal_missed"
             result.steps = len(result.actions)
             result.final_observation = obs
@@ -941,6 +994,8 @@ class _AlfStateTracker:
         carrying = re.search(r"you are carrying (.+)\.?", text)
         if carrying:
             self.inventory = []
+            self.facts = {fact for fact in self.facts
+                          if not fact.startswith("agent_holds(")}
             for obj in _extract_objects(carrying.group(1)):
                 if obj != "nothing":
                     self.inventory.append(obj)

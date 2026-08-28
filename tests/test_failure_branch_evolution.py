@@ -165,6 +165,11 @@ def test_atomic_failure_is_not_double_counted_as_task_evidence(workspace_tmp):
         retrieved_skill_refs=[str(atomic.ref), str(atomic.ref)],
         realized_atomic_nodes=[{
             "ref": str(atomic.ref), "passed": False,
+            "params": {"object": "apple_1"},
+            "attempt_started": True, "executed_action_count": 1,
+            "attempts": [{"mode": "dynamic", "started": True,
+                          "passed": False, "action_start": 0,
+                          "action_end": 1, "action_count": 1}],
             "validation": {"messages": ["effect missing"]},
         }],
     )
@@ -189,6 +194,8 @@ def test_successful_atomic_is_not_penalized_by_downstream_task_failure(workspace
         task_type="toy", benchmark="toy_env", success=False,
         realized_atomic_nodes=[{
             "ref": str(atomic.ref), "passed": True,
+            "params": {"object": "apple_1"},
+            "attempt_started": True, "executed_action_count": 1,
             "validation": {"messages": []},
         }],
     )
@@ -217,8 +224,12 @@ def test_repeated_generator_failures_do_not_suppress_verified_contract(
             task_type="toy", benchmark="toy_env", success=False,
             realized_atomic_nodes=[{
                 "ref": str(atomic.ref), "passed": False,
-                "attempts": [{"mode": "seeded", "passed": False},
-                             {"mode": "dynamic", "passed": False}],
+                "params": {"object": "apple_1"},
+                "attempt_started": True, "executed_action_count": 2,
+                "attempts": [{"mode": "seeded", "started": True,
+                              "passed": False, "action_count": 1},
+                             {"mode": "dynamic", "started": True,
+                              "passed": False, "action_count": 1}],
             }],
         )
         shell._update_skill_evidence(trace, success=False)
@@ -615,8 +626,8 @@ def test_failure_without_rescue_creates_shadow_copies_but_never_merges(workspace
         realized_atomic_nodes=[{
             "ref": str(atomic.ref), "params": {"object": "apple 1"},
             "tool_refs": [str(old_tool.ref)], "passed": False,
-            "attempts": [{
-                "mode": "direct", "passed": False,
+                "attempts": [{
+                    "mode": "direct", "started": True, "passed": False,
                 "failure_type": "effect_not_met",
                 "tool_refs": [str(old_tool.ref)],
                 "action_start": 0, "action_end": 1,
@@ -638,6 +649,7 @@ def test_failure_without_rescue_creates_shadow_copies_but_never_merges(workspace
     branch = root / "evolution" / "branches" / "trace_no_rescue-0-0-direct"
     branch_registry = SkillGraphRegistry(branch / "bank" / "skill_graph")
     branch_tools = ToolRegistry(branch / "bank" / "tools")
-    assert branch_registry.get_recommended(atomic.ref.logical_id).status == SkillStatus.SHADOW
+    assert branch_registry.get_recommended(atomic.ref.logical_id).status == SkillStatus.ACTIVE
+    assert branch_registry.get_latest(atomic.ref.logical_id).status == SkillStatus.SHADOW
     assert branch_tools.get_latest(old_tool.tool_id).status == ToolLifecycle.SHADOW
     assert branch_tools.get_recommended(old_tool.tool_id).ref == old_tool.ref

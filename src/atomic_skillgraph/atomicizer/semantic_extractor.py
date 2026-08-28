@@ -276,6 +276,11 @@ def build_structured_events(trace: TraceRecord) -> list[dict[str, Any]]:
         observed_keys = {repr(item) for item in observed_predicates}
         causal_positive = [item for item in positive
                            if repr(item) not in observed_keys]
+        origin = str(action.get("origin") or "agent")
+        capability_positive = (causal_positive if origin in {"agent", "tool"}
+                               else [])
+        capability_negative = (negative if origin in {"agent", "tool"}
+                               else [])
         events.append({
             "event_index": index,
             "step": int(action.get("step", index)),
@@ -286,12 +291,16 @@ def build_structured_events(trace: TraceRecord) -> list[dict[str, Any]]:
             "mode": str(action.get("mode") or "dynamic"),
             "node_ref": str(action.get("node_ref") or ""),
             "tool_ref": str(action.get("tool_ref") or ""),
+            "origin": origin,
             "before": before,
             "after": after,
-            "positive_effects": causal_positive,
-            "terminal_verified_effects": terminal_by_event.get(index, []),
+            "state_positive_effects": causal_positive,
+            "state_negative_effects": negative,
+            "positive_effects": capability_positive,
+            "terminal_verified_effects": (terminal_by_event.get(index, [])
+                                           if origin in {"agent", "tool"} else []),
             "observed_effects": observed_predicates,
-            "negative_effects": negative,
+            "negative_effects": capability_negative,
             "state_changed": bool(causal_positive or negative),
             "observation_changed": bool(observed_predicates),
         })
@@ -315,6 +324,8 @@ def _extract_origin_aware_effect(events: list[dict[str, Any]], start: int,
 
     for event in events[start:end + 1]:
         if not bool(event.get("accepted", True)):
+            continue
+        if str(event.get("origin") or "agent") not in {"agent", "tool"}:
             continue
         for raw in event.get("negative_effects") or []:
             if not isinstance(raw, dict):
@@ -1309,6 +1320,8 @@ def _event_capability_effects(event: dict[str, Any]) -> list[dict[str, Any]]:
     Certificate audit metadata is stripped before predicate comparison and
     parameterization.  ``observed_effects`` remain excluded.
     """
+    if str(event.get("origin") or "agent") not in {"agent", "tool"}:
+        return []
     effects: list[dict[str, Any]] = []
     seen: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
     for raw in [*(event.get("positive_effects") or []),

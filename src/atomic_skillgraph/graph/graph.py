@@ -132,6 +132,62 @@ def composite_node_order(composite: CompositeSkill, registry) -> tuple[list[str]
     return [_logical_of(by_step[step_id]) for step_id in order], report
 
 
+def composite_step_order(composite: CompositeSkill, registry
+                         ) -> tuple[list[dict[str, Any]], GraphCheckReport]:
+    """Return exact versioned occurrence steps in executable order.
+
+    The main runtime is sequential today, so complex control edges fail closed.
+    Missing exact child versions and ambiguous edge endpoints invalidate the
+    whole candidate instead of silently returning a truncated workflow.
+    """
+    report = GraphCheckReport()
+    steps = composite.step_instances()
+    by_id = {str(step["step_id"]): dict(step) for step in steps}
+    if len(by_id) != len(steps):
+        report.add("unique_step_ids", False, "duplicate occurrence step_id")
+        return [], report
+    for step in steps:
+        try:
+            ref = SkillRef.parse(str(step.get("node_ref") or ""))
+        except ValueError as exc:
+            report.add("exact_child_ref", False, str(exc))
+            continue
+        child = registry.get(ref)
+        if child is None:
+            report.add("exact_child_ref", False, f"missing exact child: {ref}")
+        elif str(getattr(child, "status", "").value) != "active":
+            report.add("exact_child_status", False,
+                       f"child not active: {ref} status={child.status.value}")
+    unsupported = [edge for edge in composite.edge_objects()
+                   if edge.type in {EdgeType.BRANCH, EdgeType.PARALLEL,
+                                    EdgeType.LOOP, EdgeType.RETRY,
+                                    EdgeType.FALLBACK}]
+    if unsupported:
+        report.add("supported_runtime_control", False,
+                   "unsupported_runtime_control_edge:" +
+                   ",".join(edge.type.value for edge in unsupported))
+    ordering = []
+    for edge in composite.edge_objects():
+        if not edge.source_step or not edge.target_step:
+            report.add("occurrence_edge_endpoint", False,
+                       f"edge lacks occurrence endpoints: {edge.edge_id}")
+            continue
+        if edge.source_step not in by_id or edge.target_step not in by_id:
+            report.add("occurrence_edge_endpoint", False,
+                       f"edge endpoint missing: {edge.source_step}->{edge.target_step}")
+            continue
+        if edge.type == EdgeType.NEXT:
+            ordering.append([edge.source_step, edge.target_step])
+    if report.errors:
+        return [], report
+    order, cycles = topo_sort(list(by_id), ordering)
+    if order is None:
+        report.add("composite_dag", False, f"control cycle: {cycles}")
+        return [], report
+    report.add("composite_dag", True)
+    return [by_id[step_id] for step_id in order], report
+
+
 def entry_exit(nodes: list[str], edges: list[list[str]]) -> tuple[list[str], list[str]]:
     """识别入口/出口节点。"""
     indeg: dict[str, int] = {n: 0 for n in nodes}

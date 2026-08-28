@@ -470,7 +470,8 @@ def check_atomicizer_env(tmp_path: Path) -> None:
                f"候选 {candidate.skill.ref} 缺少节点验证器")
     # apply：注册
     applied = atomicizer.apply(trace)
-    expect(len(registry.list_all()) >= 2, "apply 后应注册原子技能")
+    expect(len(registry.list_all_versions(SkillNodeKind.ABSTRACT_ATOMIC)) >= 2,
+           "apply 后应注册原子候选版本")
 
 
 def check_atomicizer_code(tmp_path: Path) -> None:
@@ -572,9 +573,20 @@ def check_evolution(tmp_path: Path) -> None:
     fail_trace.trace_id = new_id("trace")
     fail_trace.success = False
     fail_trace.failure_type = "benchmark_failure"
+    failed_ref = str(result.atomic_refs[0])
+    fail_trace.realized_atomic_nodes = [{
+        "ref": failed_ref, "step_id": "step_000",
+        "occurrence_id": "occ_000", "passed": False,
+        "attempt_started": True, "executed_action_count": 1,
+        "params": {"object": "mug_1"},
+        "attempts": [{"mode": "dynamic", "started": True,
+                      "passed": False, "action_start": 0,
+                      "action_end": 1, "action_count": 1}],
+    }]
     fail_trace.node_validators = [
         NodeValidationResult(
-            node_ref="skill://test.acquire-object@1.0.0",
+            node_ref=failed_ref, step_id="step_000",
+            occurrence_id="occ_000", mode="dynamic",
             level="atomic", passed=False,
             checks={"preconditions": True, "effects": False},
             messages=["核心 Effect 未发生"],
@@ -609,6 +621,17 @@ def check_validators(tmp_path: Path) -> None:
     trace = _env_trace()
     trace.success = False
     trace.failure_type = "benchmark_failure"
+    trace.realized_atomic_nodes = [{
+        "ref": str(atomic.ref), "step_id": "step_000",
+        "occurrence_id": "occ_000", "passed": False,
+        "attempt_started": True, "executed_action_count": 1,
+        "params": {"object": "egg_1"},
+        "attempts": [{"mode": "dynamic", "started": True,
+                      "passed": False, "action_count": 1}],
+    }]
+    result_bad.step_id = "step_000"
+    result_bad.occurrence_id = "occ_000"
+    result_bad.mode = "dynamic"
     trace.node_validators = [result_bad]
     localizer = FailureLocalizer()
     attributions = localizer.localize(trace)

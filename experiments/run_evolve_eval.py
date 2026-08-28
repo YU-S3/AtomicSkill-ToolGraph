@@ -96,10 +96,14 @@ def _snapshot_frozen_bank(src_data: Path, dst_data: Path) -> str:
     if marker_path.exists():
         marker = json.loads(marker_path.read_text(encoding="utf-8"))
         recorded = str(marker.get("source_bank_sha256") or "")
-        if recorded != source_digest:
+        recorded_source = str(marker.get("source_data") or "")
+        current_source = str(src_data.resolve())
+        if recorded != source_digest or recorded_source != current_source:
             raise RuntimeError(
                 f"eval-dir 已冻结另一在线里程碑：recorded={recorded[:12]}, "
-                f"current={source_digest[:12]}；请为新里程碑使用新的 --eval-dir")
+                f"current={source_digest[:12]}, "
+                f"source_changed={recorded_source != current_source}；"
+                "请为新里程碑使用新的 --eval-dir")
         if not dst_data.exists():
             raise RuntimeError("冻结快照标记存在但 data 目录缺失，拒绝继续")
         return source_digest

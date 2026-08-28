@@ -10,7 +10,8 @@ import copy
 import time
 from typing import Any
 
-from .adapters.benchmark import BenchmarkAdapter, Task
+from .adapters.benchmark import BenchmarkAdapter, EnvRunResult, Task
+from .core.binding_ir import is_concrete_binding
 from .atomicizer.trace_atomicizer import TraceAtomicizer
 from .core.config import SystemConfig
 from .core.llm import LLM
@@ -33,6 +34,8 @@ from .runtime.atomic_planner import AtomicPlanner
 from .runtime.execution_bridge import ExecutionBridge
 from .runtime.implementation_selector import ImplementationSelector
 from .runtime.runtime_graph import RuntimeGraph
+from .runtime.budget import BudgetLedger
+from .runtime.plan_validator import semantic_required_slots
 from .tools.resolver import ToolResolver
 from .tools.registry import ToolRegistry
 from .validation.composite_validator import CompositeValidator
@@ -260,7 +263,7 @@ class AtomicSkillGraphSystem:
                 ref = ToolRef.parse(tool_ref_text)
             except ValueError:
                 continue
-            tool = self.tool_registry.get(ref) or self.tool_registry.get_recommended(ref.tool_id)
+            tool = self.tool_registry.get(ref)
             if tool is None:
                 continue
             tool_types |= set(tool.provenance.get("source_task_types") or [])
@@ -282,7 +285,7 @@ class AtomicSkillGraphSystem:
             if ref.logical_id in seen_task_skills:
                 continue
             seen_task_skills.add(ref.logical_id)
-            obj = self.registry.get(ref) or self.registry.get_recommended(ref.logical_id)
+            obj = self.registry.get(ref)
             if obj is None or not hasattr(obj, "metadata"):
                 continue
             labels = set(obj.metadata.get("task_type_labels") or [])
@@ -312,7 +315,7 @@ class AtomicSkillGraphSystem:
         seed_parts: list[str] = []
         for node_index, planned in enumerate(plan.nodes):
             node = runtime_graph.nodes[node_index]
-            atomic = self._get_recommended(planned.ref.logical_id)
+            atomic = self.registry.get(planned.ref)
             if atomic is None:
                 runtime_graph.mark_fallback(node_index, ExecutionMode.DYNAMIC,
                                             "atomic_missing")
@@ -354,10 +357,26 @@ class AtomicSkillGraphSystem:
                 node.validation = validation
                 node.passed = validation.passed
                 node.after = after
+                node.attempt_started = True
+                node.executed_action_count = 1
+                node.attempts.append({
+                    "mode": ExecutionMode.DIRECT.value, "started": True,
+                    "passed": validation.passed,
+                    "failure_type": "" if validation.passed else
+                                    "tool_execution_error",
+                    "failure_stage": "validation",
+                    "failure_cause": "" if validation.passed else
+                                     "effect_violation",
+                    "tool_refs": list(node.tool_refs),
+                    "action_start": 0, "action_end": 1, "action_count": 1,
+                    "step_id": node.step_id,
+                    "occurrence_id": node.occurrence_id,
+                })
                 trace.node_validators.append(validation)
                 self._record_tool_feedback(node.tool_refs, validation.passed, "direct")
                 self._record_impl_feedback([node.impl_ref], validation.passed)
                 if validation.passed:
+                    runtime_graph.record_direct_success()
                     trace.success = True
                     trace.candidate_code = attempt.candidate
                     trace.benchmark_result = {"passed": True,
@@ -469,7 +488,7 @@ class AtomicSkillGraphSystem:
         seed_parts: list[str] = []
         all_direct = True
         for index, planned in enumerate(plan.nodes):
-            atomic = self._get_recommended(planned.ref.logical_id)
+            atomic = self.registry.get(planned.ref)
             node = runtime_graph.nodes[index]
             if atomic is None:
                 all_direct = False
@@ -509,6 +528,7 @@ class AtomicSkillGraphSystem:
             node.tool_refs = [str(r.binding.tool_ref) for r in resolved]
             direct_steps.append({
                 "node_ref": f"skill://{atomic.ref.logical_id}@{atomic.ref.version}",
+                "step_id": planned.step_id,
                 "steps": steps,
                 "atomic": atomic,
                 "inputs": planned.params,
@@ -516,10 +536,10 @@ class AtomicSkillGraphSystem:
             })
 
         if all_direct and direct_steps:
-            runtime_graph.record_usage(ExecutionMode.DIRECT)
             result = self.adapter.run_env_episode(
                 task, self.llm, seed_context="",
                 direct_steps=[{"node_ref": d["node_ref"],
+                               "step_id": d["step_id"],
                                "steps": d["steps"],
                                "tool_ref": ""}
                               for d in direct_steps],
@@ -527,6 +547,10 @@ class AtomicSkillGraphSystem:
             # 节点级验证：按 direct_steps 边界映射前后状态
             self._validate_env_direct_nodes(trace, result, direct_steps, runtime_graph)
             for node in runtime_graph.nodes:
+                if node.attempt_started:
+                    runtime_graph.record_usage(ExecutionMode.DIRECT)
+                    if node.passed:
+                        runtime_graph.record_direct_success()
                 if node.tool_refs:
                     self._record_tool_feedback(node.tool_refs, node.passed, "direct")
                 if node.impl_ref:
@@ -589,10 +613,11 @@ class AtomicSkillGraphSystem:
             trace.metrics.setdefault("execution_routing", []).append(
                 routing_audit)
             node_start_actions = len((resume or {}).get("actions") or [])
-            node_deadline = (int(self.config.max_steps) if planned.dynamic else min(
-                int(self.config.max_steps),
-                node_start_actions + max(
-                    1, int(self.config.thresholds.env_node_max_steps))))
+            node_budget = (int(self.config.thresholds.env_dynamic_node_max_steps)
+                           if planned.dynamic else
+                           int(self.config.thresholds.env_node_max_steps))
+            node_deadline = min(int(self.config.max_steps),
+                                node_start_actions + max(0, node_budget))
             before = dict((resume or {}).get("state") or task.state or {})
             planned.params = _apply_runtime_data_bindings(
                 planned.params, planned.step_id, runtime_graph, shared_bindings)
@@ -605,7 +630,7 @@ class AtomicSkillGraphSystem:
             # or by framework discovery; otherwise node_results records the
             # stale class-valued planning input rather than the executed one.
             node.params = dict(planned.params)
-            atomic = None if planned.dynamic else self._get_recommended(planned.ref.logical_id)
+            atomic = None if planned.dynamic else self.registry.get(planned.ref)
             effects = list(planned.target_effects or getattr(atomic, "effects", []) or [])
             candidates: list[tuple[ExecutionMode, str, list[dict[str, Any]]]] = []
             location_discovered = False
@@ -629,7 +654,8 @@ class AtomicSkillGraphSystem:
                     and str(item.get("name") or "").endswith("_location")
                     and not planned.params.get(str(item.get("name")))
                 }
-                if callable(discover) and location_slots:
+                if (self.config.features.enable_framework_discovery
+                        and callable(discover) and location_slots):
                     # Parameter discovery belongs to execution of the learned
                     # Atomic contract, not to Tool evolution.  Atomic-only must
                     # therefore receive the same bounded binding opportunity.
@@ -660,6 +686,7 @@ class AtomicSkillGraphSystem:
                         binding, discovery_result = discover(
                             task, str(entity_value), resume=resume,
                             max_locations=self.config.thresholds.acquire_discovery_max_locations,
+                            action_deadline=node_deadline,
                             node_ref=str(planned.ref),
                             tool_ref=discovery_tool_refs[0]
                             if discovery_tool_refs else "",
@@ -669,6 +696,8 @@ class AtomicSkillGraphSystem:
                         before = dict(resume.get("state") or before)
                         remapped = _remap_location_binding(
                             binding, entity_role, location_slot)
+                        discovery_start = node_start_actions
+                        discovery_end = len(discovery_result.actions)
                         metric = {
                             "node_ref": str(planned.ref),
                             "entity_role": entity_role,
@@ -679,7 +708,9 @@ class AtomicSkillGraphSystem:
                             "checked_locations": list(
                                 (before.get("meta") or {}).get(
                                     "checked_locations") or []),
-                            "search_actions": len(discovery_result.actions),
+                            "action_start": discovery_start,
+                            "action_end": discovery_end,
+                            "search_actions": max(0, discovery_end - discovery_start),
                         }
                         trace.metrics.setdefault(
                             "controlled_location_discovery", []).append(metric)
@@ -781,21 +812,78 @@ class AtomicSkillGraphSystem:
             routing_audit["params_after_discovery"] = dict(planned.params)
             routing_audit["location_discovered"] = bool(location_discovered)
 
+            required_slots = semantic_required_slots(effects)
+            unresolved_core = sorted(
+                slot for slot in required_slots
+                if not is_concrete_binding(planned.params.get(slot)))
+            routing_audit["semantic_required_slots"] = sorted(required_slots)
+            routing_audit["unresolved_semantic_slots"] = unresolved_core
+            if unresolved_core:
+                cause = "plan_binding_unresolved"
+                node.fallback_reason = cause
+                node.attempts.append({
+                    "mode": "", "started": False, "passed": False,
+                    "failure_type": cause, "failure_stage": "planning",
+                    "failure_cause": cause, "params": dict(planned.params),
+                    "tool_refs": [], "action_start": node_start_actions,
+                    "action_end": node_start_actions, "action_count": 0,
+                    "step_id": node.step_id,
+                    "occurrence_id": node.occurrence_id,
+                })
+                routing_audit["attempts"] = [dict(item) for item in node.attempts]
+                routing_audit["final_passed"] = False
+                routing_audit["fallback_reason"] = cause
+                trace.failure_stage = "planning"
+                trace.failure_cause = cause
+                last_result = _not_started_env_result(resume, cause)
+                break
+
             node_succeeded = False
-            for mode, seed_context, steps in candidates:
+            for attempt_index, (mode, seed_context, steps) in enumerate(candidates):
                 attempt_before = dict((resume or {}).get("state") or before)
                 action_start = len((resume or {}).get("actions") or [])
-                attempt_deadline = (node_deadline if planned.dynamic else min(
-                    node_deadline,
-                    action_start + max(
-                        1, int(self.config.thresholds.env_attempt_max_steps))))
+                attempt_limit = (node_budget if planned.dynamic else
+                                 int(self.config.thresholds.env_attempt_max_steps))
+                ledger = BudgetLedger(
+                    global_limit=int(self.config.max_steps),
+                    node_limit=max(0, node_budget),
+                    attempt_limit=max(0, attempt_limit),
+                    node_start=node_start_actions,
+                    attempt_start=action_start,
+                    actions_used=action_start,
+                )
+                remaining = ledger.attempt_remaining()
+                attempt_deadline = ledger.absolute_deadline()
+                if remaining <= 0:
+                    if ledger.global_remaining() <= 0:
+                        cause = "episode_budget_exhausted"
+                    elif ledger.node_remaining() <= 0:
+                        cause = "node_budget_exhausted"
+                    else:
+                        cause = "attempt_budget_exhausted"
+                    node.attempts.append({
+                        "mode": mode.value, "started": False, "passed": False,
+                        "failure_type": "attempt_not_started",
+                        "failure_stage": "budget", "failure_cause": cause,
+                        "params": dict(planned.params), "tool_refs": [],
+                        "action_start": action_start, "action_end": action_start,
+                        "action_count": 0, "step_id": node.step_id,
+                        "occurrence_id": node.occurrence_id,
+                    })
+                    node.fallback_reason = cause
+                    trace.failure_stage = "budget"
+                    trace.failure_cause = cause
+                    last_result = _not_started_env_result(resume, cause)
+                    break
                 runtime_graph.record_usage(mode)
+                node.attempt_started = True
                 node.mode = mode
                 direct_steps = None
                 if mode == ExecutionMode.DIRECT:
                     direct_steps = [{
                         "node_ref": str(planned.ref), "tool_ref": node.tool_refs[0]
-                        if node.tool_refs else "", "steps": steps,
+                        if node.tool_refs else "", "step_id": node.step_id,
+                        "steps": steps,
                     }]
                 result = self.adapter.run_env_episode(
                     task, self.llm, seed_context=seed_context,
@@ -838,6 +926,11 @@ class AtomicSkillGraphSystem:
                         atomic, attempt_before, after, inputs=planned.params,
                         context={"harness": "env"})
                     validation.node_ref = str(planned.ref)
+                    validation.step_id = node.step_id
+                    validation.occurrence_id = node.occurrence_id
+                    validation.attempt_index = attempt_index
+                    validation.mode = mode.value
+                    validation.failure_stage = "validation"
                     passed = validation.passed or (bool(result.success) and not effects)
                     trace.node_validators.append(validation)
                 elif effects:
@@ -846,17 +939,30 @@ class AtomicSkillGraphSystem:
                                                     effects, {"harness": "env"})
                     validation = NodeValidationResult(
                         node_ref=str(planned.ref), level="atomic", passed=passed,
+                        step_id=node.step_id,
+                        occurrence_id=node.occurrence_id,
+                        attempt_index=attempt_index, mode=mode.value,
+                        failure_stage="validation",
                         checks={"effects": passed}, before=before, after=after,
                         messages=[] if passed else [f"动态节点效果未发生：{missing}"],
                     )
                     trace.node_validators.append(validation)
-                node.attempts.append({"mode": mode.value, "passed": passed,
+                action_end = len(after_payload.get("actions") or [])
+                action_count = max(0, action_end - action_start)
+                node.executed_action_count += action_count
+                node.attempts.append({"mode": mode.value, "started": True,
+                                      "passed": passed,
                                       "failure_type": str(result.failure_type or ""),
+                                      "failure_stage": "execution",
+                                      "failure_cause": str(result.failure_type or ""),
                                       "params": dict(planned.params),
                                       "tool_refs": list(node.tool_refs)
                                       if mode == ExecutionMode.DIRECT else [],
                                       "action_start": action_start,
-                                      "action_end": len(after_payload.get("actions") or []),
+                                      "action_end": action_end,
+                                      "action_count": action_count,
+                                      "step_id": node.step_id,
+                                      "occurrence_id": node.occurrence_id,
                                       "before": attempt_before,
                                       "after": after})
                 node.validation = validation
@@ -866,9 +972,13 @@ class AtomicSkillGraphSystem:
                 # 是否救回节点，都不能覆盖本次 Direct Tool 的真实结果。
                 if mode == ExecutionMode.DIRECT and node.tool_refs:
                     self._record_tool_feedback(node.tool_refs, passed, "direct")
+                    if passed:
+                        runtime_graph.record_direct_success()
                 if mode == ExecutionMode.DIRECT and node.impl_ref:
                     self._record_impl_feedback([node.impl_ref], passed)
                 if passed:
+                    node.outputs = _materialize_atomic_outputs(
+                        atomic, planned.params, after)
                     _update_verified_runtime_bindings(
                         task, planned, runtime_graph, shared_bindings, index)
                     node_succeeded = True
@@ -893,15 +1003,22 @@ class AtomicSkillGraphSystem:
         # 这是任务级验证，不改变已完成节点的归因。
         all_nodes_passed = bool(runtime_graph.nodes) and all(n.passed for n in runtime_graph.nodes)
         if last_result is not None and not last_result.success and all_nodes_passed:
-            runtime_graph.record_usage(ExecutionMode.DYNAMIC)
-            last_result = self.adapter.run_env_episode(
-                task, self.llm, seed_context="", max_steps=self.config.max_steps,
-                resume=resume,
-            )
+            final_actions = len((resume or {}).get("actions") or [])
+            if final_actions < int(self.config.max_steps):
+                runtime_graph.record_usage(ExecutionMode.DYNAMIC)
+                last_result = self.adapter.run_env_episode(
+                    task, self.llm, seed_context="", max_steps=self.config.max_steps,
+                    resume=resume,
+                )
+            else:
+                trace.failure_stage = "budget"
+                trace.failure_cause = "episode_budget_exhausted"
         if last_result is None:
             last_result = self.adapter.run_env_episode(task, self.llm,
                                                        max_steps=self.config.max_steps)
         self._fill_env_trace(trace, last_result, runtime_graph)
+        if trace.failure_cause and trace.failure_stage in {"planning", "budget"}:
+            trace.failure_type = trace.failure_cause
         return trace
 
     def _finalize_validation(self, trace: TraceRecord, task: Task) -> None:
@@ -943,12 +1060,17 @@ class AtomicSkillGraphSystem:
         states = [dict(s.get("state") or {}) for s in (result.states or [])]
         if not states:
             return
+        spans = {str(item.get("step_id") or ""): dict(item)
+                 for item in (getattr(result, "node_spans", []) or [])}
         action_index = 0
         for spec in direct_steps:
             step_count = len(spec["steps"])
-            action_start = action_index
+            span = spans.get(str(spec.get("step_id") or ""), {})
+            action_start = int(span.get("action_start", action_index))
             before = states[action_start] if action_start < len(states) else {}
-            after_index = min(action_start + step_count, len(states) - 1)
+            after_index = min(int(span.get("action_end",
+                                           action_start + step_count)),
+                              len(states) - 1)
             after = states[after_index]
             action_index = after_index
             atomic = spec["atomic"]
@@ -970,10 +1092,34 @@ class AtomicSkillGraphSystem:
                 atomic, before, after, inputs=grounded,
                 context={"harness": "env"})
             validation.node_ref = spec["node_ref"]
+            validation.step_id = node.step_id
+            validation.occurrence_id = node.occurrence_id
+            validation.attempt_index = 0
+            validation.mode = ExecutionMode.DIRECT.value
+            validation.failure_stage = "validation"
             node.validation = validation
             node.before = before
             node.after = after
             node.passed = validation.passed
+            node.attempt_started = after_index > action_start
+            node.executed_action_count = max(0, after_index - action_start)
+            node.attempts.append({
+                "mode": ExecutionMode.DIRECT.value,
+                "started": node.attempt_started,
+                "passed": validation.passed,
+                "failure_type": "" if validation.passed else
+                                "tool_execution_error",
+                "failure_stage": "validation",
+                "failure_cause": "" if validation.passed else
+                                 "effect_violation",
+                "tool_refs": list(node.tool_refs),
+                "action_start": action_start, "action_end": after_index,
+                "action_count": node.executed_action_count,
+                "step_id": node.step_id,
+                "occurrence_id": node.occurrence_id,
+            })
+            node.outputs = (_materialize_atomic_outputs(atomic, grounded, after)
+                            if validation.passed else {})
             trace.node_validators.append(validation)
 
     def _fill_env_trace(self, trace: TraceRecord, result: Any,
@@ -1081,7 +1227,7 @@ class AtomicSkillGraphSystem:
                 ref = SkillRef.parse(ref_text)
             except ValueError:
                 continue
-            impl = self.registry.get(ref) or self.registry.get_recommended(ref.logical_id)
+            impl = self.registry.get(ref)
             if impl is None or not hasattr(impl, "quality"):
                 continue
             quality = dict(impl.quality or {})
@@ -1115,18 +1261,50 @@ class AtomicSkillGraphSystem:
                 ref = SkillRef.parse(ref_text)
             except ValueError:
                 continue
-            obj = self.registry.get(ref) or self.registry.get_recommended(ref.logical_id)
+            obj = self.registry.get(ref)
             if obj is None or not hasattr(obj, "metadata"):
                 continue  # ImplementationAtom 不承载 Skill 层证据
             stats = dict(obj.metadata.get("statistics") or {})
+            attempts = list(realized.get("attempts") or [])
+            started = bool(realized.get("attempt_started")) or any(
+                bool(item.get("started")) for item in attempts)
+            action_count = int(realized.get("executed_action_count") or 0)
+            required_slots = semantic_required_slots(
+                list(getattr(obj, "effects", []) or []))
+            core_bound = all(is_concrete_binding(
+                dict(realized.get("params") or {}).get(slot))
+                for slot in required_slots)
+            if not started or not core_bound:
+                stats["selection_count"] = int(
+                    stats.get("selection_count", 0)) + 1
+                reason = str(realized.get("fallback_reason") or "")
+                if not core_bound or "binding" in reason:
+                    stats["binding_failure_count"] = int(
+                        stats.get("binding_failure_count", 0)) + 1
+                elif "budget" in reason:
+                    stats["budget_skip_count"] = int(
+                        stats.get("budget_skip_count", 0)) + 1
+                obj.metadata["statistics"] = stats
+                self.registry.update_runtime_state(obj)
+                continue
+            stats["selection_count"] = int(
+                stats.get("selection_count", 0)) + 1
             stats["use_count"] = int(stats.get("use_count", 0)) + 1
+            stats["executed_action_count"] = int(
+                stats.get("executed_action_count", 0)) + action_count
             node_passed = bool(realized.get("passed"))
             if node_passed:
                 stats["execution_success_count"] = int(
                     stats.get("execution_success_count", 0)) + 1
+                stats["effect_validation_success_count"] = int(
+                    stats.get("effect_validation_success_count", 0)) + 1
+                stats["contract_support_count"] = int(
+                    stats.get("contract_support_count", 0)) + 1
             else:
                 stats["execution_failure_count"] = int(
                     stats.get("execution_failure_count", 0)) + 1
+                stats["effect_validation_failure_count"] = int(
+                    stats.get("effect_validation_failure_count", 0)) + 1
             if ref.logical_id not in seen_task_atomics:
                 seen_task_atomics.add(ref.logical_id)
                 stats["task_use_count"] = int(stats.get("task_use_count", 0)) + 1
@@ -1170,14 +1348,25 @@ class AtomicSkillGraphSystem:
                 ref = SkillRef.parse(trace.selected_composite)
             except ValueError:
                 ref = None
-            obj = ((self.registry.get(ref) if ref is not None else None)
-                   or (self.registry.get_recommended(ref.logical_id)
-                       if ref is not None else None))
+            obj = self.registry.get(ref) if ref is not None else None
             if obj is not None and hasattr(obj, "metadata"):
                 stats = dict(obj.metadata.get("statistics") or {})
+                stats["selection_count"] = int(
+                    stats.get("selection_count", 0)) + 1
+                composite_validation = dict(
+                    trace.validation_layers.get("composite") or {})
+                validated = bool(composite_validation)
+                composite_passed = bool(
+                    composite_validation.get("passed")) if validated else False
+                stats["validation_count"] = int(
+                    stats.get("validation_count", 0)) + int(validated)
                 stats["use_count"] = int(stats.get("use_count", 0)) + 1
-                key = "execution_success_count" if success else "execution_failure_count"
+                key = ("execution_success_count" if composite_passed
+                       else "execution_failure_count")
                 stats[key] = int(stats.get(key, 0)) + 1
+                benchmark_key = ("benchmark_success_count" if success
+                                 else "benchmark_failure_count")
+                stats[benchmark_key] = int(stats.get(benchmark_key, 0)) + 1
                 total = int(stats["use_count"])
                 empirical = int(stats.get(
                     "execution_success_count", 0)) / max(total, 1)
@@ -1185,6 +1374,15 @@ class AtomicSkillGraphSystem:
                     0.5 * float(stats.get("utility", 0.5))
                     + 0.5 * empirical, 4)
                 obj.metadata["statistics"] = stats
+                messages = [str(value).lower() for value in
+                            composite_validation.get("messages") or []]
+                if any("binding" in value or "data_flow" in value
+                       or "edge" in value for value in messages):
+                    # Structural failure is deterministic for this exact
+                    # version; remove it from normal planning immediately.
+                    obj.status = SkillStatus.SUPPRESSED
+                    obj.metadata["suppression_reason"] = (
+                        "runtime_composite_structural_validation_failed")
                 self.registry.update_runtime_state(obj)
 
     # ------------------------------------------------------------------
@@ -1257,6 +1455,12 @@ def _build_planning_audit(task: Task, plan: Any,
         "selected_composite": str(plan.composite_ref or ""),
         "planned_nodes": nodes,
         "registered_target_producers_all_statuses": producers,
+        "candidate_rejections": list((getattr(plan, "audit", {}) or {}).get(
+            "candidate_rejections") or []),
+        "selected_plan": str((getattr(plan, "audit", {}) or {}).get(
+            "selected_plan") or plan.composite_ref or "atomic_or_dynamic"),
+        "fallback_reason": str((getattr(plan, "audit", {}) or {}).get(
+            "fallback_reason") or ""),
     }
 
 
@@ -1275,6 +1479,45 @@ def _env_resume_payload(result: Any) -> dict[str, Any]:
         "states": states,
         "state": (states[-1].get("state") or {}) if states else {},
     }
+
+
+def _not_started_env_result(resume: dict[str, Any] | None,
+                            failure_type: str) -> EnvRunResult:
+    payload = dict(resume or {})
+    return EnvRunResult(
+        actions=[dict(item) for item in (payload.get("actions") or [])],
+        states=[dict(item) for item in (payload.get("states") or [])],
+        steps=len(payload.get("actions") or []),
+        failure_type=failure_type,
+        current_observation=str(payload.get("observation") or ""),
+        current_admissible=list(payload.get("admissible") or []),
+        final_observation=str(payload.get("observation") or ""),
+    )
+
+
+def _materialize_atomic_outputs(atomic: Any, params: dict[str, Any],
+                                after: dict[str, Any]) -> dict[str, Any]:
+    """Expose only concrete values after the Atomic Effect validates."""
+    if atomic is None:
+        return {}
+    outputs: dict[str, Any] = {}
+    for spec in (getattr(atomic, "outputs", []) or []):
+        name = str(spec.get("name") or "")
+        value = params.get(name)
+        if name and is_concrete_binding(value):
+            outputs[name] = value
+    # Output contracts often reuse Effect roles without duplicating values in
+    # an explicit result object. The validated grounded parameters are the
+    # authoritative materialization in that case.
+    for effect in (getattr(atomic, "effects", []) or []):
+        for value in (effect.get("args") or {}).values():
+            if not isinstance(value, str) or not value.startswith("$"):
+                continue
+            role = value.rsplit(".", 1)[-1]
+            grounded = params.get(role)
+            if is_concrete_binding(grounded):
+                outputs.setdefault(role, grounded)
+    return outputs
 
 
 def _is_env_task(task: Task) -> bool:
@@ -1296,7 +1539,7 @@ def _entry_of(trace: TraceRecord) -> str:
 def _guidelines_of(plan, registry: SkillGraphRegistry) -> str:
     parts: list[str] = []
     for node in plan.nodes:
-        atomic = registry.get_recommended(node.ref.logical_id)
+        atomic = registry.get(node.ref)
         if atomic is None:
             continue
         parts.append(f"[Atomic Skill] {atomic.summary}")
@@ -1426,7 +1669,7 @@ def _apply_runtime_data_bindings(params: dict[str, Any], step_id: str,
             continue
         source_role = str((edge.mapping or {}).get("source_output") or "")
         target_role = str((edge.mapping or {}).get("target_input") or "")
-        value = source.params.get(source_role)
+        value = source.outputs.get(source_role)
         if target_role and value not in (None, "") and (
                 refined.get(target_role) in (None, "")
                 or _runtime_binding_can_refine(refined.get(target_role), value)):
@@ -1466,7 +1709,8 @@ def _update_verified_runtime_bindings(task: Task, planned: Any,
             continue
         source_role = str((edge.mapping or {}).get("source_output") or "")
         target_role = str((edge.mapping or {}).get("target_input") or "")
-        value = planned.params.get(source_role)
+        source_state = runtime_graph.nodes[index]
+        value = source_state.outputs.get(source_role)
         if not target_role or value in (None, ""):
             continue
         for future in runtime_graph.plan.nodes[index + 1:]:

@@ -14,15 +14,23 @@ import re
 from typing import Any
 
 from ..adapters.benchmark import parse_goal_params
+from ..core.binding_ir import (BindingKind, BindingSpec, is_concrete_binding,
+                               resolve_binding)
 from ..core.config import SystemConfig
 from ..core.edge_ir import GraphEdge
 from ..core.llm import LLM
 from ..core.refs import SkillRef
 from ..core.skill_ir import AbstractAtomicSkill, CompositeSkill
 from ..core.status import EdgeType, SkillNodeKind, SkillStatus
-from ..graph.graph import composite_node_order
+from ..graph.graph import composite_step_order
 from ..graph.registry import RetrievalHit, SkillGraphRegistry
 from .runtime_graph import PlannedNode, RuntimePlan
+from .plan_validator import validate_plan_bindings
+from .contract_matcher import match_effect_contract
+
+
+class PlanCompilationError(RuntimeError):
+    pass
 
 _PLAN_PROMPT = (
     "You are an atomic task planner. Given the task goal and a list of reusable "
@@ -96,28 +104,38 @@ class AtomicPlanner:
                             and self._composite_goal_relevant(
                                 h.obj, task.target_effects))]
             if complete:
-                active = [h for h in complete
-                          if h.obj.status.value == "active"]
-                # Online may perform one controlled candidate exploration to
-                # obtain independent support. Frozen replay stays active-only.
-                selectable = active or [
-                    h for h in complete if h.obj.status.value == "draft"]
-                if selectable:
-                    selected = max(
-                        selectable,
+                rejections: list[dict[str, Any]] = []
+                for selected in sorted(
+                        complete,
                         key=lambda h: self._composite_selection_rank(
-                            h, task.target_effects),
-                    )
-                    plan = self._plan_from_composite(task, selected, retrieved)
+                            h, task.target_effects), reverse=True):
+                    if selected.obj.status != SkillStatus.ACTIVE:
+                        rejections.append({"ref": str(selected.ref),
+                                           "reason": "candidate_not_active"})
+                        continue
+                    try:
+                        plan = self._plan_from_composite(task, selected, retrieved)
+                    except PlanCompilationError as exc:
+                        rejections.append({"ref": str(selected.ref),
+                                           "reason": str(exc)})
+                        continue
+                    report = validate_plan_bindings(plan, self.registry, task)
+                    if not report.passed:
+                        rejections.append({"ref": str(selected.ref),
+                                           "reason": "plan_binding_unresolved",
+                                           "details": report.to_dict()})
+                        continue
                     plan.notes.append("composite_effect_complete")
-                    if selected.obj.status.value == "draft":
-                        plan.notes.append("controlled_candidate_exploration")
-                        if self.config.freeze_skills:
-                            plan.notes.append("strict_frozen_candidate_replay")
+                    plan.audit = {
+                        "retrieved_candidates": [str(h.ref) for h in composites],
+                        "candidate_rejections": rejections,
+                        "selected_plan": str(selected.ref),
+                    }
                     return plan
 
             eligible = [h for h in composites
                         if (h.score >= self.composite_min_score
+                            and h.obj.status == SkillStatus.ACTIVE
                             and self._composite_goal_relevant(
                                 h.obj, task.target_effects))]
             if eligible:
@@ -128,8 +146,14 @@ class AtomicPlanner:
                     key=lambda h: (self._composite_target_coverage(
                         h.obj, task.target_effects), h.score),
                 )
-                partial_plan = self._plan_from_composite(task, partial, retrieved)
-                if not self._has_unbound_dynamic_gap(partial_plan.nodes):
+                try:
+                    partial_plan = self._plan_from_composite(task, partial, retrieved)
+                except PlanCompilationError:
+                    partial_plan = None
+                report = (validate_plan_bindings(
+                    partial_plan, self.registry, task) if partial_plan else None)
+                if (partial_plan and report and report.passed
+                        and not self._has_unbound_dynamic_gap(partial_plan.nodes)):
                     partial_plan.notes.append("composite_partial_with_bound_gap")
                     return partial_plan
 
@@ -160,41 +184,46 @@ class AtomicPlanner:
     def _plan_from_composite(self, task, hit: RetrievalHit,
                              retrieved: list[RetrievalHit]) -> RuntimePlan:
         composite: CompositeSkill = hit.obj
-        order, _report = composite_node_order(composite, self.registry)
+        steps, report = composite_step_order(composite, self.registry)
+        if not report.passed:
+            raise PlanCompilationError("plan_graph_invalid:" + ";".join(report.errors))
         nodes: list[PlannedNode] = []
-        steps_by_logical: dict[str, list[dict[str, Any]]] = {}
-        for step in composite.step_instances():
-            logical_id = str(step.get("node_ref") or "").rsplit("@", 1)[0]
-            steps_by_logical.setdefault(logical_id, []).append(step)
-        occurrences: dict[str, int] = {}
-        for index, logical in enumerate(order):
-            obj = self.registry.get_recommended(logical)
-            if obj is None:
+        incoming: dict[tuple[str, str], BindingSpec] = {}
+        for edge in composite.edge_objects():
+            if edge.type != EdgeType.DATA_FLOW:
                 continue
-            occurrence = occurrences.get(logical, 0)
-            occurrences[logical] = occurrence + 1
-            stored_steps = steps_by_logical.get(logical, [])
-            if occurrence < len(stored_steps):
-                # The occurrence role map is authoritative.  Falling back to
-                # global task bindings here used to bind every navigation node
-                # to the final destination and erased source/station roles.
-                stored = dict(stored_steps[occurrence].get("params") or {})
-                params = self._resolve_composite_params(stored, task)
-                fallback = self._bind_params(task, obj)
-                for key, value in list(params.items()):
-                    if not (isinstance(value, str)
-                            and value.startswith("$flow.")):
-                        continue
-                    flow_role = value[len("$flow."):]
-                    replacement = ((task.context.get("params") or {}).get(flow_role)
-                                   or fallback.get(key) or fallback.get(flow_role))
-                    if replacement not in (None, ""):
-                        params[key] = replacement
-                    else:
-                        params.pop(key, None)
-            else:
-                params = self._bind_params(task, obj)
+            target_input = str(edge.mapping.get("target_input") or "")
+            source_output = str(edge.mapping.get("source_output") or "")
+            if target_input and source_output:
+                incoming[(edge.target_step, target_input)] = BindingSpec(
+                    BindingKind.DATA_FLOW, source_step=edge.source_step,
+                    source_output=source_output)
+        task_params = dict(task.context.get("params") or {})
+        for index, step in enumerate(steps):
+            try:
+                exact_ref = SkillRef.parse(str(step.get("node_ref") or ""))
+            except ValueError as exc:
+                raise PlanCompilationError(f"exact_child_ref_invalid:{exc}") from exc
+            obj = self.registry.get(exact_ref)
+            if obj is None or obj.status != SkillStatus.ACTIVE:
+                raise PlanCompilationError(f"exact_child_unavailable:{exact_ref}")
+            stored = dict(step.get("params") or {})
+            binding_specs: dict[str, BindingSpec] = {}
+            params: dict[str, Any] = {}
+            for key, value in stored.items():
+                spec = incoming.get((str(step["step_id"]), str(key)),
+                                    BindingSpec.from_value(value))
+                binding_specs[str(key)] = spec
+                resolved = resolve_binding(spec, task_params)
+                if is_concrete_binding(resolved):
+                    params[str(key)] = resolved
+                elif spec.kind == BindingKind.UNRESOLVED:
+                    # Keep the symbolic value visible for audit/closure checks.
+                    params[str(key)] = spec.symbol or value
             nodes.append(PlannedNode(ref=obj.ref, step_id=f"step_{index:03d}",
+                                     occurrence_id=f"occ_{index:03d}",
+                                     origin_step_id=str(step["step_id"]),
+                                     binding_specs=binding_specs,
                                      params=params, source="composite",
                                      target_effects=list(getattr(obj, "effects", []))))
         # A Composite is a validated causal workflow.  In particular, an
@@ -241,7 +270,9 @@ class AtomicPlanner:
     def _plan_from_atomics(self, task, hits: list[RetrievalHit]) -> list[PlannedNode]:
         # 最小充分：greedy 覆盖 target_effects（若提供），否则取 top-k 中得分 > 阈值的
         if task.target_effects:
-            selected = self._cover_target_effects(task.target_effects, hits)
+            selected = self._cover_target_effects(
+                task.target_effects, hits,
+                dict(task.context.get("params") or {}))
             selected = self._close_and_order_dependencies(selected, hits,
                                                           task.target_effects)
             selected = self._expand_cardinality_workflow(
@@ -284,6 +315,11 @@ class AtomicPlanner:
         retrieval score。共享前置状态的节点必须先纳入对应 producer；同层节点
         再按任务目标 Effect 的声明顺序稳定排序。
         """
+        def produces(producer: RetrievalHit, consumer: RetrievalHit) -> bool:
+            return any(match_effect_contract(effect, precondition).passed
+                       for effect in getattr(producer.obj, "effects", []) or []
+                       for precondition in getattr(consumer.obj, "preconditions", []) or [])
+
         def keys(items: list[dict]) -> set[str]:
             return {_canonical_predicate(str(item.get("predicate") or ""))
                     for item in items if isinstance(item, dict) and item.get("predicate")}
@@ -301,8 +337,10 @@ class AtomicPlanner:
             required = set().union(*(keys(getattr(hit.obj, "preconditions", []))
                                      for hit in chosen)) if chosen else set()
             for predicate in sorted(required - produced):
+                consumers = [hit for hit in chosen
+                             if predicate in keys(getattr(hit.obj, "preconditions", []))]
                 producers = [hit for hit in pool
-                             if predicate in keys(getattr(hit.obj, "effects", []))]
+                             if any(produces(hit, consumer) for consumer in consumers)]
                 if not producers:
                     continue
                 producer = max(producers, key=lambda hit: hit.score)
@@ -328,7 +366,7 @@ class AtomicPlanner:
             for consumer in by_id:
                 if producer == consumer:
                     continue
-                if effects_by_id[producer] & pre_by_id[consumer]:
+                if produces(by_id[producer], by_id[consumer]):
                     if consumer not in edges[producer]:
                         edges[producer].add(consumer)
                         indegree[consumer] += 1
@@ -361,21 +399,22 @@ class AtomicPlanner:
         """把未被检索能力覆盖的目标效果显式化，供逐节点动态执行。"""
         if not task.target_effects:
             return nodes
-        covered = {_canonical_predicate(str(effect.get("predicate") or ""))
-                   for node in nodes for effect in node.target_effects
-                   if isinstance(effect, dict) and effect.get("predicate")}
+        covered_counts: dict[str, int] = {}
+        for node in nodes:
+            for effect in node.target_effects:
+                if not isinstance(effect, dict) or not effect.get("predicate"):
+                    continue
+                key = _canonical_predicate(str(effect["predicate"]))
+                covered_counts[key] = covered_counts.get(key, 0) + max(
+                    1, int(effect.get("cardinality", 1) or 1))
         for effect in task.target_effects:
             predicate = str(effect.get("predicate") or "unknown")
             canonical = _canonical_predicate(predicate)
-            if canonical in covered:
+            required = max(1, int(effect.get("cardinality", 1) or 1))
+            missing = max(0, required - covered_counts.get(canonical, 0))
+            if missing <= 0:
                 continue
             slug = re.sub(r"[^a-z0-9_.]+", "_", predicate.lower()).strip("_") or "effect"
-            gap = PlannedNode(
-                ref=SkillRef(f"runtime.dynamic.{slug}", "0.0.0"),
-                source="dynamic_gap",
-                params=self._bind_dynamic_effect_params(task, effect),
-                target_effects=[dict(effect)], dynamic=True,
-            )
             # Missing target Effects participate in the same declared goal
             # order as learned producers.  Appending every gap at the end made
             # transformation goals execute after final delivery.
@@ -395,18 +434,30 @@ class AtomicPlanner:
                 if ranks and min(ranks) > gap_rank:
                     insert_at = index
                     break
-            nodes.insert(insert_at, gap)
-            covered.add(canonical)
+            for occurrence in range(missing):
+                gap_effect = dict(effect)
+                gap_effect["cardinality"] = 1
+                gap = PlannedNode(
+                    ref=SkillRef(f"runtime.dynamic.{slug}", "0.0.0"),
+                    source="dynamic_gap",
+                    occurrence_id=f"dynamic_{slug}_{occurrence:03d}",
+                    params=self._bind_dynamic_effect_params(task, gap_effect),
+                    target_effects=[gap_effect], dynamic=True,
+                )
+                nodes.insert(insert_at + occurrence, gap)
+            covered_counts[canonical] = covered_counts.get(canonical, 0) + missing
         for index, node in enumerate(nodes):
             node.step_id = f"step_{index:03d}"
+            node.occurrence_id = node.occurrence_id or node.step_id
         return nodes
 
     def _composite_effect_keys(self, composite: CompositeSkill) -> set[str]:
         """Composite Effect 闭包：由有序子 Atomic 的核心 Effect 合并得到。"""
         keys: set[str] = set()
         for step in composite.step_instances():
-            logical = SkillRef.parse(str(step["node_ref"])).logical_id
-            atomic = self.registry.get_recommended(logical)
+            atomic = self.registry.get(SkillRef.parse(str(step["node_ref"])))
+            if atomic is None:
+                continue
             for effect in list(getattr(atomic, "effects", []) or []):
                 if isinstance(effect, dict) and effect.get("predicate"):
                     keys.add(_canonical_predicate(str(effect["predicate"])))
@@ -415,8 +466,9 @@ class AtomicPlanner:
     def _composite_effect_counts(self, composite: CompositeSkill) -> dict[str, int]:
         counts: dict[str, int] = {}
         for step in composite.step_instances():
-            logical = SkillRef.parse(str(step["node_ref"])).logical_id
-            atomic = self.registry.get_recommended(logical)
+            atomic = self.registry.get(SkillRef.parse(str(step["node_ref"])))
+            if atomic is None:
+                continue
             for effect in list(getattr(atomic, "effects", []) or []):
                 if isinstance(effect, dict) and effect.get("predicate"):
                     key = _canonical_predicate(str(effect["predicate"]))
@@ -444,10 +496,12 @@ class AtomicPlanner:
 
     def _composite_covers_targets(self, composite: CompositeSkill,
                                   target_effects: list[dict]) -> bool:
-        target = self._target_effect_counts(target_effects)
-        actual = self._composite_effect_counts(composite)
-        return all(actual.get(predicate, 0) >= required
-                   for predicate, required in target.items())
+        learned = list((composite.validator or {}).get("target_effects") or [])
+        if not learned:
+            return False
+        return all(any(match_effect_contract(candidate, target).passed
+                       for candidate in learned)
+                   for target in target_effects)
 
     def _composite_goal_relevant(self, composite: CompositeSkill,
                                  target_effects: list[dict]) -> bool:
@@ -461,7 +515,9 @@ class AtomicPlanner:
         """
         learned = list((composite.validator or {}).get("target_effects") or [])
         if not learned:
-            return True  # compatibility for historical non-v2 artifacts
+            # Legacy Composite versions without a declared goal contract are
+            # auditable history, not safe normal-planner candidates.
+            return False
         wanted = self._target_effect_counts(target_effects)
         declared = self._target_effect_counts(learned)
         return all(predicate in wanted and required <= wanted[predicate]
@@ -522,19 +578,15 @@ class AtomicPlanner:
                        composite_edges: list[GraphEdge] | None = None) -> list[GraphEdge]:
         """生成可执行运行时边；Composite 边按实例顺序映射后保留类型语义。"""
         edges: list[GraphEdge] = []
-        by_ref: dict[str, list[PlannedNode]] = {}
-        for node in nodes:
-            by_ref.setdefault(str(node.ref), []).append(node)
+        by_origin_step = {node.origin_step_id: node for node in nodes
+                          if node.origin_step_id}
         if composite_edges:
-            cursors: dict[str, int] = {}
             for edge in composite_edges:
-                source_nodes = by_ref.get(edge.source, [])
-                target_nodes = by_ref.get(edge.target, [])
-                if not source_nodes or not target_nodes:
-                    continue
-                si = min(cursors.get(f"s:{edge.source}", 0), len(source_nodes) - 1)
-                ti = min(cursors.get(f"t:{edge.target}", 0), len(target_nodes) - 1)
-                source, target = source_nodes[si], target_nodes[ti]
+                source = by_origin_step.get(edge.source_step)
+                target = by_origin_step.get(edge.target_step)
+                if source is None or target is None:
+                    raise PlanCompilationError(
+                        f"runtime_edge_endpoint_missing:{edge.source_step}->{edge.target_step}")
                 edges.append(GraphEdge(
                     source=str(source.ref), target=str(target.ref), type=edge.type,
                     subtype=edge.subtype, scope="runtime",
@@ -586,21 +638,21 @@ class AtomicPlanner:
         return selected
 
     @staticmethod
-    def _cover_target_effects(target_effects: list[dict], hits: list[RetrievalHit]) -> list[RetrievalHit]:
-        def effect_keys(effects: list[dict]) -> set[str]:
-            return {
-                _canonical_predicate(str(e.get("predicate") or ""))
-                for e in effects if isinstance(e, dict)
-            }
-        target = effect_keys(target_effects)
-        covered: set[str] = set()
+    def _cover_target_effects(target_effects: list[dict], hits: list[RetrievalHit],
+                              bindings: dict[str, Any] | None = None
+                              ) -> list[RetrievalHit]:
+        unmatched = list(target_effects)
         selected: list[RetrievalHit] = []
         for hit in sorted(hits, key=lambda h: h.score, reverse=True):
-            keys = effect_keys(getattr(hit.obj, "effects", []))
-            if keys & target and not keys.issubset(covered):
+            matched = [target for target in unmatched
+                       if any(match_effect_contract(
+                           effect, {**target, "cardinality": 1,
+                                    "distinct_by": ""}, bindings).passed
+                              for effect in getattr(hit.obj, "effects", []) or [])]
+            if matched:
                 selected.append(hit)
-                covered |= keys
-                if covered >= target:
+                unmatched = [target for target in unmatched if target not in matched]
+                if not unmatched:
                     break
         if selected:
             return selected

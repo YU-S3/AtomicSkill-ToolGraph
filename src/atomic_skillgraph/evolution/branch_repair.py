@@ -66,6 +66,11 @@ class FailureBranchManager:
     def process(self, trace: TraceRecord, task) -> list[dict[str, Any]]:
         if self.config.freeze_skills:
             return []
+        # A plan that could not bind/compile or an attempt that never started
+        # has no executable repair evidence.  Creating a branch from it would
+        # turn planner/budget failures into fake Tool/Skill mutations.
+        if trace.failure_stage in {"planning", "budget"}:
+            return []
         events: list[dict[str, Any]] = []
         for node_index, node in enumerate(trace.realized_atomic_nodes):
             attempts = list(node.get("attempts") or [])

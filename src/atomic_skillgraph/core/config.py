@@ -35,6 +35,7 @@ class Thresholds:
     composite_min_support: int = 2            # 单轨迹 Composite 仅为 draft；多轨迹支持后晋升
     env_node_max_steps: int = 30              # 单个 Atomic（含 fallback）的环境步数上限
     env_attempt_max_steps: int = 15           # 单种执行模式的环境步数上限
+    env_dynamic_node_max_steps: int = 20      # Dynamic gap 单节点动作上限
 
 
 @dataclass
@@ -59,6 +60,7 @@ class FeatureFlags:
     enable_governance: bool = True           # utility/negative-transfer 治理
     enable_primitive_reuse: bool = True      # PrimitiveCompiler 作为 Tool 挖掘器
     task_type_hard_restricted: bool = False  # task_type 是否作为硬过滤
+    enable_framework_discovery: bool = False # 主方法禁用框架替 Agent 搜索位置
 
     def to_dict(self) -> dict[str, bool]:
         return {
@@ -73,6 +75,7 @@ class FeatureFlags:
             "enable_governance": self.enable_governance,
             "enable_primitive_reuse": self.enable_primitive_reuse,
             "task_type_hard_restricted": self.task_type_hard_restricted,
+            "enable_framework_discovery": self.enable_framework_discovery,
         }
 
 
@@ -190,6 +193,7 @@ class SystemConfig:
                 "composite_min_support": self.thresholds.composite_min_support,
                 "env_node_max_steps": self.thresholds.env_node_max_steps,
                 "env_attempt_max_steps": self.thresholds.env_attempt_max_steps,
+                "env_dynamic_node_max_steps": self.thresholds.env_dynamic_node_max_steps,
             },
             "features": self.features.to_dict(),
             "seed": self.seed,

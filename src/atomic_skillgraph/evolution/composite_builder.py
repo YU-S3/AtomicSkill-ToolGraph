@@ -18,6 +18,8 @@ from ..core.status import EdgeType, SkillStatus
 from ..core.trace_ir import TraceRecord
 from ..graph.aligner import align_composite
 from ..graph.registry import SkillGraphRegistry
+from .composite_lifecycle import evaluate_composite
+from ..runtime.contract_matcher import match_effect_contract
 
 
 @dataclass
@@ -53,7 +55,13 @@ class CompositeBuilder:
             return CompositeBuildResult(decision="skipped",
                                         reason="fewer_than_two_atomic_nodes")
 
+        provided_segments = segments is not None
         segments = list(segments or [{} for _ in atomic_refs])
+        if provided_segments and len(segments) != len(atomic_refs):
+            return CompositeBuildResult(
+                decision="skipped",
+                reason=("occurrence_segment_count_mismatch:"
+                        f"refs={len(atomic_refs)}:segments={len(segments)}"))
         graph_proposal = dict(graph_proposal or {})
         pairs = list(zip(atomic_refs, segments))
         proposed_order = list(graph_proposal.get("ordered_phase_ids") or [])
@@ -75,7 +83,9 @@ class CompositeBuilder:
              "metadata": {"source_trace_id": trace.trace_id,
                           "phase_id": str(segment.get("phase_id") or f"phase_{index:03d}"),
                           "event_start": segment.get("event_start"),
-                          "event_end": segment.get("event_end")}}
+                          "event_end": segment.get("event_end"),
+                          # Instance values are evidence only, never identity.
+                          "grounded_params": dict(segment.get("params") or {})}}
             for index, (node_ref, segment) in enumerate(zip(node_refs, segments))
         ]
         control = [
@@ -121,24 +131,29 @@ class CompositeBuilder:
                        "target_effects": list(trace.provenance.get("target_effects") or [])},
             metadata={
                 "source_trace_ids": [trace.trace_id],
+                "independent_support_keys": [_support_key(trace)],
                 "semantic_proposals": [{
                     "source_trace_id": trace.trace_id,
                     "summary_raw": str(graph_proposal.get("summary") or "").strip(),
                     "implicit_dependencies_raw": list(
                         graph_proposal.get("implicit_dependencies") or []),
                 }],
-                "candidate": {"admission": "multi_trace_or_strict_replay",
+                "candidate": {"admission": "multi_trace",
                               "graph_proposal_validated": bool(graph_proposal.get("validated")),
                               "semantic_extraction_validated": bool(segments) and all(
                                   str(segment.get("extraction_method") or "")
-                                  == "llm_proposal_code_validated" for segment in segments),
-                              "strict_replay_passed": False},
+                                  == "llm_proposal_code_validated" for segment in segments)},
                 "statistics": {"use_count": 0, "success_count": 1,
                                "failure_count": 0, "utility": 0.5,
                                "support_count": 1},
             },
             status=SkillStatus.DRAFT,
         )
+        decision = evaluate_composite(
+            candidate, self.registry,
+            min_support=self.config.thresholds.composite_min_support)
+        candidate.status = decision.status
+        candidate.metadata["candidate"]["lifecycle_reason"] = decision.reason
 
         alignment = align_composite(candidate, self.registry)
         if alignment.matched:
@@ -151,14 +166,12 @@ class CompositeBuilder:
                 min_support = max(2, int(self.config.thresholds.composite_min_support))
                 support = int((existing.metadata.get("statistics") or {}).get(
                     "support_count", 0))
-                strict_replay = bool((existing.metadata.get("candidate") or {}).get(
-                    "strict_replay_passed"))
-                if support >= min_support or strict_replay:
-                    existing.status = SkillStatus.ACTIVE
+                lifecycle = evaluate_composite(
+                    existing, self.registry, min_support=min_support)
+                existing.status = lifecycle.status
+                existing.metadata.setdefault("candidate", {})[
+                    "lifecycle_reason"] = lifecycle.reason
                 self.registry.update_runtime_state(existing)
-                # 对齐可能命中历史版本；让推荐指针跟随支持度最高、仍可用的
-                # canonical artifact，避免 pointer 停在被覆盖/低支持版本。
-                self.registry.recommend(existing.ref)
                 return CompositeBuildResult(composite=existing, decision="reuse",
                                             reason="same_atomic_chain")
         # 同一逻辑链下确有不同的已验证 DAG 时分配新版本，绝不再次写入
@@ -185,14 +198,18 @@ class CompositeBuilder:
                 labels.append(label)
         stats = dict(existing.metadata.get("statistics") or {})
         sources = list(existing.metadata.get("source_trace_ids") or [])
-        independent = trace.trace_id not in sources
+        support_keys = list(existing.metadata.get("independent_support_keys") or [])
+        key = _support_key(trace)
+        independent = key not in support_keys
         if independent:
             sources.append(trace.trace_id)
+            support_keys.append(key)
             stats["support_count"] = int(stats.get("support_count", 0)) + 1
             stats["success_count"] = int(stats.get("success_count", 0)) + 1
         existing.task_type_labels = labels
         existing.metadata["statistics"] = stats
         existing.metadata["source_trace_ids"] = sources
+        existing.metadata["independent_support_keys"] = support_keys
         proposals = list(existing.metadata.get("semantic_proposals") or [])
         for proposal in incoming.metadata.get("semantic_proposals") or []:
             source = str(proposal.get("source_trace_id") or "")
@@ -297,14 +314,15 @@ def _infer_data_edges(steps: list[dict[str, Any]], registry: SkillGraphRegistry,
                     continue
                 matched = False
                 for output in list(getattr(source, "outputs", None) or []):
-                    same_name = output.get("name") == input_spec.get("name")
                     same_type = bool(
                         output.get("semantic_type")
                         and output.get("semantic_type")
                         == input_spec.get("semantic_type"))
-                    source_value = dict(source_step.get("params") or {}).get(
+                    source_value = dict(source_step.get("metadata", {}).get(
+                        "grounded_params") or {}).get(
                         str(output.get("name") or ""))
-                    target_value = dict(target_step.get("params") or {}).get(
+                    target_value = dict(target_step.get("metadata", {}).get(
+                        "grounded_params") or {}).get(
                         str(input_spec.get("name") or ""))
                     grounded_same_value = bool(
                         source_value not in (None, "")
@@ -312,7 +330,7 @@ def _infer_data_edges(steps: list[dict[str, Any]], registry: SkillGraphRegistry,
                         and _same_grounded_value(source_value, target_value))
                     # Broad semantic types such as entity_ref are not enough
                     # on their own: two unrelated roles can share that type.
-                    if not (same_name or (same_type and grounded_same_value)):
+                    if not (same_type and grounded_same_value):
                         continue
                     edges.append(GraphEdge(
                         source=source_step["node_ref"], target=target_step["node_ref"],
@@ -324,6 +342,10 @@ def _infer_data_edges(steps: list[dict[str, Any]], registry: SkillGraphRegistry,
                             "target_input": str(input_spec.get("name")),
                             "schema": str(input_spec.get("semantic_type") or "value"),
                             "transform": "identity",
+                            "evidence": {
+                                "source_value": source_value,
+                                "target_value": target_value,
+                            },
                         },
                         evidence=[trace_id],
                     ).to_dict())
@@ -338,6 +360,12 @@ def _same_grounded_value(left: Any, right: Any) -> bool:
     normalize = lambda value: re.sub(
         r"\s+", "_", str(value or "").strip().lower())
     return bool(normalize(left) and normalize(left) == normalize(right))
+
+
+def _support_key(trace: TraceRecord) -> str:
+    instance = str((trace.provenance or {}).get("environment_instance") or
+                   (trace.provenance or {}).get("game_file") or "")
+    return f"{trace.benchmark}:{trace.task_id}:{instance}"
 
 
 def _infer_dependency_edges(steps: list[dict[str, Any]], registry: SkillGraphRegistry,
@@ -355,7 +383,7 @@ def _infer_dependency_edges(steps: list[dict[str, Any]], registry: SkillGraphReg
                 source_step = steps[source_index]
                 source_ref = SkillRef.parse(source_step["node_ref"])
                 source = registry.get(source_ref) or registry.get_recommended(source_ref.logical_id)
-                if any(str(effect.get("predicate") or "") == predicate
+                if any(match_effect_contract(effect, precondition).passed
                        for effect in list(getattr(source, "effects", []) or [])):
                     edges.append(GraphEdge(
                         source=source_step["node_ref"], target=target_step["node_ref"],

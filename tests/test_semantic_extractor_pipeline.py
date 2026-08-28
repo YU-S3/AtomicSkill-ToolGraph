@@ -178,7 +178,7 @@ def test_repeated_incompatible_name_variant_reuses_staged_registration(workspace
 
     result = atomicizer.apply(TraceRecord(trace_id="same_trace", success=True))
 
-    atomics = [item for item in registry.list_all()
+    atomics = [item for item in registry.list_all_versions()
                if isinstance(item, AbstractAtomicSkill)]
     assert len(atomics) == 2
     assert result.decisions == ["add_contract_variant", "reuse_contract_variant"]
@@ -530,7 +530,7 @@ def test_first_trace_cannot_persist_same_family_bystander_literal(workspace_tmp)
     names = [candidate.skill.ref.logical_id for candidate in result.candidates]
     assert {"env.agent_holds", "env.object_heated",
             "env.object_at_location"}.issubset(names)
-    place = registry.get_recommended("env.object_at_location")
+    place = registry.get_latest("env.object_at_location")
     assert place is not None
     assert place.effects == [{
         "predicate": "object.at_location",
@@ -968,9 +968,13 @@ def test_composite_is_draft_then_promoted_by_independent_trace(workspace_tmp):
               or (phase["name"] == "object_at_location"
                   and phase["params"].get("target_location") == "cabinet_1")]
     refs = [acquire.ref, heat.ref, place.ref]
-    first = builder.build_or_align(refs, _trace("trace_one"), segments=phases)
+    trace_one = _trace("trace_one")
+    trace_one.task_id = "independent_task_one"
+    first = builder.build_or_align(refs, trace_one, segments=phases)
     assert first.composite.status == SkillStatus.DRAFT
-    second = builder.build_or_align(refs, _trace("trace_two"), segments=phases)
+    trace_two = _trace("trace_two")
+    trace_two.task_id = "independent_task_two"
+    second = builder.build_or_align(refs, trace_two, segments=phases)
     assert second.composite.status == SkillStatus.ACTIVE
     assert second.composite.step_instances()[1]["params"]["heating_station"] == "$task.heating_station"
 
@@ -1001,12 +1005,18 @@ def test_composite_alignment_ignores_llm_wording_and_optional_hint(workspace_tmp
     builder = CompositeBuilder(registry, config)
     phases = [phase for phase in
               SemanticExtractorAgent(_ExtractorLLM()).extract(_trace()).phases
-              if phase["name"] in {"agent_holds", "object_heated"}
+              if phase["name"] == "object_heated"
+              or (phase["name"] == "agent_holds"
+                  and phase["params"].get("object_location") == "countertop_1")
               or (phase["name"] == "object_at_location"
                   and phase["params"].get("target_location") == "cabinet_1")]
     refs = [acquire.ref, heat.ref, place.ref]
+    wording_one = _trace("composite_wording_one")
+    wording_one.task_id = "wording_task_one"
+    wording_two = _trace("composite_wording_two")
+    wording_two.task_id = "wording_task_two"
     first = builder.build_or_align(
-        refs, _trace("composite_wording_one"), segments=phases,
+        refs, wording_one, segments=phases,
         graph_proposal={
             "validated": True,
             "summary": "Acquire a mug and put it into this coffeemachine",
@@ -1016,7 +1026,7 @@ def test_composite_alignment_ignores_llm_wording_and_optional_hint(workspace_tmp
             }],
         })
     second = builder.build_or_align(
-        refs, _trace("composite_wording_two"), segments=phases,
+        refs, wording_two, segments=phases,
         graph_proposal={"validated": True,
                         "summary": "A completely different sentence"})
 
@@ -1046,7 +1056,9 @@ def test_composite_does_not_bind_unknown_source_to_same_family_target(workspace_
     trace.provenance["params"].pop("object_location", None)
     phases = [phase for phase in
               SemanticExtractorAgent(_ExtractorLLM()).extract(_trace()).phases
-              if phase["name"] in {"agent_holds", "object_heated"}]
+              if phase["name"] == "object_heated"
+              or (phase["name"] == "agent_holds"
+                  and phase["params"].get("object_location") == "countertop_1")]
     phases = copy.deepcopy(phases)
     phases[0]["params"]["object_location"] = "cabinet_2"
     built = CompositeBuilder(registry, SystemConfig(data_dir=workspace_tmp)).build_or_align(
@@ -1125,7 +1137,7 @@ def test_unchanged_composite_insight_updates_evidence_without_version_churn(
 
     assert result["reason"] == "evidence_only"
     assert registry.list_versions(built.composite.ref.logical_id) == ["1.0.0"]
-    assert registry.get_recommended(
+    assert registry.get_latest(
         built.composite.ref.logical_id).insight["sample_count"] == 3
 
 

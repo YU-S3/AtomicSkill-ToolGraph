@@ -45,6 +45,7 @@ thresholds:
   # 防止一个错误 Atomic 或一种 fallback 模式耗尽整题交互预算。
   env_node_max_steps: 30
   env_attempt_max_steps: 15
+  env_dynamic_node_max_steps: 20
 
 features:                             # 消融开关（实验入口可覆盖）
   enable_composite: true
@@ -58,6 +59,8 @@ features:                             # 消融开关（实验入口可覆盖）
   enable_governance: true
   enable_primitive_reuse: true
   task_type_hard_restricted: false
+  # 主方法由 Agent 在 Seeded/Dynamic 中完成未知位置定位；框架发现仅供消融。
+  enable_framework_discovery: false
 
 seed: 42
 max_repairs: 2

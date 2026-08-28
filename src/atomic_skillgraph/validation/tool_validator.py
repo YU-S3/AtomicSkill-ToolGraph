@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from ..core.binding_ir import is_concrete_binding
 from ..core.status import ArtifactKind, ValidationLevel
 from ..core.tool_ir import ToolAsset
 from ..tools import sandbox as _sandbox_mod
@@ -50,7 +51,9 @@ class ToolValidator:
 
         # 接口：所有必填参数可实例化
         required = [p.get("name") for p in tool.parameters() if p.get("required")]
-        provided = set((inputs or {}).keys())
+        values = dict(inputs or {})
+        provided = {key for key, value in values.items()
+                    if is_concrete_binding(value)}
         missing = [name for name in required if name not in provided]
         checks["parameters_bindable"] = not missing
         if missing:

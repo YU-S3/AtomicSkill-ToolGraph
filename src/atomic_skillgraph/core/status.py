@@ -140,6 +140,17 @@ class ErrorKind(str, Enum):
     DATA_FLOW_ERROR = "data_flow_error"
     COMPOSITE_VALIDATION_ERROR = "composite_validation_error"
     BENCHMARK_FAILURE = "benchmark_failure"
+    PLAN_CONTRACT_MISMATCH = "plan_contract_mismatch"
+    PLAN_BINDING_UNRESOLVED = "plan_binding_unresolved"
+    PLAN_EDGE_MAPPING_ERROR = "plan_edge_mapping_error"
+    UNSUPPORTED_CONTROL_FLOW = "unsupported_control_flow"
+    IMPLEMENTATION_INPUT_UNRESOLVED = "implementation_input_unresolved"
+    ATTEMPT_NOT_STARTED = "attempt_not_started"
+    NODE_BUDGET_EXHAUSTED = "node_budget_exhausted"
+    ATTEMPT_BUDGET_EXHAUSTED = "attempt_budget_exhausted"
+    EPISODE_BUDGET_EXHAUSTED = "episode_budget_exhausted"
+    COMPOSITE_CANDIDATE_REJECTED = "composite_candidate_rejected"
+    FRAMEWORK_ACTION_EXCLUDED = "framework_action_excluded"
     UNKNOWN = "unknown"
 
 

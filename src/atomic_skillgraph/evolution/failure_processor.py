@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..core.config import SystemConfig
+from ..core.binding_ir import is_concrete_binding
 from ..core.refs import SkillRef, ToolRef
 from ..core.status import ErrorKind
 from ..core.trace_ir import TraceRecord
@@ -23,6 +24,7 @@ from ..persistence import ProposalStore
 from ..tools.registry import ToolRegistry
 from ..validation.failure_localizer import FailureAttribution, FailureLocalizer
 from ..graph.registry import SkillGraphRegistry
+from ..runtime.plan_validator import semantic_required_slots
 
 
 @dataclass
@@ -68,13 +70,25 @@ class FailureProcessor:
     # ------------------------------------------------------------------
     def _record_failure_evidence(self, trace: TraceRecord,
                                  result: FailureProcessingResult) -> None:
-        # Tool 失败证据
-        for tool_ref_text in trace.tool_refs:
+        # Tool failure evidence is exact-attempt evidence: selected/seeded
+        # references and rescued historical attempts are not counted here.
+        failed_direct_refs = {
+            str(tool_ref)
+            for node in trace.realized_atomic_nodes
+            if not bool(node.get("passed"))
+            for attempt in (node.get("attempts") or [])
+            if bool(attempt.get("started"))
+            and str(attempt.get("mode") or "") == "direct"
+            and not bool(attempt.get("passed"))
+            for tool_ref in (attempt.get("tool_refs") or [])
+            if tool_ref
+        }
+        for tool_ref_text in sorted(failed_direct_refs):
             try:
                 ref = ToolRef.parse(tool_ref_text)
             except ValueError:
                 continue
-            tool = self.tool_registry.get(ref) or self.tool_registry.get_recommended(ref.tool_id)
+            tool = self.tool_registry.get(ref)
             if tool is None:
                 continue
             # Runtime feedback already records call/failure/consecutive counts.
@@ -86,14 +100,26 @@ class FailureProcessor:
         # Abstract Skill 失败证据
         for node in trace.realized_atomic_nodes:
             node_ref = str(node.get("ref", ""))
-            if not node_ref or node.get("passed", True):
+            if (not node_ref or node.get("passed", True)
+                    or not bool(node.get("attempt_started"))
+                    or int(node.get("executed_action_count") or 0) <= 0):
+                continue
+            attempts = list(node.get("attempts") or [])
+            if attempts and all(str(item.get("failure_stage") or "") in {
+                    "planning", "budget"} for item in attempts):
                 continue
             try:
                 ref = SkillRef.parse(node_ref)
             except ValueError:
                 continue
-            atomic = self.registry.get(ref) or self.registry.get_recommended(ref.logical_id)
+            atomic = self.registry.get(ref)
             if atomic is None:
+                continue
+            required = semantic_required_slots(
+                list(getattr(atomic, "effects", []) or []))
+            if not all(is_concrete_binding(
+                    dict(node.get("params") or {}).get(slot))
+                       for slot in required):
                 continue
             stats = dict(atomic.metadata.get("statistics") or {})
             stats["failure_count"] = int(stats.get("failure_count", 0)) + 1
@@ -113,7 +139,9 @@ class FailureProcessor:
                  attribution: FailureAttribution) -> dict[str, Any] | None:
         kind = attribution.kind
         common = {"attribution": attribution.to_dict(),
-                  "tool_refs": list(trace.tool_refs)}
+                  "tool_refs": list(trace.tool_refs),
+                  "step_id": attribution.step_id,
+                  "occurrence_id": attribution.occurrence_id}
         if kind == ErrorKind.TOOL_EXECUTION_ERROR:
             return self.proposals.add(
                 "tool_update", trace.trace_id, attribution.node_ref,

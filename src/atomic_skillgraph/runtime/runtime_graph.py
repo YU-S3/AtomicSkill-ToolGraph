@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from ..core.binding_ir import BindingSpec
 from ..core.edge_ir import GraphEdge
 from ..core.refs import SkillRef
 from ..core.status import EdgeType, ExecutionMode
@@ -24,9 +25,16 @@ class PlannedNode:
     source: str = "retrieval"       # composite | retrieval | planner_llm
     target_effects: list[dict[str, Any]] = field(default_factory=list)
     dynamic: bool = False
+    occurrence_id: str = ""
+    origin_step_id: str = ""
+    binding_specs: dict[str, BindingSpec] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {"ref": str(self.ref), "step_id": self.step_id,
+                "occurrence_id": self.occurrence_id,
+                "origin_step_id": self.origin_step_id,
+                "binding_specs": {key: value.to_dict()
+                                  for key, value in self.binding_specs.items()},
                 "params": self.params, "source": self.source,
                 "target_effects": self.target_effects, "dynamic": self.dynamic}
 
@@ -41,6 +49,7 @@ class RuntimePlan:
     edges: list[GraphEdge] = field(default_factory=list)
     retrieved: list[dict[str, Any]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    audit: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -50,6 +59,7 @@ class RuntimePlan:
             "edges": [e.to_dict() for e in self.edges],
             "retrieved": self.retrieved,
             "notes": self.notes,
+            "audit": self.audit,
         }
 
 
@@ -70,6 +80,11 @@ class RuntimeNodeState:
     fallback_reason: str = ""
     target_effects: list[dict[str, Any]] = field(default_factory=list)
     attempts: list[dict[str, Any]] = field(default_factory=list)
+    occurrence_id: str = ""
+    origin_step_id: str = ""
+    outputs: dict[str, Any] = field(default_factory=dict)
+    attempt_started: bool = False
+    executed_action_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -86,6 +101,11 @@ class RuntimeNodeState:
             "fallback_reason": self.fallback_reason,
             "target_effects": self.target_effects,
             "attempts": self.attempts,
+            "occurrence_id": self.occurrence_id,
+            "origin_step_id": self.origin_step_id,
+            "outputs": self.outputs,
+            "attempt_started": self.attempt_started,
+            "executed_action_count": self.executed_action_count,
         }
 
 
@@ -97,6 +117,9 @@ class RuntimeGraph:
         self.plan = plan
         self.nodes: list[RuntimeNodeState] = [
             RuntimeNodeState(ref=str(node.ref), step_id=node.step_id or f"step_{index:03d}",
+                             occurrence_id=node.occurrence_id or
+                             node.step_id or f"step_{index:03d}",
+                             origin_step_id=node.origin_step_id,
                              params=dict(node.params),
                              target_effects=list(node.target_effects))
             for index, node in enumerate(plan.nodes)
@@ -104,6 +127,9 @@ class RuntimeGraph:
         self.edges: list[GraphEdge] = list(plan.edges) or self._sequential_edges()
         self.metrics: dict[str, Any] = {
             "direct_reuse_count": 0,
+            "direct_attempt_count": 0,
+            "direct_started_count": 0,
+            "direct_success_count": 0,
             "seeded_generation_count": 0,
             "dynamic_generation_count": 0,
             "tool_calls": 0,
@@ -117,7 +143,8 @@ class RuntimeGraph:
 
     def record_usage(self, mode: ExecutionMode) -> None:
         if mode == ExecutionMode.DIRECT:
-            self.metrics["direct_reuse_count"] += 1
+            self.metrics["direct_attempt_count"] += 1
+            self.metrics["direct_started_count"] += 1
         elif mode == ExecutionMode.SEEDED:
             self.metrics["seeded_generation_count"] += 1
         else:
@@ -125,6 +152,11 @@ class RuntimeGraph:
 
     def add_tokens(self, usage) -> None:
         self.metrics["llm_tokens"] += int(getattr(usage, "total_tokens", 0))
+
+    def record_direct_success(self) -> None:
+        self.metrics["direct_success_count"] += 1
+        # Backward-compatible metric now means realized successful reuse.
+        self.metrics["direct_reuse_count"] += 1
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -172,7 +204,17 @@ class RuntimeGraph:
         ]
         trace.realized_atomic_nodes = [n.to_dict() for n in self.nodes]
         trace.implementation_refs = [n.impl_ref for n in self.nodes if n.impl_ref]
-        trace.tool_refs = [t for n in self.nodes for t in n.tool_refs]
+        # Only a Direct attempt that actually started is Tool usage evidence.
+        # Merely resolving/selecting a Tool must not create a call or failure.
+        trace.tool_refs = sorted({
+            str(tool_ref)
+            for node in self.nodes
+            for attempt in node.attempts
+            if bool(attempt.get("started"))
+            and str(attempt.get("mode") or "") == ExecutionMode.DIRECT.value
+            for tool_ref in (attempt.get("tool_refs") or [])
+            if tool_ref
+        })
         trace.selected_composite = self.plan.composite_ref
         trace.retrieved_skill_refs = [h.get("ref", "") for h in self.plan.retrieved]
         trace.metrics.update(self.metrics)

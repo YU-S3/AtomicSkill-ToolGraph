@@ -12,7 +12,7 @@ from typing import Any
 
 from ..core.config import SystemConfig
 from ..core.refs import SkillRef, bump_version
-from ..core.status import EdgeType
+from ..core.status import EdgeType, SkillStatus
 from ..persistence import TraceStore
 from ..graph.registry import SkillGraphRegistry
 
@@ -51,7 +51,8 @@ class InsightUpdater:
         if semantic_old == semantic_new:
             composite.insight = insight
             self.registry.update_runtime_state(composite)
-            self.registry.recommend(composite.ref)
+            if composite.status == SkillStatus.ACTIVE:
+                self.registry.recommend(composite.ref)
             return {"updated": False, "reason": "evidence_only",
                     "sample_count": len(traces), "version": composite.ref.version}
         old_ref = composite.ref

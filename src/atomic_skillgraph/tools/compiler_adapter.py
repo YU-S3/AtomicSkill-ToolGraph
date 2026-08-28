@@ -250,6 +250,13 @@ def mine_action_template_tools(trace: TraceRecord, segments: list[AtomicSegment]
     for segment in segments:
         if segment.kind != "env" or not segment.actions:
             continue
+        learnable_actions = [dict(item) for item in segment.actions
+                             if str(item.get("origin") or "agent")
+                             in {"agent", "tool"}]
+        if not learnable_actions:
+            continue
+        segment = AtomicSegment.from_dict({**segment.to_dict(),
+                                           "actions": learnable_actions})
         # Semantic slicing may remove exploration, but an execution-location
         # transition backed by the raw state trace is part of the reusable Tool
         # contract. Recover it without consulting task types or capability names.
@@ -370,7 +377,8 @@ def _restore_grounded_location_transition(
     core action. This separates required execution context from unrelated
     exploration without enumerating verbs, tasks, or Atomic capability names.
     """
-    actions = [dict(item) for item in segment.actions]
+    actions = [dict(item) for item in segment.actions
+               if str(item.get("origin") or "agent") in {"agent", "tool"}]
     params = dict(segment.params or {})
     if not actions:
         return actions, params, []
@@ -394,7 +402,8 @@ def _restore_grounded_location_transition(
     for item in trace.actions:
         value = item.to_dict() if hasattr(item, "to_dict") else dict(item)
         if (int(value.get("step", 0)) < first_step
-                and bool(value.get("accepted", True))):
+                and bool(value.get("accepted", True))
+                and str(value.get("origin") or "agent") in {"agent", "tool"}):
             preceding.append(value)
 
     for location in sorted(current_locations):

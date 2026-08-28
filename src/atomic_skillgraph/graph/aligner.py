@@ -16,6 +16,8 @@ from typing import Any
 from ..core.skill_ir import AbstractAtomicSkill, CompositeSkill, ImplementationAtom, ToolBinding
 from ..core.refs import SkillRef
 from ..core.status import SkillNodeKind
+from ..core.binding_ir import BindingSpec
+from ..core.status import SkillStatus
 from .registry import SkillGraphRegistry
 
 _TOKEN_RE = re.compile(r"[a-z0-9_]+")
@@ -88,7 +90,10 @@ def _atomic_contract_compatible(left: AbstractAtomicSkill,
 
 def align_atomic(candidate: AbstractAtomicSkill, registry: SkillGraphRegistry) -> AlignDecision:
     """把 Atomic 候选对齐到已有 Abstract Atomic Skill（§37.1）。"""
-    candidates = registry.list_by_kind(SkillNodeKind.ABSTRACT_ATOMIC)
+    candidates = [obj for obj in registry.list_all_versions(
+        SkillNodeKind.ABSTRACT_ATOMIC)
+        if obj.status not in {SkillStatus.SUPPRESSED, SkillStatus.RETIRED,
+                              SkillStatus.SHADOW}]
     best: tuple[float, Any] | None = None
     for existing in candidates:
         compatible = _atomic_contract_compatible(candidate, existing)
@@ -130,8 +135,11 @@ def align_atomic(candidate: AbstractAtomicSkill, registry: SkillGraphRegistry) -
 
 def align_implementation(candidate: ImplementationAtom, registry: SkillGraphRegistry) -> AlignDecision:
     """Implementation merge（§37.2）：implements 同一 Abstract + Tool binding 等价。"""
-    for existing in registry.list_by_kind(SkillNodeKind.IMPLEMENTATION_ATOMIC):
-        if existing.abstract_ref.logical_id != candidate.abstract_ref.logical_id:
+    for existing in registry.list_all_versions(SkillNodeKind.IMPLEMENTATION_ATOMIC):
+        if existing.status in {SkillStatus.SUPPRESSED, SkillStatus.RETIRED,
+                               SkillStatus.SHADOW}:
+            continue
+        if existing.abstract_ref != candidate.abstract_ref:
             continue
         if (existing.compatibility or {}) != (candidate.compatibility or {}):
             continue
@@ -159,7 +167,10 @@ def align_composite(candidate: CompositeSkill, registry: SkillGraphRegistry) -> 
     matches = [
         existing
         for existing in registry.list_all_versions(SkillNodeKind.COMPOSITE)
-        if _composite_occurrence_signature(existing, registry) == candidate_signature
+        if (existing.status not in {SkillStatus.SUPPRESSED, SkillStatus.RETIRED,
+                                    SkillStatus.SHADOW}
+            and _composite_occurrence_signature(existing, registry)
+            == candidate_signature)
     ]
     if matches:
         status_rank = {"active": 2, "draft": 1}
@@ -195,16 +206,20 @@ def _composite_occurrence_signature(
         for step in step_objects
     }
     steps = tuple(sorted(labels.values()))
-    # Parameter identity is represented as a co-reference hypergraph instead
-    # of literal storage paths. Thus ``$flow.container`` and
-    # ``$task.target_location`` are equivalent when both connect the same
-    # Atomic Effect roles, while opening a source and opening a destination
-    # remain distinct when their sharing topology differs.
+    # Binding origin is part of identity. A task-bound destination and an
+    # unresolved legacy flow symbol must never accumulate shared support.
     binding_members: dict[str, list[tuple[Any, ...]]] = {}
+    binding_contracts: list[tuple[Any, ...]] = []
     for step in step_objects:
         step_id = str(step["step_id"])
-        relevant = _effect_role_bindings(step, registry)
+        relevant = dict(step.get("params") or {})
         for role, value in relevant.items():
+            spec = BindingSpec.from_value(value)
+            binding_contracts.append((
+                labels[step_id], str(role), spec.kind.value,
+                spec.task_role, spec.source_step, spec.source_output,
+                str(spec.value) if spec.kind.value == "literal" else "",
+            ))
             binding_members.setdefault(str(value), []).append(
                 (labels[step_id], str(role)))
     bindings = tuple(sorted(
@@ -231,7 +246,8 @@ def _composite_occurrence_signature(
         for item in (composite.validator.get("target_effects") or [])
         if isinstance(item, dict) and item.get("predicate")
     ))
-    return steps, bindings, data, dependencies, targets
+    return (steps, tuple(sorted(binding_contracts)), bindings,
+            data, dependencies, targets)
 
 
 def _atomic_contract_label(step: dict[str, Any],

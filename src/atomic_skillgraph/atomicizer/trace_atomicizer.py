@@ -14,7 +14,7 @@ from typing import Any
 
 from ..core.refs import SkillRef
 from ..core.skill_ir import AbstractAtomicSkill
-from ..core.status import EdgeType, SkillStatus
+from ..core.status import EdgeType, SkillNodeKind, SkillStatus
 from ..core.trace_ir import TraceRecord
 from ..graph.aligner import (
     AlignDecision,
@@ -347,7 +347,10 @@ class TraceAtomicizer:
     def _known_atomic_contracts(self) -> list[dict[str, Any]]:
         """Small auditable catalog supplied to each independent Extractor call."""
         catalog: list[dict[str, Any]] = []
-        for node in self.registry.list_all():
+        for node in self.registry.list_all_versions(SkillNodeKind.ABSTRACT_ATOMIC):
+            if node.status in {SkillStatus.SUPPRESSED, SkillStatus.RETIRED,
+                               SkillStatus.SHADOW}:
+                continue
             if not isinstance(node, AbstractAtomicSkill):
                 continue
             catalog.append({
@@ -440,7 +443,10 @@ def _build_evidence(segment: dict[str, Any], registry: SkillGraphRegistry) -> di
         "executor_evidence": 0,
     }
     effects = segment.get("effect") or []
-    for obj in registry.list_all():
+    for obj in registry.list_all_versions():
+        if obj.status in {SkillStatus.SUPPRESSED, SkillStatus.RETIRED,
+                          SkillStatus.SHADOW}:
+            continue
         from ..core.skill_ir import CompositeSkill
         if isinstance(obj, CompositeSkill):
             continue

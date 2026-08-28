@@ -122,8 +122,15 @@ def _effective_occurrence_results(
     attribution continue to see the complete failed-attempt history.
     """
     effective: list[NodeValidationResult] = []
+    occurrence_positions: dict[str, int] = {}
     for node in node_results:
-        if (effective and not effective[-1].passed
+        occurrence = str(node.occurrence_id or node.step_id or "")
+        if occurrence and occurrence in occurrence_positions:
+            effective[occurrence_positions[occurrence]] = node
+        elif occurrence:
+            occurrence_positions[occurrence] = len(effective)
+            effective.append(node)
+        elif (effective and not effective[-1].passed
                 and _logical_node_ref(effective[-1].node_ref)
                 and _logical_node_ref(effective[-1].node_ref)
                 == _logical_node_ref(node.node_ref)):

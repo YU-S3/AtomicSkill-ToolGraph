@@ -5,8 +5,9 @@ from types import SimpleNamespace
 from atomic_skillgraph.adapters.benchmark import Task
 from atomic_skillgraph.core.config import SystemConfig
 from atomic_skillgraph.core.refs import SkillRef
+from atomic_skillgraph.core.edge_ir import GraphEdge
 from atomic_skillgraph.core.skill_ir import AbstractAtomicSkill, CompositeSkill
-from atomic_skillgraph.core.status import SkillStatus
+from atomic_skillgraph.core.status import EdgeType, SkillStatus
 from atomic_skillgraph.graph.registry import SkillGraphRegistry
 from atomic_skillgraph.evolution.success_processor import SuccessProcessor
 from atomic_skillgraph.runtime.atomic_planner import AtomicPlanner
@@ -35,10 +36,22 @@ def _atomic(logical_id: str, predicate: str, inputs: list[str]):
 def _composite(logical_id: str, refs: list[str], summary: str, utility: float,
                *, status: SkillStatus = SkillStatus.ACTIVE,
                target_effects: list[dict] | None = None):
+    steps = []
+    for index, ref in enumerate(refs):
+        params = {"object": "$task.object"}
+        if "place" in ref:
+            params["target_location"] = "$task.target_location"
+        steps.append({"step_id": f"step_{index:03d}",
+                      "node_ref": ref, "params": params})
+    control = [GraphEdge(
+        source=refs[index], target=refs[index + 1], type=EdgeType.NEXT,
+        scope="composite", source_step=f"step_{index:03d}",
+        target_step=f"step_{index + 1:03d}").to_dict()
+        for index in range(len(refs) - 1)]
     return CompositeSkill(
         ref=SkillRef(logical_id, "1.0.0"), summary=summary,
         task_type_labels=[TASK_TYPE],
-        graph={"nodes": refs},
+        graph={"nodes": refs, "steps": steps, "control": control},
         validator={"target_effects": target_effects or []},
         metadata={"statistics": {"utility": utility}},
         status=status,
@@ -57,6 +70,7 @@ def _registry(root, *, include_complete: bool = True):
         "composite.alfworld.acquire-heat",
         [str(acquire.ref), str(heat.ref)],
         "heat mug and put it in cabinet", 1.0,
+        target_effects=[_task().target_effects[0]],
     )
     registry.register(partial)
     if include_complete:
@@ -64,6 +78,7 @@ def _registry(root, *, include_complete: bool = True):
             "composite.alfworld.acquire-heat-place",
             [str(acquire.ref), str(heat.ref), str(place.ref)],
             "unrelated complete chain", 0.1,
+            target_effects=_task().target_effects,
         ))
     return registry
 

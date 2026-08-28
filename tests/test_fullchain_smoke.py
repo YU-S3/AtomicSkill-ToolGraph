@@ -64,7 +64,8 @@ def test_fullchain_smoke(workspace_tmp):
         for e in episodes
     ]
     route_report = "\n".join(map(str, route_audit))
-    assert any(e["direct_reuse_count"] > 0 for e in episodes), route_report
+    assert any(system.trace_store.load(e["trace_id"]).metrics.get(
+        "direct_attempt_count", 0) > 0 for e in episodes), route_report
     assert any(e["seeded_generation_count"] > 0 for e in episodes), route_report
     # 知识增长
     final = system.stats()

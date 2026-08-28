@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from ..core.binding_ir import is_concrete_binding
 from ..core.skill_ir import ImplementationAtom, ToolBinding
 from .registry import ToolRegistry
 
@@ -46,12 +47,11 @@ class ToolResolver:
         resolved: list[ResolvedTool] = []
         for binding in implementation.tool_bindings:
             tool = self.tool_registry.get(binding.tool_ref)
-            if tool is None:
-                # 版本指针可能被推荐版本替代
-                tool = self.tool_registry.get_recommended(binding.tool_ref.tool_id)
             if tool is None or not tool.is_usable():
                 resolved.append(ResolvedTool(binding=binding, tool=tool,
-                                             missing=["tool_unavailable"]))
+                                             missing=["tool_version_missing"
+                                                      if tool is None else
+                                                      "tool_unavailable"]))
                 continue
             parameters, missing = self._bind(binding, tool, inputs, ctx)
             resolved.append(ResolvedTool(binding=binding, tool=tool,
@@ -67,11 +67,11 @@ class ToolResolver:
         for param in tool.param_names():
             if param in mapping:
                 value = _resolve_value(mapping[param], inputs, ctx)
-                if value is _MISSING:
+                if value is _MISSING or not is_concrete_binding(value):
                     missing.append(param)
                 else:
                     parameters[param] = value
-            elif param in inputs:
+            elif param in inputs and is_concrete_binding(inputs[param]):
                 parameters[param] = inputs[param]
             else:
                 missing.append(param)

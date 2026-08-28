@@ -172,7 +172,7 @@ class ImplementationSelector:
     def _implementations_of(self, atomic_ref: SkillRef) -> list[ImplementationAtom]:
         result: list[ImplementationAtom] = []
         for impl in self.registry.list_all_versions(SkillNodeKind.IMPLEMENTATION_ATOMIC):
-            if impl.abstract_ref.logical_id == atomic_ref.logical_id:
+            if impl.abstract_ref == atomic_ref:
                 result.append(impl)
         return result
 

@@ -81,6 +81,11 @@ class NodeValidationResult:
     messages: list[str] = field(default_factory=list)
     before: dict[str, Any] = field(default_factory=dict)
     after: dict[str, Any] = field(default_factory=dict)
+    step_id: str = ""
+    occurrence_id: str = ""
+    attempt_index: int = -1
+    mode: str = ""
+    failure_stage: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -91,6 +96,11 @@ class NodeValidationResult:
             "messages": self.messages,
             "before": self.before,
             "after": self.after,
+            "step_id": self.step_id,
+            "occurrence_id": self.occurrence_id,
+            "attempt_index": self.attempt_index,
+            "mode": self.mode,
+            "failure_stage": self.failure_stage,
         }
 
 
@@ -122,6 +132,8 @@ class TraceRecord:
     benchmark_result: dict[str, Any] = field(default_factory=dict)
     success: bool = False
     failure_type: str = ""
+    failure_stage: str = ""
+    failure_cause: str = ""
     token_cost: float = 0.0
     latency_ms: float = 0.0
     retries: int = 0
@@ -174,6 +186,8 @@ class TraceRecord:
             "benchmark_result": self.benchmark_result,
             "success": self.success,
             "failure_type": self.failure_type,
+            "failure_stage": self.failure_stage,
+            "failure_cause": self.failure_cause,
             "token_cost": self.token_cost,
             "latency_ms": self.latency_ms,
             "retries": self.retries,
@@ -208,6 +222,8 @@ class TraceRecord:
             benchmark_result=dict(data.get("benchmark_result") or {}),
             success=bool(data.get("success", False)),
             failure_type=str(data.get("failure_type", "")),
+            failure_stage=str(data.get("failure_stage", "")),
+            failure_cause=str(data.get("failure_cause", "")),
             token_cost=float(data.get("token_cost", 0.0)),
             latency_ms=float(data.get("latency_ms", 0.0)),
             retries=int(data.get("retries", 0)),
