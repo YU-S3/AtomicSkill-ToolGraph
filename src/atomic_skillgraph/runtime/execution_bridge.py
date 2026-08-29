@@ -93,6 +93,24 @@ class ExecutionBridge:
         if not pre_ok:
             reasons.append("precondition_violation")
 
+        # Tool operational context is stricter than the Abstract Atomic
+        # semantic contract.  A minimal implementation may omit setup only
+        # when the live state actually satisfies its declared/inferred context.
+        context_ok = True
+        validate_context = getattr(self.adapter, "validate_tool_context", None)
+        if callable(validate_context):
+            for item in resolved:
+                if item.tool is None:
+                    continue
+                result = validate_context(
+                    item.tool, dict(item.parameters or {}), state)
+                if not bool(result.get("passed")):
+                    context_ok = False
+                    reasons.append(
+                        f"tool_context_violation:{item.tool.ref}:"
+                        f"{result.get('reason', 'unknown')}")
+        checks["tool_context"] = context_ok
+
         eligible = all(checks.values())
         return DirectGateResult(
             eligible=eligible,

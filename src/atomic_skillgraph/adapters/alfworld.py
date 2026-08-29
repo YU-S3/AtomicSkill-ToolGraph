@@ -15,7 +15,7 @@ from ..core.llm import LLM
 from ..core.binding_ir import binding_slot_name
 from ..core.predicates import (
     StateSnapshot, check_effects, distinct_claims_conflict,
-    matching_effect_witnesses)
+    evaluate_preconditions, matching_effect_witnesses)
 from .benchmark import (
     BenchmarkAdapter,
     EnvRunResult,
@@ -177,6 +177,11 @@ class AlfWorldAdapter:
         for step in steps:
             filled = _fill_template(step, parameters)
             result = env.step(filled)
+            if not _env_step_accepted(result):
+                return {"passed": False,
+                        "after": _parse_alfworld_state(result.observation),
+                        "observation": result.observation,
+                        "reason": f"action_rejected:{filled}"}
             if result.done and not result.won:
                 return {"passed": False,
                         "after": _parse_alfworld_state(result.observation),
@@ -184,6 +189,30 @@ class AlfWorldAdapter:
         # 模板执行后：效果验证由上层 node validator 完成；此处给基础信息
         return {"passed": True, "after": _parse_alfworld_state(result.observation),
                 "observation": result.observation, "reason": "template_executed"}
+
+    def validate_tool_context(self, tool, parameters: dict[str, Any],
+                              state: dict[str, Any]) -> dict[str, Any]:
+        """Validate Tool-level execution context against the live state.
+
+        Atomic preconditions describe semantic capability requirements.  A
+        minimal action template can have additional operational requirements
+        (for example, the agent must already be at ``object_location``).  Those
+        requirements are checked independently so a source-state replay cannot
+        authorize the template in an unrelated runtime state.
+        """
+        declared = [dict(item) for item in
+                    (tool.interface or {}).get("preconditions", [])
+                    if isinstance(item, dict)]
+        if declared:
+            passed, missing = evaluate_preconditions(
+                StateSnapshot(state), dict(parameters), declared,
+                {"inputs": dict(parameters)})
+            if not passed:
+                return {"passed": False,
+                        "reason": f"declared_context_missing:{missing}"}
+        steps = [_fill_template(step, parameters)
+                 for step in (tool.artifact.get("steps") or [])]
+        return _validate_alfworld_action_context(steps, state)
 
     def replay_tool(self, tool, bindings: dict[str, Any],
                     before: dict[str, Any]) -> dict[str, Any]:
@@ -196,6 +225,9 @@ class AlfWorldAdapter:
         replay_case = next((t for t in tool.replay_cases() if t.get("kind") == "replay"), None)
         if replay_case is None:
             return {"passed": False, "reason": "no_replay_case"}
+        closure = _validate_declared_action_context(tool, bindings)
+        if not closure.get("passed"):
+            return closure
         env_index = _replay_env_index(replay_case)
         if env_index is None:
             return {"passed": False, "reason": "source_task_unknown"}
@@ -231,18 +263,6 @@ class AlfWorldAdapter:
         # 再执行模板步骤
         steps = list(tool.artifact.get("steps") or [])
         replay_bindings = dict(bindings)
-        is_acquire = any(str(effect.get("predicate") or "") == "agent.holds"
-                         for effect in expected_effects)
-        template_navigates = any(str(step).strip().lower().startswith("go to ")
-                                 for step in steps)
-        # take-only Acquire Tool 的 source trace replay 必须先恢复“对象可取”的
-        # 环境前置状态。该发现过程是 Admission 框架行为，不计作 Tool 本体。
-        if is_acquire and not template_navigates:
-            replay_bindings, admissible, setup_ok = _controlled_acquire_replay_setup(
-                env, tracker, admissible, replay_bindings)
-            if not setup_ok:
-                return {"passed": False, "after": tracker.state(),
-                        "reason": "acquire_location_discovery_failed"}
         for step in steps:
             if _is_noop_step(step):
                 continue
@@ -603,6 +623,18 @@ class AlfWorldAdapter:
                             excluded_effect_bindings)
                     result.states.append({"step": len(result.actions),
                                           "state": tracker.state()})
+                    if not accepted:
+                        result.failure_type = "direct_template_action_rejected"
+                        result.steps = len(result.actions)
+                        result.final_observation = obs
+                        result.node_spans.append({
+                            "step_id": str(step_spec.get("step_id") or
+                                           step_spec.get("node_ref") or ""),
+                            "action_start": span_start,
+                            "action_end": len(result.actions),
+                            "skipped_template_steps": skipped,
+                        })
+                        return result
                     # The action that establishes the final atomic Effect may
                     # simultaneously finish the benchmark.  Preserve the
                     # authoritative ALFWorld signal before returning at the
@@ -1599,6 +1631,81 @@ def _fill_template(step: str, params: dict[str, Any]) -> str:
         return step.format(**{k: str(v).replace("_", " ") for k, v in params.items()})
     except (KeyError, ValueError):
         return step
+
+
+def _validate_declared_action_context(tool: Any,
+                                      bindings: dict[str, Any]) -> dict[str, Any]:
+    """Require every externally consumed location to be in Tool interface.
+
+    Admission source replay reconstructs the exact pre-action state and is
+    therefore unable, on its own, to distinguish a self-contained template
+    from one that silently depends on the source prefix.  We validate the
+    symbolic body from an otherwise unknown location, seeded only with
+    explicitly declared ``agent.at`` requirements.
+    """
+    locations: set[str] = set()
+    for item in (tool.interface or {}).get("preconditions", []):
+        if not isinstance(item, dict):
+            continue
+        predicate = str(item.get("predicate") or "").replace("_", ".").lower()
+        if predicate != "agent.at":
+            continue
+        raw = str((item.get("args") or {}).get("location") or "")
+        if raw.startswith("$inputs."):
+            raw = str(bindings.get(raw[len("$inputs."):], ""))
+        elif raw.startswith("$"):
+            raw = str(bindings.get(raw[1:], ""))
+        if raw:
+            locations.add(_norm(raw))
+    state = {"facts": [f"agent_at({value})" for value in sorted(locations)]}
+    steps = [_fill_template(step, bindings)
+             for step in (tool.artifact.get("steps") or [])]
+    result = _validate_alfworld_action_context(steps, state)
+    if not result.get("passed"):
+        result["reason"] = "undeclared_execution_context:" + str(
+            result.get("reason") or "location_unknown")
+    return result
+
+
+def _validate_alfworld_action_context(steps: list[str],
+                                      state: dict[str, Any]) -> dict[str, Any]:
+    """Symbolically verify location requirements of an ALFWorld template."""
+    current = {
+        _norm(match.group(1))
+        for fact in (state or {}).get("facts", [])
+        if (match := re.fullmatch(r"agent_at\((.+?)\)", str(fact)))
+    }
+    for raw_step in steps:
+        step = str(raw_step).strip()
+        navigation = re.fullmatch(r"go\s+to\s+(.+)", step,
+                                  flags=re.IGNORECASE)
+        if navigation:
+            current = {_norm(navigation.group(1))}
+            continue
+        required = _required_action_location(step)
+        if required and _norm(required) not in current:
+            return {
+                "passed": False,
+                "reason": (f"location_context_missing:required={_norm(required)};"
+                           f"current={sorted(current)};action={step}"),
+                "required_location": _norm(required),
+            }
+    return {"passed": True, "reason": "tool_context_satisfied"}
+
+
+def _required_action_location(step: str) -> str:
+    """Return the entity/location at which an accepted action must execute."""
+    patterns = (
+        r"take\s+.+?\s+from\s+(.+)",
+        r"(?:move|put)\s+.+?\s+to\s+(.+)",
+        r"(?:clean|heat|cool)\s+.+?\s+with\s+(.+)",
+        r"(?:open|close|use|toggle)\s+(.+)",
+    )
+    for pattern in patterns:
+        match = re.fullmatch(pattern, str(step).strip(), flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+    return ""
 
 
 def _split_step(step: Any, default_params: dict[str, Any]) -> tuple[str, dict[str, Any]]:

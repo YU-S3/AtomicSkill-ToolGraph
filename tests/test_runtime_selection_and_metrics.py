@@ -1,4 +1,4 @@
-from atomic_skillgraph.core.config import SystemConfig
+from atomic_skillgraph.core.config import SystemConfig, Thresholds
 from atomic_skillgraph.core.refs import SkillRef, ToolRef
 from atomic_skillgraph.core.skill_ir import (
     AbstractAtomicSkill,
@@ -12,6 +12,7 @@ from atomic_skillgraph.runtime.implementation_selector import ImplementationSele
 from atomic_skillgraph.tools.admission_adapter import AdmissionEngine
 from atomic_skillgraph.tools.registry import ToolRegistry
 from atomic_skillgraph.tools.resolver import ToolResolver
+from atomic_skillgraph.tools.lifecycle import ToolLifecycleManager
 from experiments.report import summarize_episodes
 
 
@@ -115,6 +116,36 @@ def test_selector_discovers_location_slot_from_learned_tool_contract(workspace_t
         "fixture_location"}
     assert selector.select_allowing_missing(
         atomic.ref, context, {"fixture_location"}).implementation.ref == impl.ref
+
+
+def test_preferred_requires_stable_direct_execution_evidence(workspace_tmp):
+    registry = ToolRegistry(workspace_tmp / "lifecycle_tools")
+    best = _action_tool("generic.best", ["engage {fixture}"])
+    other = _action_tool("generic.other", ["engage {fixture}", "verify {fixture}"])
+    best.statistics.update({"support_count": 10, "utility": 0.9})
+    other.statistics.update({"support_count": 5, "utility": 0.5})
+    registry.register(best)
+    registry.register(other)
+    registry.set_status(best.ref, ToolLifecycle.ACTIVE)
+    registry.set_status(other.ref, ToolLifecycle.ACTIVE)
+    manager = ToolLifecycleManager(registry, Thresholds(
+        direct_min_success=3, preferred_margin=0.1,
+        preferred_min_direct_success_rate=0.95))
+
+    assert not any(event.action == "promote_preferred"
+                   for event in manager.review())
+    for _ in range(3):
+        registry.record_feedback(best.ref, True, usage_mode="direct")
+    events = manager.review()
+    assert any(event.action == "promote_preferred" and event.tool_ref == str(best.ref)
+               for event in events)
+    assert registry.get(best.ref).status == ToolLifecycle.PREFERRED
+
+    registry.record_feedback(best.ref, False, usage_mode="direct")
+    events = manager.review()
+    assert any(event.action == "demote_active" and event.tool_ref == str(best.ref)
+               for event in events)
+    assert registry.get(best.ref).status == ToolLifecycle.ACTIVE
 
 
 def test_report_separates_any_direct_node_rate_and_all_direct_episodes():

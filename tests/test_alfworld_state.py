@@ -22,9 +22,15 @@ from atomic_skillgraph.atomicizer.trace_atomicizer import TraceAtomicizer  # noq
 from atomic_skillgraph.atomicizer.semantic_extractor import build_structured_events  # noqa: E402
 from atomic_skillgraph.adapters.benchmark import Task  # noqa: E402
 from atomic_skillgraph.core.trace_ir import ActionRecord, TraceRecord  # noqa: E402
+from atomic_skillgraph.core.refs import ToolRef  # noqa: E402
+from atomic_skillgraph.core.status import ArtifactKind, ToolLifecycle  # noqa: E402
+from atomic_skillgraph.core.tool_ir import ToolAsset  # noqa: E402
 from atomic_skillgraph.core.predicates import StateSnapshot, check_effects  # noqa: E402
 from atomic_skillgraph.graph.registry import SkillGraphRegistry  # noqa: E402
-from atomic_skillgraph.tools.compiler_adapter import mine_action_template_tools  # noqa: E402
+from atomic_skillgraph.tools.compiler_adapter import (  # noqa: E402
+    _infer_execution_context_preconditions,
+    mine_action_template_tools,
+)
 from atomic_skillgraph.system import _completed_distinct_effect_instances  # noqa: E402
 
 # 真实 ALFWorld PDDL 环境（0.4.2）观察语料（来自一次成功 heat 任务）
@@ -296,6 +302,113 @@ def test_atomicizer_on_pddl_trace(workspace_tmp):
         "go to {object_location}",
         "take {object} from {object_location}",
     ], "源任务的无槽位探索动作不应写入 Direct Tool 本体"
+
+
+def test_minimal_action_template_declares_consumed_location_context():
+    preconditions = _infer_execution_context_preconditions(
+        ["take {object} from {object_location}"],
+        {"object": "mug_1", "object_location": "countertop_1"},
+        {"facts": ["agent_at(countertop_1)",
+                   "object_at(mug_1, countertop_1)"]},
+    )
+    assert preconditions == [{
+        "predicate": "agent_at",
+        "args": {"location": "$inputs.object_location"},
+    }]
+    assert _infer_execution_context_preconditions(
+        ["go to {object_location}",
+         "take {object} from {object_location}"],
+        {"object": "mug_1", "object_location": "countertop_1"},
+        {"facts": ["agent_at(countertop_1)"]},
+    ) == []
+
+
+def _take_only_tool(*, declare_context: bool) -> ToolAsset:
+    interface = {
+        "inputs": {"object": "object_ref", "object_location": "location_ref"},
+        "outputs": {"effect": []},
+    }
+    if declare_context:
+        interface["preconditions"] = [{
+            "predicate": "agent_at",
+            "args": {"location": "$inputs.object_location"},
+        }]
+    return ToolAsset(
+        ref=ToolRef("alfworld.test_take_only", "0.1.0"),
+        artifact_kind=ArtifactKind.ACTION_TEMPLATE,
+        signature={"parameters": [
+            {"name": "object"}, {"name": "object_location"}]},
+        interface=interface,
+        artifact={"steps": ["take {object} from {object_location}"]},
+        tests=[{"kind": "replay", "bindings": {
+            "object": "mug_1", "object_location": "countertop_1"}}],
+        status=ToolLifecycle.DRAFT,
+    )
+
+
+def test_action_template_admission_rejects_undeclared_location_context():
+    adapter = AlfWorldAdapter()
+    result = adapter.replay_tool(
+        _take_only_tool(declare_context=False),
+        {"object": "mug_1", "object_location": "countertop_1"},
+        {"facts": ["agent_at(countertop_1)"]},
+    )
+    assert not result["passed"]
+    assert result["reason"].startswith("undeclared_execution_context:")
+
+
+def test_direct_tool_context_is_checked_against_live_agent_location():
+    adapter = AlfWorldAdapter()
+    tool = _take_only_tool(declare_context=True)
+    params = {"object": "mug_1", "object_location": "countertop_1"}
+    rejected = adapter.validate_tool_context(
+        tool, params, {"facts": ["agent_at(desk_1)"]})
+    accepted = adapter.validate_tool_context(
+        tool, params, {"facts": ["agent_at(countertop_1)"]})
+    assert not rejected["passed"]
+    assert "declared_context_missing" in rejected["reason"]
+    assert accepted["passed"]
+
+
+def test_rejected_direct_template_action_stops_immediately():
+    class _RejectingEnv:
+        def __init__(self):
+            self.calls = []
+
+        def step(self, action):
+            self.calls.append(action)
+            return type("_StepResult", (), {
+                "observation": "Nothing happens.", "score": 0.0,
+                "done": False, "won": False, "accepted": False,
+                "admissible_commands": ["go to countertop 1"],
+            })()
+
+    adapter = AlfWorldAdapter()
+    env = _RejectingEnv()
+    adapter._current_env = env
+    task = Task(task_id="direct_reject", benchmark="alfworld",
+                task_type="unseen", goal="obtain a mug", context={})
+    result = adapter.run_env_episode(
+        task, _StubLLM(),
+        direct_steps=[{
+            "step_id": "step_000", "node_ref": "skill://acquire@1.0.0",
+            "steps": [{"template": "take {object} from {object_location}",
+                       "params": {"object": "mug_1",
+                                  "object_location": "countertop_1"}}],
+        }],
+        resume={
+            "observation": "at desk", "admissible": ["go to countertop 1"],
+            "actions": [], "states": [],
+            "state": {"facts": ["agent_at(desk_1)"],
+                      "inventory": [], "meta": {}},
+        },
+        stop_effects=[{"predicate": "agent.holds",
+                       "args": {"object": "$inputs.object"}}],
+        effect_inputs={"object": "mug_1"}, max_steps=15,
+    )
+    assert env.calls == ["take mug 1 from countertop 1"]
+    assert result.failure_type == "direct_template_action_rejected"
+    assert result.steps == 1
 
 
 # ---------------------------------------------------------------------------

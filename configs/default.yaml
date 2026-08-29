@@ -31,6 +31,8 @@ thresholds:
   direct_max_consecutive_failures: 2
   candidate_min_support: 3
   preferred_margin: 0.1
+  # preferred 不能仅凭 source replay/support 晋升，必须有稳定 Direct 成功率。
+  preferred_min_direct_success_rate: 0.95
   suppress_failure_threshold: 2
   retirement_utility: 0.2
   admission_timeout_seconds: 10.0

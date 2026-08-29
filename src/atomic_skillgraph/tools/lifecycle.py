@@ -67,6 +67,19 @@ class ToolLifecycleManager:
     def _select_preferred(self) -> list[LifecycleEvent]:
         """同 tool_id 家族 + 跨家族同 entry_point：utility 最优 → preferred（§39.2）。"""
         events: list[LifecycleEvent] = []
+        # Preferred is a runtime recommendation, not an admission synonym.
+        # Demote recommendations whose live Direct evidence no longer meets
+        # the reliability contract before choosing the next best variant.
+        for tool in self.registry.list_all(statuses={ToolLifecycle.PREFERRED}):
+            if self._preferred_reliable(tool):
+                continue
+            try:
+                self.registry.set_status(tool.ref, ToolLifecycle.ACTIVE)
+                events.append(LifecycleEvent(
+                    str(tool.ref), "demote_active",
+                    "preferred_direct_reliability_not_satisfied"))
+            except ValueError:
+                continue
         classes: dict[str, list] = {}
         for tool in self.registry.list_all(
                 statuses={ToolLifecycle.CANDIDATE, ToolLifecycle.ACTIVE, ToolLifecycle.PREFERRED}):
@@ -81,7 +94,9 @@ class ToolLifecycleManager:
             margin = best.utility() - (second.utility() if second else 0.0)
             if best.status == ToolLifecycle.PREFERRED:
                 continue
-            if (best.status == ToolLifecycle.ACTIVE and margin >= self.thresholds.preferred_margin):
+            if (best.status == ToolLifecycle.ACTIVE
+                    and self._preferred_reliable(best)
+                    and margin >= self.thresholds.preferred_margin):
                 try:
                     self.registry.set_status(best.ref, ToolLifecycle.PREFERRED)
                     events.append(LifecycleEvent(str(best.ref), "promote_preferred",
@@ -89,6 +104,20 @@ class ToolLifecycleManager:
                 except ValueError:
                     continue
         return events
+
+    def _preferred_reliable(self, tool) -> bool:
+        stats = tool.statistics or {}
+        success = int(stats.get("direct_success_count", 0))
+        failure = int(stats.get("direct_failure_count", 0))
+        total = success + failure
+        if success < int(self.thresholds.direct_min_success) or total <= 0:
+            return False
+        rate = success / total
+        return bool(
+            rate >= float(self.thresholds.preferred_min_direct_success_rate)
+            and int(stats.get("consecutive_failures", 0))
+            < int(self.thresholds.direct_max_consecutive_failures)
+        )
 
     def _review_failures(self) -> list[LifecycleEvent]:
         events: list[LifecycleEvent] = []

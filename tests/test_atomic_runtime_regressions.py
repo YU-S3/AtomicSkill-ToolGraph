@@ -220,6 +220,85 @@ def test_atomic_only_runs_controlled_location_discovery(workspace_tmp):
         "mandatory_location_slots"] == ["object_location"]
 
 
+def test_in_place_fallback_validates_preconditions_at_node_boundary(
+        workspace_tmp):
+    class _Adapter:
+        supports_in_place_resume = True
+
+        def __init__(self):
+            self.calls = 0
+
+        def run_env_episode(self, task, llm, **kwargs):
+            self.calls += 1
+            resume = dict(kwargs.get("resume") or {})
+            actions = [dict(item) for item in resume.get("actions", [])]
+            states = [dict(item) for item in resume.get("states", [])]
+            if self.calls == 1:
+                after = {"facts": ["object_at(mug_1, microwave_1)"],
+                         "inventory": [], "meta": {}}
+                actions.append({"step": len(actions),
+                                "name": "move mug 1 to microwave 1",
+                                "params": {"object": "mug_1"},
+                                "accepted": True})
+                states.append({"step": len(actions), "state": after})
+                return EnvRunResult(
+                    actions=actions, states=states,
+                    failure_type="effect_not_met",
+                    current_observation="mug is in microwave",
+                    current_admissible=["take mug 1 from microwave 1"],
+                    final_observation="mug is in microwave")
+            after = {"facts": ["agent_holds(mug_1)",
+                                "object_heated(mug_1)"],
+                     "inventory": ["mug_1"], "meta": {}}
+            actions.append({"step": len(actions),
+                            "name": "heat mug 1 with microwave 1",
+                            "params": {"object": "mug_1"},
+                            "accepted": True})
+            states.append({"step": len(actions), "state": after})
+            # Reproduce the historical boundary bug: adapter-local completion
+            # is absent, while formal Effect validation can still prove success.
+            return EnvRunResult(
+                actions=actions, states=states,
+                current_observation="mug is hot",
+                current_admissible=["continue"],
+                final_observation="mug is hot")
+
+    config = SystemConfig(data_dir=workspace_tmp / "fallback_boundary")
+    config.llm.mock = True
+    adapter = _Adapter()
+    system = AtomicSkillGraphSystem(config, adapter, MockLLM(script={}))
+    transform = AbstractAtomicSkill(
+        ref=SkillRef("env.object_heated", "1.0.0"), summary="heat object",
+        inputs=[{"name": "object"}],
+        preconditions=[{"predicate": "agent.holds",
+                        "args": {"object": "$inputs.object"}}],
+        effects=[{"predicate": "object.heated",
+                  "args": {"object": "$inputs.object"}}],
+        guideline={"rules": ["produce the declared state"]},
+        status=SkillStatus.ACTIVE)
+    system.registry.register(transform)
+    initial = {"facts": ["agent_holds(mug_1)"],
+               "inventory": ["mug_1"], "meta": {}}
+    task = Task(
+        task_id="fallback_boundary", benchmark="alfworld", goal="heat mug",
+        context={"params": {"object": "mug_1"}}, state=initial,
+        target_effects=list(transform.effects))
+    plan = RuntimePlan(nodes=[PlannedNode(
+        ref=transform.ref, step_id="step_000", occurrence_id="occ_000",
+        params={"object": "mug_1"}, target_effects=list(transform.effects))])
+    trace = TraceRecord(task_id=task.task_id, benchmark=task.benchmark)
+    runtime = RuntimeGraph(task.task_id, plan)
+
+    system._run_env_nodes(task, plan, trace, runtime)
+
+    # A later benchmark-only finalization call is allowed after the Atomic
+    # node succeeds; the first two calls are the in-place node attempts.
+    assert adapter.calls >= 2
+    assert runtime.nodes[0].passed is True
+    assert runtime.nodes[0].execution_status.value == "executed_success"
+    assert trace.node_validators[-1].before["inventory"] == ["mug_1"]
+
+
 def test_failed_mandatory_discovery_does_not_start_seeded_and_owns_node_budget(
         workspace_tmp):
     class _Adapter:

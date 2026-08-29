@@ -271,6 +271,8 @@ def mine_action_template_tools(trace: TraceRecord, segments: list[AtomicSegment]
         core_steps, extra_prefix = _clean_template_steps(steps)
         if not core_steps:
             continue
+        execution_preconditions = _infer_execution_context_preconditions(
+            core_steps, executable_params, segment.before)
         parameters = [
             {"name": slot, "semantic_type": _guess_semantic_type(slot), "required": True}
             for slot in sorted(slots)
@@ -318,6 +320,11 @@ def mine_action_template_tools(trace: TraceRecord, segments: list[AtomicSegment]
             signature={"parameters": parameters},
             interface={
                 "inputs": {p["name"]: p["semantic_type"] for p in parameters},
+                # Action templates may deliberately omit setup that is already
+                # established by controlled discovery.  Persist that execution
+                # context as an explicit contract instead of letting source
+                # replay hide it from Direct routing.
+                "preconditions": execution_preconditions,
                 "outputs": {"effect": [str(e) for e in parameterize_predicates(
                     segment.effect, segment.params)]},
             },
@@ -340,6 +347,49 @@ def mine_action_template_tools(trace: TraceRecord, segments: list[AtomicSegment]
         )
         tools.append(tool)
     return tools
+
+
+def _infer_execution_context_preconditions(
+        steps: list[str], params: dict[str, Any],
+        before: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Declare location context consumed but not established by a template.
+
+    Semantic slicing is allowed to produce a minimal ``take``/``open`` shape
+    when discovery has already navigated to the relevant location.  The old
+    compiler discarded that dependency, so source-state replay certified the
+    shape for arbitrary states.  This routine turns the observed dependency
+    into a portable predicate that Runtime must re-check on every Direct call.
+    """
+    facts = {str(item) for item in (before or {}).get("facts", [])}
+    agent_locations = {
+        match.group(1)
+        for fact in facts
+        if (match := re.fullmatch(r"agent_at\((.+?)\)", fact))
+    }
+    if not agent_locations:
+        return []
+    result: list[dict[str, Any]] = []
+    for slot, value in sorted(params.items()):
+        normalized = _norm_value(value)
+        if normalized not in {_norm_value(item) for item in agent_locations}:
+            continue
+        marker = f"{{{slot}}}"
+        first_use = next((index for index, step in enumerate(steps)
+                          if marker in str(step)), None)
+        if first_use is None:
+            continue
+        establishes_location = any(
+            re.fullmatch(rf"\s*go\s+to\s+{re.escape(marker)}\s*", str(step),
+                         flags=re.IGNORECASE)
+            for step in steps[:first_use + 1]
+        )
+        if establishes_location:
+            continue
+        result.append({
+            "predicate": "agent_at",
+            "args": {"location": f"$inputs.{slot}"},
+        })
+    return result
 
 
 def _clean_template_steps(steps: list[str]) -> tuple[list[str], list[str]]:

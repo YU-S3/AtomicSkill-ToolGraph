@@ -24,6 +24,7 @@ class Thresholds:
     direct_max_consecutive_failures: int = 2 # 连续失败降级阈值
     candidate_min_support: int = 3           # candidate -> active 额外成功证据
     preferred_margin: float = 0.1            # preferred 选择的 utility 领先幅度
+    preferred_min_direct_success_rate: float = 0.95 # preferred 必须有稳定 Direct 证据
     suppress_failure_threshold: int = 2      # 失败证据达到阈值 → 抑制审查
     retirement_utility: float = 0.2          # 长期 utility 低于阈值 → 退役候选
     llm_generalize_min_group: int = 2        # generalize 最少同构组大小
@@ -188,6 +189,7 @@ class SystemConfig:
                 "direct_min_success": self.thresholds.direct_min_success,
                 "candidate_min_support": self.thresholds.candidate_min_support,
                 "preferred_margin": self.thresholds.preferred_margin,
+                "preferred_min_direct_success_rate": self.thresholds.preferred_min_direct_success_rate,
                 "admission_timeout_seconds": self.thresholds.admission_timeout_seconds,
                 "acquire_discovery_max_locations": self.thresholds.acquire_discovery_max_locations,
                 "llm_max_consecutive_errors": self.thresholds.llm_max_consecutive_errors,

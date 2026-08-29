@@ -1285,8 +1285,14 @@ class AtomicSkillGraphSystem:
                 passed = bool(getattr(result, "atomic_complete", False))
                 validation = None
                 if atomic is not None:
+                    # Seeded/Dynamic are in-place fallbacks inside one Atomic
+                    # occurrence.  A failed earlier attempt may temporarily
+                    # consume a precondition (for example place the held
+                    # object), then the next attempt repairs it and produces
+                    # the declared Effect.  Eligibility belongs to the stable
+                    # node boundary, not to each intermediate retry boundary.
                     validation = self.node_validator.validate_atomic(
-                        atomic, attempt_before, after, inputs=planned.params,
+                        atomic, before, after, inputs=planned.params,
                         context={"harness": "env"})
                     validation.node_ref = str(planned.ref)
                     validation.step_id = node.step_id
@@ -1386,7 +1392,7 @@ class AtomicSkillGraphSystem:
                     self._record_impl_feedback([node.impl_ref], passed)
                 if passed:
                     node.outputs = materialize_atomic_outputs(
-                        atomic, planned.params, attempt_before, after,
+                        atomic, planned.params, before, after,
                         tool_result=(_execution_output_payload(result)
                                      if mode == ExecutionMode.DIRECT else None))
                     _update_verified_runtime_bindings(
@@ -1397,6 +1403,13 @@ class AtomicSkillGraphSystem:
                     # Benchmark won 不能替代当前节点 Effect；保留不一致供审计。
                     break
                 node.fallback_reason = str(result.failure_type or "effect_not_met")
+                # Every started failed attempt must carry an attributed cause.
+                # Leaving this empty produced task failures with a blank
+                # ``failure_type`` even though formal Effect validation failed.
+                if not result.failure_type:
+                    result.failure_type = node.fallback_reason
+                    node.attempts[-1]["failure_type"] = node.fallback_reason
+                    node.attempts[-1]["failure_cause"] = node.fallback_reason
                 if not resume.get("admissible"):
                     break
 

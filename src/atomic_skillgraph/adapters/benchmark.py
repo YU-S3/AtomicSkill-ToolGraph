@@ -221,6 +221,9 @@ class BenchmarkAdapter(Protocol):
     def execute_tool(self, task: Task, tool, parameters: dict[str, Any],
                      state: dict[str, Any]) -> dict[str, Any]: ...
 
+    def validate_tool_context(self, tool, parameters: dict[str, Any],
+                              state: dict[str, Any]) -> dict[str, Any]: ...
+
     def generate_code(self, task: Task, llm: LLM, *,
                       seed_context: str = "",
                       max_repairs: int = 2) -> CodeRunResult: ...
