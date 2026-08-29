@@ -370,6 +370,46 @@ def test_direct_tool_context_is_checked_against_live_agent_location():
     assert accepted["passed"]
 
 
+def test_direct_tool_requires_instance_grounded_action_references():
+    adapter = AlfWorldAdapter()
+    tool = ToolAsset(
+        ref=ToolRef("alfworld.test_place", "0.1.0"),
+        artifact_kind=ArtifactKind.ACTION_TEMPLATE,
+        signature={"parameters": [
+            {"name": "object", "semantic_type": "object_ref"},
+            {"name": "target_location", "semantic_type": "location_ref"},
+        ]},
+        interface={"inputs": {
+            "object": "object_ref", "target_location": "location_ref"}},
+        artifact={"steps": [
+            "go to {target_location}",
+            "move {object} to {target_location}",
+        ]},
+        status=ToolLifecycle.CANDIDATE,
+    )
+
+    rejected = adapter.validate_tool_context(
+        tool,
+        {"object": "spraybottle_1", "target_location": "cabinet"},
+        {"facts": ["agent_holds(spraybottle_1)"]},
+    )
+    assert not rejected["passed"]
+    assert rejected["reason"].startswith("executable_reference_unresolved:")
+
+    # Metamorphic coverage: entity family and instance number do not change
+    # the rule; every concrete executable reference is accepted uniformly.
+    for object_ref, target_ref in (
+            ("spraybottle_1", "cabinet_3"),
+            ("mug_7", "drawer_1"),
+            ("apple_2", "armchair_4")):
+        accepted = adapter.validate_tool_context(
+            tool,
+            {"object": object_ref, "target_location": target_ref},
+            {"facts": [f"agent_holds({object_ref})"]},
+        )
+        assert accepted["passed"], accepted
+
+
 def test_rejected_direct_template_action_stops_immediately():
     class _RejectingEnv:
         def __init__(self):

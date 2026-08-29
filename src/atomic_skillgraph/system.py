@@ -176,15 +176,19 @@ class AtomicSkillGraphSystem:
         trace.metrics["benchmark_won"] = bool(trace.success)
         trace.metrics["runtime_contract_valid"] = runtime_contract_valid
         trace.metrics["learning_eligible"] = learning_eligible
-        if learning_eligible:
-            for kind, refs, passed, mode in pending_feedback:
-                if kind == "tool":
-                    self._record_tool_feedback(refs, passed, mode)
-                else:
-                    self._record_impl_feedback(refs, passed)
-        elif pending_feedback:
-            trace.metrics["feedback_discarded_for_contract_mismatch"] = len(
-                pending_feedback)
+        # Tool/Implementation evidence belongs to the attempt that actually
+        # executed.  A later Seeded/Dynamic rescue, or an unrelated final task
+        # contract mismatch, must not erase a failed Direct attempt.  The
+        # episode transaction above already removes infrastructure retries;
+        # every remaining attempt is therefore safe to commit independently
+        # of Skill/Composite learning eligibility.
+        for kind, refs, passed, mode in pending_feedback:
+            if kind == "tool":
+                self._record_tool_feedback(refs, passed, mode)
+            else:
+                self._record_impl_feedback(refs, passed)
+        if not learning_eligible and pending_feedback:
+            trace.metrics["attempt_feedback_committed"] = len(pending_feedback)
         # 保存 trace（成功与失败都保存）
         self.trace_store.save(trace)
         evolution_runtime_usage_before = snapshot_llm_usage(self.llm)
@@ -2238,11 +2242,30 @@ def _runtime_learning_eligible(
         item for item in trace.node_validators
         if item.level in {"atomic", "task_gap"}
     ]
-    validators_valid = all(bool(item.passed) for item in validators)
+    # Attempt validators are an ordered audit trail.  Direct failure followed
+    # by a successful Seeded/Dynamic fallback is one valid final occurrence,
+    # not a permanently invalid trace.  Only the last validator for each
+    # occurrence owns its final contract verdict; anonymous legacy validators
+    # remain fail-closed and are evaluated individually.
+    final_validators: dict[tuple[str, str], NodeValidationResult] = {}
+    anonymous_validators: list[NodeValidationResult] = []
+    for item in validators:
+        occurrence = str(item.occurrence_id or item.step_id or "")
+        if occurrence:
+            final_validators[(str(item.level), occurrence)] = item
+        else:
+            anonymous_validators.append(item)
+    validators_valid = (
+        all(bool(item.passed) for item in final_validators.values())
+        and all(bool(item.passed) for item in anonymous_validators)
+    )
     gap_required = bool(
         trace.task_gap_analysis is not None
         and trace.task_gap_analysis.missing_effects)
-    gap_validators = [item for item in validators if item.level == "task_gap"]
+    gap_validators = [
+        item for (level, _occurrence), item in final_validators.items()
+        if level == "task_gap"
+    ] + [item for item in anonymous_validators if item.level == "task_gap"]
     gap_valid = (not gap_required) or (
         bool(gap_validators) and all(item.passed for item in gap_validators))
     # Legacy/non-resume whole-plan Seeded execution cannot be credited when it

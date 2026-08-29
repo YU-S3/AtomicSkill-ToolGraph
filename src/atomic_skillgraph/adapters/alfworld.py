@@ -1669,7 +1669,13 @@ def _validate_declared_action_context(tool: Any,
 
 def _validate_alfworld_action_context(steps: list[str],
                                       state: dict[str, Any]) -> dict[str, Any]:
-    """Symbolically verify location requirements of an ALFWorld template."""
+    """Verify that an ALFWorld template is immediately executable.
+
+    ALFWorld goal bindings may legitimately be class-valued (``cabinet``),
+    while executable actions require an exposed instance (``cabinet_3``).
+    Admission and Runtime share this validator so neither a source replay nor
+    a non-empty task string can turn a semantic class into Direct evidence.
+    """
     current = {
         _norm(match.group(1))
         for fact in (state or {}).get("facts", [])
@@ -1677,6 +1683,20 @@ def _validate_alfworld_action_context(steps: list[str],
     }
     for raw_step in steps:
         step = str(raw_step).strip()
+        unresolved = [
+            value for value in _alfworld_action_references(step)
+            if not _is_executable_alfworld_reference(value)
+        ]
+        if unresolved:
+            return {
+                "passed": False,
+                "reason": (
+                    "executable_reference_unresolved:"
+                    f"values={[_norm(value) for value in unresolved]};"
+                    f"action={step}"
+                ),
+                "unresolved_references": [_norm(value) for value in unresolved],
+            }
         navigation = re.fullmatch(r"go\s+to\s+(.+)", step,
                                   flags=re.IGNORECASE)
         if navigation:
@@ -1691,6 +1711,31 @@ def _validate_alfworld_action_context(steps: list[str],
                 "required_location": _norm(required),
             }
     return {"passed": True, "reason": "tool_context_satisfied"}
+
+
+def _is_executable_alfworld_reference(value: str) -> bool:
+    """Return whether a semantic entity value names one ALFWorld instance."""
+
+    normalized = _norm(value)
+    return bool(normalized and re.search(r"_\d+$", normalized))
+
+
+def _alfworld_action_references(step: str) -> list[str]:
+    """Extract entity arguments from one supported ALFWorld action."""
+
+    patterns = (
+        r"go\s+to\s+(.+)",
+        r"take\s+(.+?)\s+from\s+(.+)",
+        r"move\s+(.+?)\s+to\s+(.+)",
+        r"put\s+(.+?)\s+(?:in|on)\s+(.+)",
+        r"(?:clean|heat|cool)\s+(.+?)\s+with\s+(.+)",
+        r"(?:open|close|use|toggle|examine)\s+(.+)",
+    )
+    for pattern in patterns:
+        match = re.fullmatch(pattern, str(step).strip(), flags=re.IGNORECASE)
+        if match:
+            return [item.strip() for item in match.groups() if item is not None]
+    return []
 
 
 def _required_action_location(step: str) -> str:

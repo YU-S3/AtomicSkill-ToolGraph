@@ -1,5 +1,5 @@
 from atomic_skillgraph.adapters.alfworld import (
-    _effects_met, _ground_effect_inputs_from_action,
+    AlfWorldAdapter, _effects_met, _ground_effect_inputs_from_action,
     _hard_cycle_block_reason, _meaningful_env_state_changed)
 from atomic_skillgraph.adapters.benchmark import EnvRunResult, Task
 from atomic_skillgraph.adapters.mock_llm import MockLLM
@@ -669,8 +669,8 @@ def test_acquire_discovery_rebinds_source_before_direct_tool_selection(
     assert AdmissionEngine(
         replay_fn=lambda *_args: {"passed": True}).admit(tool).passed
     tool.statistics.update({
-        "utility": 1.0, "success_count": 3,
-        "direct_success_count": 3,
+        "utility": 1.0, "call_count": 3, "success_count": 3,
+        "direct_use_count": 3, "direct_success_count": 3,
         "admission_replay_success_count": 1,
     })
     impl = ImplementationAtom(
@@ -712,3 +712,200 @@ def test_acquire_discovery_rebinds_source_before_direct_tool_selection(
     assert node.impl_ref == str(impl.ref)
     assert node.tool_refs == [str(tool.ref)]
     assert trace.metrics["execution_routing"][0]["location_discovered"] is True
+
+
+class _PlacementFallbackAdapter:
+    supports_in_place_resume = True
+
+    def __init__(self, *, reject_direct: bool = False):
+        self.reject_direct = reject_direct
+        self.calls = []
+        self.context_validator = AlfWorldAdapter()
+
+    def validate_tool_context(self, tool, parameters, state):
+        return self.context_validator.validate_tool_context(
+            tool, parameters, state)
+
+    def replay_tool(self, *_args, **_kwargs):
+        return {"passed": True}
+
+    def run_env_episode(self, task, llm, **kwargs):
+        resume = dict(kwargs.get("resume") or {})
+        actions = [dict(item) for item in resume.get("actions", [])]
+        states = [dict(item) for item in resume.get("states", [])]
+        direct_steps = kwargs.get("direct_steps")
+        self.calls.append({
+            "direct": direct_steps is not None,
+            "seeded": bool(kwargs.get("seed_context")),
+        })
+        if direct_steps is not None and self.reject_direct:
+            actions.append({
+                "step": len(actions), "name": "go to cabinet 1",
+                "params": {}, "accepted": False, "mode": "direct",
+                "tool_ref": direct_steps[0].get("tool_ref", ""),
+            })
+            state = dict(resume.get("state") or task.state)
+            states.append({"step": len(actions), "state": state})
+            return EnvRunResult(
+                actions=actions, states=states,
+                failure_type="direct_template_action_rejected",
+                current_observation="Nothing happens.",
+                current_admissible=["go to cabinet 1"],
+                final_observation="Nothing happens.",
+            )
+
+        target = "cabinet_1"
+        state = {
+            "facts": ["agent_at(cabinet_1)",
+                      "object_at(spraybottle_1, cabinet_1)"],
+            "inventory": [], "meta": {},
+        }
+        actions.extend([
+            {"step": len(actions), "name": "go to cabinet 1",
+             "params": {}, "accepted": True},
+            {"step": len(actions) + 1,
+             "name": "move spraybottle 1 to cabinet 1",
+             "params": {"object": "spraybottle_1",
+                        "target_location": target},
+             "accepted": True},
+        ])
+        states.append({"step": len(actions), "state": state})
+        return EnvRunResult(
+            success=True, atomic_complete=True,
+            actions=actions, states=states,
+            current_observation="placed", current_admissible=["look"],
+            final_observation="placed",
+        )
+
+
+def _register_placement_tool(system):
+    place = AbstractAtomicSkill(
+        ref=SkillRef("generic.place", "1.0.0"), summary="place entity",
+        inputs=[{"name": "object"}, {"name": "target_location"}],
+        preconditions=[{"predicate": "agent.holds",
+                        "args": {"object": "$inputs.object"}}],
+        effects=[{"predicate": "object.at_location", "args": {
+            "object": "$inputs.object",
+            "location": "$inputs.target_location",
+        }}],
+        guideline={"rules": ["place the held entity at the destination"]},
+        status=SkillStatus.ACTIVE,
+    )
+    tool = ToolAsset(
+        ref=ToolRef("generic.place.action", "1.0.0"),
+        artifact_kind=ArtifactKind.ACTION_TEMPLATE,
+        summary="navigate to and place an entity",
+        signature={"parameters": [
+            {"name": "object", "semantic_type": "object_ref"},
+            {"name": "target_location", "semantic_type": "location_ref"},
+        ]},
+        interface={"inputs": {
+            "object": "object_ref", "target_location": "location_ref"}},
+        artifact={"steps": [
+            "go to {target_location}",
+            "move {object} to {target_location}",
+        ]},
+        safety={"direct_execution_allowed": True},
+        status=ToolLifecycle.CANDIDATE,
+    )
+    assert AdmissionEngine(
+        replay_fn=lambda *_args: {"passed": True}).admit(tool).passed
+    tool.statistics.update({
+        "utility": 1.0, "success_count": 3,
+        "direct_success_count": 3,
+        "admission_replay_success_count": 1,
+    })
+    impl = ImplementationAtom(
+        ref=SkillRef("impl.generic.place.action", "1.0.0"),
+        abstract_ref=place.ref,
+        tool_bindings=[ToolBinding(tool.ref)], status=SkillStatus.ACTIVE,
+        quality={"utility": 1.0, "success_count": 3},
+    )
+    system.registry.register(place)
+    system.registry.register(impl)
+    system.tool_registry.register(tool)
+    system.tool_registry.set_status(tool.ref, ToolLifecycle.ACTIVE)
+    return place, tool
+
+
+def test_class_valued_target_never_enters_direct_and_seeded_grounds_instance(
+        workspace_tmp):
+    adapter = _PlacementFallbackAdapter()
+    system = _system(workspace_tmp / "class_target_gate", adapter)
+    system.config.features.enable_tool_evolution = True
+    place, tool = _register_placement_tool(system)
+    initial = {"facts": ["agent_holds(spraybottle_1)"],
+               "inventory": ["spraybottle_1"], "meta": {}}
+    task = Task(
+        task_id="class_target_gate", benchmark="alfworld",
+        goal="put a spraybottle in cabinet",
+        context={"params": {"object": "spraybottle_1",
+                            "target_location": "cabinet"}},
+        state=initial, target_effects=list(place.effects),
+    )
+    plan = RuntimePlan(nodes=[PlannedNode(
+        ref=place.ref, step_id="step_000", occurrence_id="occ_000",
+        params={"object": "spraybottle_1", "target_location": "cabinet"},
+        target_effects=list(place.effects),
+    )])
+    trace = TraceRecord(task_id=task.task_id, benchmark=task.benchmark)
+    runtime = RuntimeGraph(task.task_id, plan)
+
+    system._run_env_nodes(task, plan, trace, runtime)
+
+    node = runtime.nodes[0]
+    assert all(not call["direct"] for call in adapter.calls)
+    assert node.mode == ExecutionMode.SEEDED
+    assert node.passed is True
+    assert node.params["target_location"] == "cabinet_1"
+    audit = trace.metrics["execution_routing"][0]
+    candidate = audit["implementation_candidates"][0]
+    assert candidate["direct_gate"]["eligible"] is False
+    assert "executable_reference_unresolved" in candidate[
+        "direct_gate"]["reason"]
+    assert system.tool_registry.get(tool.ref).statistics.get(
+        "direct_failure_count", 0) == 0
+
+
+def test_failed_direct_feedback_persists_when_seeded_rescues_task(
+        workspace_tmp):
+    adapter = _PlacementFallbackAdapter(reject_direct=True)
+    system = _system(workspace_tmp / "attempt_feedback", adapter)
+    system.config.features.enable_tool_evolution = True
+    system.config.features.enable_composite = False
+    place, tool = _register_placement_tool(system)
+    initial = {"facts": ["agent_holds(spraybottle_1)"],
+               "inventory": ["spraybottle_1"], "meta": {}}
+    task = Task(
+        task_id="attempt_feedback", benchmark="alfworld",
+        goal="put a spraybottle in cabinet 1",
+        context={"params": {"object": "spraybottle_1",
+                            "target_location": "cabinet_1"}},
+        state=initial, target_effects=list(place.effects),
+    )
+    plan = RuntimePlan(nodes=[PlannedNode(
+        ref=place.ref, step_id="step_000", occurrence_id="occ_000",
+        params={"object": "spraybottle_1", "target_location": "cabinet_1"},
+        target_effects=list(place.effects),
+    )])
+    system.planner.compile_runtime_graph = lambda _task: plan
+    # This regression targets attempt evidence transaction/persistence.  Tool
+    # mining from the synthetic two-action trace is orthogonal and is covered
+    # by the staged pipeline tests with fully parameterized source traces.
+    system._process_trace = lambda _trace, _task: {}
+    before_stats = dict(system.tool_registry.get(tool.ref).statistics)
+
+    episode = system.run_task(task)
+
+    assert episode["success"] is True
+    assert episode["runtime_contract_valid"] is True
+    assert [call["direct"] for call in adapter.calls[:2]] == [True, False]
+    saved = system.tool_registry.get(tool.ref)
+    assert saved.statistics["failure_count"] == int(
+        before_stats.get("failure_count", 0)) + 1
+    assert saved.statistics["direct_failure_count"] == int(
+        before_stats.get("direct_failure_count", 0)) + 1
+    assert saved.statistics["direct_use_count"] == int(
+        before_stats.get("direct_use_count", 0)) + 1
+    assert saved.statistics["success_count"] == int(
+        before_stats.get("success_count", 0))

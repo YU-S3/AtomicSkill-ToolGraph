@@ -14,6 +14,7 @@ from atomic_skillgraph.runtime.runtime_graph import PlannedNode, RuntimeGraph, R
 from atomic_skillgraph.system import (
     AtomicSkillGraphSystem,
     _append_planned_runtime_spans,
+    _runtime_learning_eligible,
     _runtime_node_metrics,
 )
 from experiments import common as experiment_common
@@ -124,6 +125,28 @@ def test_successful_tool_reuse_excludes_failed_direct_attempts():
     metrics = _runtime_node_metrics(graph)
     assert metrics["successful_tool_refs"] == [
         "tool://generic.success@1.0.0"]
+
+
+def test_fallback_contract_uses_final_validator_per_occurrence():
+    trace = TraceRecord(task_id="fallback", benchmark="alfworld", success=True)
+    trace.realized_atomic_nodes = [{
+        "attempt_started": True,
+        "execution_status": NodeExecutionStatus.EXECUTED_SUCCESS.value,
+        "passed": True,
+    }]
+    trace.node_validators = [
+        NodeValidationResult(
+            level="atomic", passed=False, step_id="step_000",
+            occurrence_id="occ_000", attempt_index=0, mode="direct"),
+        NodeValidationResult(
+            level="atomic", passed=True, step_id="step_000",
+            occurrence_id="occ_000", attempt_index=1, mode="seeded"),
+    ]
+
+    assert _runtime_learning_eligible(trace) is True
+
+    trace.node_validators[-1].passed = False
+    assert _runtime_learning_eligible(trace) is False
 
 
 def test_code_direct_execution_sets_explicit_execution_status():
